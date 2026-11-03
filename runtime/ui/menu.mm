@@ -1459,7 +1459,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
     drain_events(io);
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
-    float scale = (float)(th / 1080.0) * ui_touch_scale();  // (a phone: bigger - ui_touch.h)
+    float scale = (float)(th / 1080.0);  // (in game as on the desktop: the start screen alone is bigger on a phone)
     if (scale < 0.45f) scale = 0.45f;
     io.FontGlobalScale = scale;
 
