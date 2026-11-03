@@ -169,6 +169,9 @@ cp "$WORK/third_party/fonts/BIZUDPGothic/BIZUDPGothic-Regular.ttf" "$A/"
 cp "$WORK/third_party/fonts/BIZUDPGothic/OFL.txt" "$A/BIZUDPGothic-OFL.txt"
 cp "$WORK/third_party/fonts/DejaVu/DejaVuSans.ttf" "$A/"
 cp "$WORK/third_party/fonts/DejaVu/LICENSE" "$A/DejaVu-LICENSE.txt"
+# (the Snapdragon GSR upscaler's BSD-3 licence asks for its notice with every binary)
+mkdir -p "$APP/app/src/main/assets/licenses"
+cp "$WORK/third_party/sgsr/LICENSE" "$APP/app/src/main/assets/licenses/SnapdragonGSR-LICENSE.txt"
 ls -1 "$A" | sed 's/^/  /'
 # the recompiled game itself, if it has been built
 if [ -f "$GAME_BUILD/lasgame.so" ]; then

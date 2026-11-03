@@ -514,6 +514,79 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(min(mx, max(mn, ac / aw)), 1.0);\n"
                "}\n";
     }
+    // Snapdragon Game Super Resolution 1 (Copyright (c) 2025, Qualcomm Innovation Center, Inc., BSD-3-Clause:
+    // third_party/sgsr/LICENSE), from sgsr/v1/include/glsl/sgsr1_shader_mobile.frag: upscale and sharpen in one pass,
+    // 12-tap Lanczos-like weights only where the green channel shows an edge (else the plain bilinear tap). Made for
+    // Adreno: mediump math (RelaxedPrecision for the driver), textureGather. Taken as it is apart from the inputs:
+    // a = ViewportInfo (1 / texture size, texture size), b.xy = texture uv per output pixel (the contents' part of
+    // the texture under Dynamic resolution); RGBA mode (1), the edge threshold and sharpness its defaults.
+    if (!strcmp(name, "sgsr1.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "precision mediump float;\n"
+               "precision highp int;\n"
+               "layout(set = 0, binding = 0) uniform mediump sampler2D ps0;\n"
+               "layout(push_constant) uniform P { highp vec4 a; highp vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 out_Target0;\n"
+               "const int mode = 1;\n"
+               "const float edgeThreshold = 8.0 / 255.0, edgeSharpness = 2.0;\n"
+               "float fastLanczos2(float x) { float wA = x - 4.0; float wB = x * wA - wA; wA *= wA; return wB * wA; }\n"
+               "vec2 weightY(float dx, float dy, float c, float std) {\n"
+               "  float x = ((dx * dx) + (dy * dy)) * 0.55 + clamp(abs(c) * std, 0.0, 1.0);\n"
+               "  float w = fastLanczos2(x);\n"
+               "  return vec2(w, w * c);\n"
+               "}\n"
+               "void main() {\n"
+               "  highp vec4 ViewportInfo = pc.a;\n"
+               "  highp vec2 uv = gl_FragCoord.xy * pc.b.xy;\n"
+               "  vec4 color;\n"
+               "  color.xyz = textureLod(ps0, uv, 0.0).xyz;\n"
+               "  highp vec2 imgCoord = ((uv * ViewportInfo.zw) + vec2(-0.5, 0.5));\n"
+               "  highp vec2 imgCoordPixel = floor(imgCoord);\n"
+               "  highp vec2 coord = (imgCoordPixel * ViewportInfo.xy);\n"
+               "  vec2 pl = (imgCoord + (-imgCoordPixel));\n"
+               "  vec4 left = textureGather(ps0, coord, mode);\n"
+               "  float edgeVote = abs(left.z - left.y) + abs(color[mode] - left.y) + abs(color[mode] - left.z);\n"
+               "  if (edgeVote > edgeThreshold) {\n"
+               "    coord.x += ViewportInfo.x;\n"
+               "    vec4 right = textureGather(ps0, coord + vec2(ViewportInfo.x, 0.0), mode);\n"
+               "    vec4 upDown;\n"
+               "    upDown.xy = textureGather(ps0, coord + vec2(0.0, -ViewportInfo.y), mode).wz;\n"
+               "    upDown.zw = textureGather(ps0, coord + vec2(0.0, ViewportInfo.y), mode).yx;\n"
+               "    float mean = (left.y + left.z + right.x + right.w) * 0.25;\n"
+               "    left = left - vec4(mean);\n"
+               "    right = right - vec4(mean);\n"
+               "    upDown = upDown - vec4(mean);\n"
+               "    color.w = color[mode] - mean;\n"
+               "    float sum = (((((abs(left.x) + abs(left.y)) + abs(left.z)) + abs(left.w)) + (((abs(right.x) + abs(right.y)) + "
+               "abs(right.z)) + abs(right.w))) + (((abs(upDown.x) + abs(upDown.y)) + abs(upDown.z)) + abs(upDown.w)));\n"
+               "    float std = 2.181818 / sum;\n"
+               "    vec2 aWY = weightY(pl.x, pl.y + 1.0, upDown.x, std);\n"
+               "    aWY += weightY(pl.x - 1.0, pl.y + 1.0, upDown.y, std);\n"
+               "    aWY += weightY(pl.x - 1.0, pl.y - 2.0, upDown.z, std);\n"
+               "    aWY += weightY(pl.x, pl.y - 2.0, upDown.w, std);\n"
+               "    aWY += weightY(pl.x + 1.0, pl.y - 1.0, left.x, std);\n"
+               "    aWY += weightY(pl.x, pl.y - 1.0, left.y, std);\n"
+               "    aWY += weightY(pl.x, pl.y, left.z, std);\n"
+               "    aWY += weightY(pl.x + 1.0, pl.y, left.w, std);\n"
+               "    aWY += weightY(pl.x - 1.0, pl.y - 1.0, right.x, std);\n"
+               "    aWY += weightY(pl.x - 2.0, pl.y - 1.0, right.y, std);\n"
+               "    aWY += weightY(pl.x - 2.0, pl.y, right.z, std);\n"
+               "    aWY += weightY(pl.x - 1.0, pl.y, right.w, std);\n"
+               "    float finalY = aWY.y / aWY.x;\n"
+               "    float maxY = max(max(left.y, left.z), max(right.x, right.w));\n"
+               "    float minY = min(min(left.y, left.z), min(right.x, right.w));\n"
+               "    finalY = clamp(edgeSharpness * finalY, minY, maxY);\n"
+               "    float deltaY = finalY - color.w;\n"
+               "    deltaY = clamp(deltaY, -23.0 / 255.0, 23.0 / 255.0);\n"  // (smooth high contrast input)
+               "    color.x = clamp((color.x + deltaY), 0.0, 1.0);\n"
+               "    color.y = clamp((color.y + deltaY), 0.0, 1.0);\n"
+               "    color.z = clamp((color.z + deltaY), 0.0, 1.0);\n"
+               "  }\n"
+               "  color.w = 1.0;\n"
+               "  out_Target0 = color;\n"
+               "}\n";
+    }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
     // b.xy = image size. The lobe is limited so the result stays inside the neighbours' range; noise is damped.
     // Box downscale (exec.c post_process): the image is larger than its place in the window (internal resolution

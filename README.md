@@ -38,7 +38,7 @@ It is built on **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai
 - [Status](#status)
 - [Requirements](#requirements)
 - [Building and installing](#building-and-installing)
-- [Controls](#controls)
+- [Controls](#controls) ([Image quality](#image-quality))
 - [Saves](#saves)
 - [What is different from the PC version](#what-is-different-from-the-pc-version)
 - [Troubleshooting](#troubleshooting)
@@ -54,19 +54,22 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 |---|---|
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
-| Intro cutscenes, train, Lumiose City | Works, with the visual bugs below |
-| Frame rate | 30 fps (the game's own rate on the Switch) in the scenes tested so far |
+| Intro cutscenes, train, Lumiose City | Works: no heavy visual bugs left (the eyes below), the game's own pop-in |
+| Frame rate | A steady 30 fps (the game's own rate on the Switch) in the scenes tested so far |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
 | Touch controls | Works (D-pad tested in the game's menus; the rest in progress) |
 | Saving | Works |
 | Memory | About 3 GB in use |
-| Heat | The resolution steps down by itself as the phone warms (thermal headroom) |
+| Heat | The resolution steps down by itself as the phone warms (thermal headroom): 75% of the screen, down to about 45% once hot |
+| Upscaling | Snapdragon Game Super Resolution (Qualcomm's own upscaler) by default; AMD FSR 1 and bilinear in the menu |
 | *Mega Dimension* DLC | Not tested yet |
 
 **Known visual bugs** (being worked on):
 - Some eyes look wrong: the iris drawn as blue and white squares, a dark rectangle behind some Pokémon's eyes.
-- Straight light strips and translucent rectangles over faces and bodies in some scenes.
+- Faint straight light strips over faces and bodies in some close-up cutscenes (seen in one run).
+- The picture is soft once the phone is hot: the resolution goes down to keep the temperature in check (see
+  [Image quality](#image-quality)).
 
 ## Requirements
 
@@ -105,6 +108,17 @@ that guide has each step and option. In short:
   where your thumb lands, and a drag on the right half of the screen for the camera. They hide while a controller is in
   use and come back with the next touch.
 - **Settings menu**: the ☰ button at the top of the screen, or Android's Back gesture.
+- **Layout**: the Switch's by default - the right button is A (confirm), the bottom one B (back), in the game and in
+  the menus, with Nintendo button icons. **Settings > Controls > A/B/X/Y layout > Xbox** puts A at the bottom instead.
+
+### Image quality
+
+The game renders below the screen's resolution and is scaled up: 75% of the screen to begin with, and a step lower each
+time the phone warms up (down to about 45%). In **Settings > Video**:
+- **Upscaler**: *Snapdragon GSR* (the default: Qualcomm's own, made for Adreno), *AMD FSR 1*, or *Bilinear* (softest).
+- **Internal resolution**: *Match display* (100%) for a sharper picture, at the cost of more heat (and so more steps
+  down later).
+- **Anti-aliasing**: *SMAA* smooths jagged edges, at a small cost.
 
 ## Saves
 
@@ -143,6 +157,8 @@ files as on the Switch and on the PC version, so they move between them without 
   [shaderc](https://github.com/google/shaderc), [LibHac](https://github.com/Thealexbarney/LibHac) and the others listed
   in [docs/LASRecomp-README.md](docs/LASRecomp-README.md#license). Fonts bundled in the APK: BIZ UDPGothic (SIL OFL)
   and DejaVu Sans.
+- **[Snapdragon Game Super Resolution](https://github.com/SnapdragonGameStudios/snapdragon-gsr)** by Qualcomm
+  Innovation Center (BSD-3-Clause, [third_party/sgsr](third_party/sgsr/LICENSE)): the default upscaler.
 
 ## Legal
 

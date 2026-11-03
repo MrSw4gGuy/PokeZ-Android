@@ -393,6 +393,31 @@ extern "C" void controls_tab_draw(float scale) {
                   "Leave Battle moves by position off. Restart after changing this option or bindings.",
                   "Posiciona os golpes nos botões configurados do controle, sem alterar os comandos. Preparado automaticamente. "
                   "Deixe Golpes por posição desligado. Reinicie após mudar esta opção ou os comandos."));
+    {   // The face buttons as a whole: the Switch's (A on the right confirms, B at the bottom goes back - by position, the
+        // default) or the Xbox one (by letter: A at the bottom). A preset over the four bindings, the menus' confirm
+        // button and the icons at once; read back from the bindings, so rebinding by hand shows where it stands.
+        bool xb = g_bind_pad[BIND_A] == SDL_GAMEPAD_BUTTON_SOUTH && g_bind_pad[BIND_B] == SDL_GAMEPAD_BUTTON_EAST &&
+                  g_bind_pad[BIND_X] == SDL_GAMEPAD_BUTTON_WEST && g_bind_pad[BIND_Y] == SDL_GAMEPAD_BUTTON_NORTH;
+        int v = xb ? 1 : 0;
+        const char *const names[] = {TR("Switch (A on the right)", "Switch (A à direita)"),
+                                     TR("Xbox (A at the bottom)", "Xbox (A embaixo)")};
+        if (opt_choice(TR("A/B/X/Y layout", "Layout A/B/X/Y"), &v, names, 2, 0,
+                       TR("Switch: the right button is A (confirm) and the bottom one B (back), as on the Switch. Xbox: the "
+                          "bottom button is A. Changes the game's buttons, the confirm button in these menus and the "
+                          "button icons together.",
+                          "Switch: o botão da direita é o A (confirmar) e o de baixo o B (voltar), como no Switch. Xbox: o "
+                          "botão de baixo é o A. Muda os botões do jogo, o botão de confirmar destes menus e os ícones "
+                          "dos botões juntos."))) {
+            static const int16_t nin[4] = {SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_NORTH,
+                                           SDL_GAMEPAD_BUTTON_WEST},
+                                 xbx[4] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_WEST,
+                                           SDL_GAMEPAD_BUTTON_NORTH};
+            for (int i = 0; i < 4; i++) g_bind_pad[BIND_A + i] = v ? xbx[i] : nin[i];
+            g_settings.menu_confirm = v ? MENU_CONFIRM_CONTROLLER : MENU_CONFIRM_GAME;
+            g_settings.prompts = v ? PROMPTS_XBOX : PROMPTS_NINTENDO;
+            settings_save();
+        }
+    }
     {
         const char *const names[] = {TR("Game layout", "Layout do jogo"), TR("Controller convention", "Padrão do controle")};
         opt_choice(TR("Confirm button", "Botão de confirmar"), &g_settings.menu_confirm, names, 2, MENU_CONFIRM_CONTROLLER,

@@ -642,14 +642,28 @@ static void tab_display(bool in_game) {
                             "Como a imagem é ampliada para a janela quando renderiza numa resolução menor. MetalFX: o "
                             "upscaler da Apple, mais nítido. Bilinear: simples e suave.");
 #else
-        const char *ups[] = {TR("Bilinear", "Bilinear"), "AMD FSR 1"};
+        // (and Snapdragon Game Super Resolution 1, Qualcomm's one-pass upscale and sharpening made for Adreno: the
+        // Android default)
+        const char *ups[] = {TR("Bilinear", "Bilinear"), "AMD FSR 1", "Snapdragon GSR"};
         const char *ud = TR("How the image is scaled up to the window when it renders at a lower resolution. AMD FSR 1: "
-                            "edge-aware upscaling and sharpening, sharper. Bilinear: plain and soft.",
+                            "edge-aware upscaling and sharpening, sharper. Snapdragon GSR: Qualcomm's upscaler, made for "
+                            "Adreno phones - sharp edges in one light pass. Bilinear: plain and soft.",
                             "Como a imagem é ampliada para a janela quando renderiza numa resolução menor. AMD FSR 1: "
-                            "ampliação que respeita as bordas, com nitidez - mais nítido. Bilinear: simples e suave.");
+                            "ampliação que respeita as bordas, com nitidez - mais nítido. Snapdragon GSR: o upscaler da "
+                            "Qualcomm, feito para celulares Adreno - bordas nítidas numa passada leve. Bilinear: simples e "
+                            "suave.");
 #endif
+#ifdef __APPLE__
+        const int nups = 2;
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
+        int udef = g_default_upscaler == UPSCALE_BILINEAR ? 0 : 1;
+#else
+        const int nups = 3;
+        int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : g_settings.upscaler == UPSCALE_SGSR ? 2 : 1;
+        int udef = g_default_upscaler == UPSCALE_BILINEAR ? 0 : g_default_upscaler == UPSCALE_SGSR ? 2 : 1;
+#endif
         char udm[700];
+#ifndef __ANDROID__  // (Android: the thermal steps render below the display even at Match display)
         if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
             snprintf(udm, sizeof udm, "%s\n\n%s", ud,
                      TR("Not used at Match display: the game already renders at your display's resolution.",
@@ -657,8 +671,11 @@ static void tab_display(bool in_game) {
             ud = udm;
             opt_disable_next();
         }
-        if (opt_choice("Upscaler", &ui, ups, 2, g_default_upscaler == UPSCALE_BILINEAR ? 0 : 1, ud))
-            g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR, g_settings.upscaler_auto = false;
+#else
+        (void)udm;
+#endif
+        if (opt_choice("Upscaler", &ui, ups, nups, udef, ud))
+            g_settings.upscaler = ui == 0 ? UPSCALE_BILINEAR : ui == 2 ? UPSCALE_SGSR : UPSCALE_SHARP, g_settings.upscaler_auto = false;
     }
     const char *aa[] = {TR("Off", "Desligado"), "SMAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,

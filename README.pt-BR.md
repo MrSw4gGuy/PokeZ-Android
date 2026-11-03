@@ -38,7 +38,7 @@ como são), então nenhum emulador e nenhuma tradução de instruções rodam en
 - [Estado](#estado)
 - [Requisitos](#requisitos)
 - [Compilar e instalar](#compilar-e-instalar)
-- [Controles](#controles)
+- [Controles](#controles) ([Qualidade de imagem](#qualidade-de-imagem))
 - [Saves](#saves)
 - [O que muda em relação à versão de PC](#o-que-muda-em-relação-à-versão-de-pc)
 - [Problemas](#problemas)
@@ -54,20 +54,23 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 |---|---|
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
-| Cenas da introdução, trem, Lumiose | Funciona, com os bugs visuais abaixo |
-| Taxa de quadros | 30 fps (a taxa do próprio jogo no Switch) nas cenas testadas até agora |
+| Cenas da introdução, trem, Lumiose | Funciona: sem bugs visuais pesados (fora os olhos, abaixo), só o pop-in do próprio jogo |
+| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch) nas cenas testadas até agora |
 | Textos e caixas de diálogo | Funciona |
 | Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
 | Controles de toque | Funciona (direcional testado nos menus do jogo; o resto em teste) |
 | Salvar | Funciona |
 | Memória | Cerca de 3 GB em uso |
-| Aquecimento | A resolução baixa sozinha conforme o celular esquenta (folga térmica) |
+| Aquecimento | A resolução baixa sozinha conforme o celular esquenta (folga térmica): 75% da tela, até cerca de 45% quando quente |
+| Upscaling | Snapdragon Game Super Resolution (o upscaler da própria Qualcomm) por padrão; AMD FSR 1 e bilinear no menu |
 | DLC *Mega Dimension* | Ainda não testado |
 
 **Bugs visuais conhecidos** (em correção):
 - Alguns olhos aparecem errados: a íris desenhada em quadradinhos azuis e brancos, um retângulo escuro atrás do olho
   de alguns Pokémon.
-- Faixas claras retas e retângulos translúcidos sobre rostos e corpos em algumas cenas.
+- Faixas claras retas e fracas sobre rostos e corpos em algumas cenas de close (vistas numa run).
+- A imagem fica menos nítida quando o celular esquenta: a resolução baixa para segurar a temperatura (veja
+  [Qualidade de imagem](#qualidade-de-imagem)).
 
 ## Requisitos
 
@@ -106,6 +109,18 @@ esse guia tem cada passo e opção. Resumindo:
   esquerdo que aparece onde o polegar encosta, e arrastar na metade direita da tela para a câmera. Somem enquanto um
   controle está em uso e voltam no próximo toque.
 - **Menu de configurações**: o botão ☰ no alto da tela, ou o gesto de Voltar do Android.
+- **Layout**: o do Switch por padrão - o botão da direita é o A (confirmar), o de baixo o B (voltar), no jogo e nos
+  menus, com os ícones da Nintendo. **Configurações > Controles > Layout A/B/X/Y > Xbox** coloca o A embaixo.
+
+### Qualidade de imagem
+
+O jogo renderiza abaixo da resolução da tela e é ampliado: 75% da tela no começo, e um degrau a menos cada vez que o
+celular esquenta (até cerca de 45%). Em **Configurações > Vídeo**:
+- **Upscaler**: *Snapdragon GSR* (o padrão: o da própria Qualcomm, feito para Adreno), *AMD FSR 1* ou *Bilinear* (o
+  mais suave).
+- **Resolução interna**: *Igual à tela* (100%) para uma imagem mais nítida, ao custo de mais calor (e por isso mais
+  degraus depois).
+- **Anti-aliasing**: *SMAA* suaviza as bordas serrilhadas, com um custo pequeno.
 
 ## Saves
 
@@ -146,6 +161,8 @@ arquivos do Switch e da versão de PC, então passam de um para o outro sem conv
   [shaderc](https://github.com/google/shaderc), [LibHac](https://github.com/Thealexbarney/LibHac) e as outras listadas
   em [docs/LASRecomp-README.md](docs/LASRecomp-README.md#license). Fontes incluídas no APK: BIZ UDPGothic (SIL OFL) e
   DejaVu Sans.
+- **[Snapdragon Game Super Resolution](https://github.com/SnapdragonGameStudios/snapdragon-gsr)**, da Qualcomm
+  Innovation Center (BSD-3-Clause, [third_party/sgsr](third_party/sgsr/LICENSE)): o upscaler padrão.
 
 ## Aviso legal
 

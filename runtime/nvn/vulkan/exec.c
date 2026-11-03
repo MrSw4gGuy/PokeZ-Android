@@ -10222,19 +10222,22 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
     if (oh > 16384) oh = 16384;
     uint32_t cw = (uint32_t)lroundf(b->width * fx), ch = (uint32_t)lroundf(b->height * fy);  // (the contents' size)
     bool fsr = g_settings.upscaler == UPSCALE_FSR1 && (ow > cw + 1 || oh > ch + 1);  // (an upscale only)
-    *upscaled = fsr;
+    // Snapdragon GSR 1 (shaders.c sgsr1.frag): its own sharpening in the same pass, so no RCAS after it unless one is
+    // chosen in F1 (Auto: none)
+    bool sgsr = g_settings.upscaler == UPSCALE_SGSR && (ow > cw + 1 || oh > ch + 1);
+    *upscaled = fsr || sgsr;
     // Internal resolution above the window's: the present's one bilinear tap reads at most 2 x 2 source texels per
     // window pixel - all of them at 2x, 1 in 9 at 3x (its centre: no anti-aliasing at all), 4 in 16 at 4x - so the
     // higher resolutions looked worse than 2x. A box filter over each window pixel's whole footprint instead.
-    bool down = !fsr && ow && oh && (ow + 1 < cw || oh + 1 < ch);
-    *upscaled = fsr || down;  // (the result fills the window: no contents' scale left for the present)
+    bool down = !fsr && !sgsr && ow && oh && (ow + 1 < cw || oh + 1 < ch);
+    *upscaled = fsr || sgsr || down;  // (the result fills the window: no contents' scale left for the present)
     // F1 Sharpening (FSR 1's RCAS, settings.h SHARPEN_*): RCAS's strength in stops (0: strongest; < 0: none). Auto:
     // AMD's default 0.2 after an FSR upscale only, as before; Low / Medium / High also after the box downscale or on
     // the image at its own size.
     static const float stops[SHARPEN_N] = {0.2f, -1, 1.0f, 0.5f, 0.1f};
     int sm = g_settings.sharpen >= 0 && g_settings.sharpen < SHARPEN_N ? g_settings.sharpen : SHARPEN_AUTO;
     float sharp = sm == SHARPEN_AUTO && !fsr ? -1 : stops[sm];
-    if (!smaa && !fsr && !down && sharp < 0) return v;
+    if (!smaa && !fsr && !sgsr && !down && sharp < 0) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
     vk_frame_suspend();
@@ -10272,6 +10275,20 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
             v = post_view(r);
         }
     }
+    if (sgsr) {
+        float tw = (float)b->width, th = (float)b->height;  // (SGSR samples by uv: the contents' part of the texture)
+        TexBackend *e = post_image(3, ow, oh), *r = post_image(4, ow, oh);
+        float pg[8] = {1.0f / tw, 1.0f / th, tw, th, (float)cw / tw / ow, (float)ch / th / oh};
+        VkImageView gi[3] = {v};
+        post_pass(cb, "sgsr1.frag", gi, 1, e, pg, false);
+        v = post_view(e);
+        if (sharp >= 0) {
+            float pr[8] = {exp2f(-sharp), 0, 0, 0, (float)ow, (float)oh};
+            VkImageView ri_[3] = {v};
+            post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
+            v = post_view(r);
+        }
+    }
     if (down) {
         float pd[8] = {(float)cw / ow, (float)ch / oh, (float)cw, (float)ch};  // (the contents: Dynamic resolution)
         TexBackend *d = post_image(5, ow, oh);
@@ -10279,7 +10296,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
         post_pass(cb, "boxdown.frag", di, 1, d, pd, false);
         v = post_view(d);
     }
-    if (sharp >= 0 && !fsr) {  // (after the box downscale: at the window's size; else the contents' part of the image)
+    if (sharp >= 0 && !fsr && !sgsr) {  // (after the box downscale: at the window's size; else the contents' part of the image)
         uint32_t sw = down ? ow : cw, sh = down ? oh : ch;
         TexBackend *r = down ? post_image(4, ow, oh) : post_image(6, b->width, b->height);
         float pr[8] = {exp2f(-sharp), 0, 0, 0, (float)sw, (float)sh};  // (RCAS reads clamped to the contents)
@@ -10293,12 +10310,13 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
     vk_frame_resume();
     {
         static uint32_t piw, pih, pow_, poh;
-        static int psm = -1, pfs = -1, pdn = -1;
+        static int psm = -1, pfs = -1, pdn = -1, psg = -1;
         static float psh = -2;
-        if (b->width != piw || b->height != pih || ow != pow_ || oh != poh || smaa != psm || fsr != pfs || down != pdn || sharp != psh)
-            LOG("[post] %ux%u%s%s%s -> %ux%u, sharpening %.1f\n", b->width, b->height, smaa ? " smaa" : "", fsr ? " fsr1" : "",
-                down ? " box" : "", ow, oh, sharp);
-        piw = b->width; pih = b->height; pow_ = ow; poh = oh; psm = smaa; pfs = fsr; pdn = down; psh = sharp;
+        if (b->width != piw || b->height != pih || ow != pow_ || oh != poh || smaa != psm || fsr != pfs || down != pdn ||
+            sharp != psh || sgsr != psg)
+            LOG("[post] %ux%u%s%s%s%s -> %ux%u, sharpening %.1f\n", b->width, b->height, smaa ? " smaa" : "", fsr ? " fsr1" : "",
+                sgsr ? " sgsr" : "", down ? " box" : "", ow, oh, sharp);
+        piw = b->width; pih = b->height; pow_ = ow; poh = oh; psm = smaa; pfs = fsr; pdn = down; psh = sharp; psg = sgsr;
     }
     return v;
 }

@@ -46,7 +46,14 @@ Settings g_settings = {
     .rumble = true,
     .rumble_strength = 100,
     .controller_light = true,
+    #ifdef __ANDROID__
+    // (Android: the Switch's layout everywhere by default - the right button confirms in these menus too and the
+    // icons are Nintendo's, whatever family the controller reports; F1 > Controls > A/B/X/Y layout turns it round)
+    .menu_confirm = MENU_CONFIRM_GAME,
+    .prompts = PROMPTS_NINTENDO,
+#else
     .menu_confirm = MENU_CONFIRM_CONTROLLER,
+#endif
     .show_fps = false,
     .fps60_lock = true,  // ("Drop to 30 fps when needed" off unless the player turns it on)
     .tex_hd = true,
@@ -149,11 +156,17 @@ void settings_resolve_defaults(bool integrated) {
     if (e && *e) integrated = atoi(e) != 0;
     g_gpu_integrated = integrated;
     g_default_upscaler = integrated ? UPSCALE_BILINEAR : UPSCALE_SHARP;
+#ifdef __ANDROID__
+    // (a phone renders well below its screen - 75% by default, less once it is warm: an edge-aware upscale is worth
+    // its fraction of a millisecond there. Qualcomm's own, made for Adreno: one pass, upscale and sharpening)
+    g_default_upscaler = UPSCALE_SGSR;
+#endif
     g_default_res_mode = RES_MATCH;  // (Dynamic is not a default until it is reliable: user 2026-10-18)
     if (g_settings.upscaler_auto) g_settings.upscaler = g_default_upscaler;
     if (g_settings.res_auto) g_settings.res_mode = g_default_res_mode;
     LOG("[settings] %s GPU: upscaler %s (%s), resolution %s (%s), anti-aliasing %s\n", integrated ? "integrated" : "discrete / other",
-        g_settings.upscaler == UPSCALE_BILINEAR ? "bilinear" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "metalfx",
+        g_settings.upscaler == UPSCALE_BILINEAR ? "bilinear" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" :
+        g_settings.upscaler == UPSCALE_SGSR ? "sgsr" : "metalfx",
         g_settings.upscaler_auto ? "default" : "chosen", res_name(g_settings.res_mode), g_settings.res_auto ? "default" : "chosen",
         g_settings.antialias == AA_SMAA ? "smaa" : "off");
 }
@@ -222,6 +235,9 @@ void settings_video_recommend(unsigned vendor, bool integrated, uint64_t vram, c
     r->res_mode = p == VPROF_LIGHT ? RES_Q75 : p == VPROF_ULTRA ? RES_X15 : 1;
     r->fps60 = p >= VPROF_HIGH;
     r->aniso16 = p != VPROF_LIGHT;
+#ifdef __ANDROID__
+    r->aniso16 = true;  // (mobile GPUs filter 16x for next to nothing; without it the ground blurs into blocks at a distance)
+#endif
     snprintf(r->gpu, sizeof r->gpu, "%s", gpu_name ? gpu_name : "");
     r->known = true;
     LOG("[settings] recommended video: %s (%s, %llu GB video memory, %d threads, %d GB RAM): resolution %s, %s fps%s\n",
@@ -320,7 +336,12 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "upscaler")) {  // (metalfx / fsr1: this OS's; auto: never chosen, the GPU's default)
             g_settings.upscaler_auto = !strcmp(val, "auto");
-            if (!g_settings.upscaler_auto) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;
+            if (!g_settings.upscaler_auto)
+                g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
+#ifndef __APPLE__
+                                      : !strcmp(val, "sgsr") ? UPSCALE_SGSR  // (Vulkan only)
+#endif
+                                      : UPSCALE_SHARP;
             else g_settings.upscaler = g_default_upscaler;
         }
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
@@ -444,7 +465,7 @@ void settings_save(void) {
     fprintf(f, "water_vivid = %d\n", g_settings.water_vivid);
     fprintf(f, "tex_dump = %d\n", g_settings.tex_dump);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler_auto ? "auto" : g_settings.upscaler == UPSCALE_METALFX ? "metalfx" :
-                                   g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
+                                   g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : g_settings.upscaler == UPSCALE_SGSR ? "sgsr" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "sharpening = %s\n", sharpen_names[g_settings.sharpen >= 0 && g_settings.sharpen < SHARPEN_N ? g_settings.sharpen : 0]);
     fprintf(f, "temporal_aa = %s\n", g_settings.taa ? "fsr2" : "game");
