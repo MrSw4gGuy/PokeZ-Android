@@ -107,7 +107,7 @@ static bool fps60_holds(void) {
         if (!dyn || cpu < 0 || cpu >= FPS60_BACK_MS || !(scene || timer)) return false;
         LOG("[pace] trying 60 fps again (%s; %.1f ms CPU a frame)%s\n", scene ? "the scene changed" : "a while at 30", cpu,
             backoff > 1 ? " (backing off)" : "");
-        menu_notice("Trying 60 fps again.", 3);
+        menu_notice(UI_TR("Trying 60 fps again.", "Tentando 60 fps de novo."), 3);
         g_fps60_fell_back = false, retry = true, warm = slow = held_s = 0, back_at = now;
         return true;
     }
@@ -126,10 +126,14 @@ static bool fps60_holds(void) {
     if (back_at && now - back_at < FPS60_FLICKER_S * 1000000000ull && backoff < 8) backoff *= 2;
     LOG("[pace] 60 fps not held (%.0f fps for %d s): back to 30 fps - below 60 the game moves in slow motion%s\n", fps,
         slow, dyn ? " (60 again when there is room)" : "");
-    if (dyn) menu_notice("30 fps for now: 60 wasn't held, and below that the game moves in slow motion. Back to 60 "
-                         "by itself when there is room.", 5);
-    else menu_notice("60 fps turned off: this PC didn't keep 60 fps, and below that the game moves in slow motion. "
-                     "Back to 30 fps (choose 60 again in F1 to retry).", 8);
+    if (dyn) menu_notice(UI_TR("30 fps for now: 60 wasn't held, and below that the game moves in slow motion. Back to 60 "
+                               "by itself when there is room.",
+                               "30 fps por enquanto: não segurou 60, e abaixo disso o jogo fica em câmera lenta. Volta para "
+                               "60 sozinho quando houver folga."), 5);
+    else menu_notice(UI_TR("60 fps turned off: this PC didn't keep 60 fps, and below that the game moves in slow motion. "
+                           "Back to 30 fps (choose 60 again in F1 to retry).",
+                           "60 fps desligado: não segurou 60, e abaixo disso o jogo fica em câmera lenta. De volta a 30 "
+                           "fps (escolha 60 de novo no menu para tentar outra vez)."), 8);
     return false;
 }
 int32_t rt_za_frame_cfg(int32_t cfg) {
