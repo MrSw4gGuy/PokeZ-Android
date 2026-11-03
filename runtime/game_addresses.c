@@ -6,7 +6,10 @@
 
 #include "rt.h"
 
-#define GA_ADDR(name, value) .name = UINT64_C(value),
+// The tables are written as desktop guest addresses; they move with the window (rt.h GUEST_SHIFT, zero on the
+// desktop). Only values inside the desktop window are addresses: MAIN_CODE_SIZE, a size, must stay as it is.
+#define GA_REBASE(v) ((v) >= 0x7000000000ull && (v) < 0x8000000000ull ? GUEST_REBASE(v) : (v))
+#define GA_ADDR(name, value) .name = GA_REBASE(UINT64_C(value)),
 static const GameAddrs ga_v1_0_0 = {
 #include "game_addresses/patches_v1_0_0.h"
 #include "game_addresses/runtime_v1_0_0.h"

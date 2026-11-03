@@ -23,8 +23,7 @@
 #include "hle.h"
 #include "settings.h"
 
-#define MAIN_BASE 0x7000000000ull
-#define WORD_TAB 256
+#define WORD_TAB 256  // (MAIN_BASE: rt.h's, through hle.h - a local copy kept the desktop address on Android)
 
 static struct { uint64_t addr; uint32_t word; } words[WORD_TAB];
 static int nwords;

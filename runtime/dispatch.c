@@ -159,9 +159,9 @@ RtJmp *rt_setjmp_site(Cpu *c, uint64_t ret) {
 // Skipping the empty delegate is no way out (the game then stays on an empty screen for good), so each step waits for
 // what it needs, within reason. The "[boot]" lines tell which case a report was. LARECOMP_BOOT_DELEGATE_WAIT=0: no waits.
 // LARECOMP_TEST_OBJECT_LATE=<ms>: the object seems not ready at the first step for that long (with no waits: the crash).
-#define BOOT_DELEGATE_OBJ 0x7006109cc0ull
-#define BOOT_DELEGATE_SET 0x7000ac2a2cull
-#define BOOT_DELEGATE_USE 0x7000bbb0dcull
+#define BOOT_DELEGATE_OBJ GUEST_REBASE(0x7006109cc0ull)  // (desktop addresses, moved with the window: rt.h)
+#define BOOT_DELEGATE_SET GUEST_REBASE(0x7000ac2a2cull)
+#define BOOT_DELEGATE_USE GUEST_REBASE(0x7000bbb0dcull)
 #define BOOT_OBJ_READY ((volatile uint32_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x140))
 #define BOOT_OBJ_DONE ((volatile uint8_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x100))
 #define BOOT_OBJ_FN ((volatile uint64_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0xc0 + 0x20))

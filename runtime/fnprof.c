@@ -34,9 +34,9 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
     for (int i = 0; i < bt_n; i++)
         if (bt_addrs[i] == a && !atomic_exchange(&bt_done[i], 1)) {
             if (i == 0) g_bt_first_x0 = x0;
-            uint64_t vt = x0 >= 0x7000000000ull && x0 < 0x7800000000ull ? *(uint64_t *)(uintptr_t)x0 : 0;
-            uint64_t v100 = vt >= 0x7000000000ull && vt < 0x7800000000ull ? *(uint64_t *)(uintptr_t)(vt + 0x100) : 0;
-            uint64_t p8 = x0 >= 0x7000000000ull && x0 < 0x7800000000ull ? *(uint64_t *)(uintptr_t)(x0 + 8) : 0;
+            uint64_t vt = x0 >= GUEST_LO && x0 < GUEST_HI ? *(uint64_t *)(uintptr_t)x0 : 0;
+            uint64_t v100 = vt >= GUEST_LO && vt < GUEST_HI ? *(uint64_t *)(uintptr_t)(vt + 0x100) : 0;
+            uint64_t p8 = x0 >= GUEST_LO && x0 < GUEST_HI ? *(uint64_t *)(uintptr_t)(x0 + 8) : 0;
             fprintf(stderr, "[fnprof-bt] %llx entered from guest lr %llx x0 %llx (vtable %llx, +0x100 %llx, [x0+8] %llx):\n",
                     (unsigned long long)a, (unsigned long long)lr, (unsigned long long)x0, (unsigned long long)vt,
                     (unsigned long long)v100, (unsigned long long)p8);
@@ -80,7 +80,7 @@ static void dbg_scan(uint64_t frame) {
     if (at < 0 || (long)frame != at) return;
     at = -1;
     int hits = 0;
-    for (uint64_t a = 0x7000000000ull; a < 0x7800000000ull && hits < 50;) {
+    for (uint64_t a = GUEST_LO; a < GUEST_HI && hits < 50;) {
         MEMORY_BASIC_INFORMATION mi;
         if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) break;
         uint64_t end = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;

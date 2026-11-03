@@ -4,7 +4,7 @@
 
 #include "rt.h"
 
-#define STACK_BASE 0x7200000000ull
+#define STACK_BASE GUEST_REBASE(0x7200000000ull)  // (rt.h: moved with the rest of the window)
 #define STACK_SIZE 0x0040000000ull
 
 typedef enum { KOBJ_THREAD = 1, KOBJ_EVENT, KOBJ_SESSION, KOBJ_SHMEM, KOBJ_TMEM } KType;

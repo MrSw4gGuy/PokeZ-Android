@@ -28,28 +28,45 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 // ---- address space layout (guest addresses == host addresses)
 // macOS reserves 0x2_0000_0000-0x70_0000_0000, and guest addresses must fit in 39 bits, so the
 // guest lives in a 12.5 GB window at 0x70_0000_0000 claimed at startup (see main.c).
+#ifdef __ANDROID__
+// Android cannot use 0x70_0000_0000: scudo, the platform's hardened allocator, reserves its primary regions
+// from 0x6f_ff89_8000 upward while libc starts, long before any constructor of ours runs, and it lands in the
+// same place every launch - so the re-exec retry in main.c would never find a free layout (and an app cannot
+// re-exec anyway). Measured on an SM-S936B, the free gaps are 0x0e-0x57, 0x57-0x6e and 0x72-0x7f GB-wise; the
+// window goes in the middle of the first, where Android keeps nothing (scudo sits near the top of the address
+// space, so a reboot moving it does not reach down here).
+#define GUEST_LO     0x2000000000ull
+#else
 #define GUEST_LO     0x7000000000ull
+#endif
+// Everything below is written as its desktop address and moved by GUEST_SHIFT, the distance between this
+// platform's window and the desktop one: zero on Windows, Linux and macOS, so nothing there changes. The same
+// shift moves the game's own address tables (game_addresses.c) and the generator's patch and hook sites
+// (tools/game_addresses.py), which are all written as desktop addresses too. Unsigned wrap-around makes a
+// negative shift work: GUEST_REBASE(0x7200000000) on Android is 0x2200000000.
+#define GUEST_SHIFT      (GUEST_LO - 0x7000000000ull)
+#define GUEST_REBASE(a)  ((a) + GUEST_SHIFT)
 #ifdef __APPLE__
 #define GUEST_HI     0x7320000000ull
 #else  // room for an SDK's virtual address memory too (Pokémon Legends Z-A reserves 12 GB; MAP_NORESERVE)
-#define GUEST_HI     0x7800000000ull
+#define GUEST_HI     GUEST_REBASE(0x7800000000ull)
 #endif
-#define MAIN_BASE    0x7000000000ull
-#define SDK_BASE     0x7008000000ull   // (128 MB for main: Pokémon Legends Z-A's image is 0x5f7a000)
-#define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
+#define MAIN_BASE    GUEST_REBASE(0x7000000000ull)
+#define SDK_BASE     GUEST_REBASE(0x7008000000ull)   // (128 MB for main: Pokémon Legends Z-A's image is 0x5f7a000)
+#define HLE_BASE     GUEST_REBASE(0x7080000000ull)   // fake addresses for host-implemented functions
+#define TLS_BASE     GUEST_REBASE(0x7090000000ull)
 #define HLE_SIZE     0x0000100000ull
-#define TLS_BASE     0x7090000000ull
 #define TLS_SIZE     0x0000100000ull
-#define HLE_HEAP     0x7092000000ull   // guest-visible memory owned by host code
+#define HLE_HEAP     GUEST_REBASE(0x7092000000ull)   // guest-visible memory owned by host code
 #define HLE_HEAP_SIZE 0x000E000000ull
 #ifdef __APPLE__
 #define ALIAS_BASE   0x7100000000ull   // alias region (svcMapMemory targets)
 #define ALIAS_SIZE   0x0100000000ull
 #else  // alias region (svcMapMemory targets; an SDK's virtual address memory reserves its address regions here)
-#define ALIAS_BASE   0x7400000000ull
+#define ALIAS_BASE   GUEST_REBASE(0x7400000000ull)
 #define ALIAS_SIZE   0x0400000000ull   // 16 GB, up to GUEST_HI
 #endif
-#define HEAP_BASE    0x7240000000ull
+#define HEAP_BASE    GUEST_REBASE(0x7240000000ull)
 #define HEAP_MAX     0x00D0000000ull   // 3.25 GB
 
 // ---- the game (kernel.c; set from exefs/main.npdm by main.c)

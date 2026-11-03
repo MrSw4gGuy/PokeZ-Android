@@ -191,7 +191,10 @@ typedef struct {
 } Gen;
 
 static PlatProc gen_start(const Tools *t, const Gen *g, int i, const char *game_dir) {
-    static const char *const base[2] = {"0x7000000000", "0x7008000000"};
+    // the same bases the runtime loads the modules at (rt.h), or the generated code would not match them
+    char base[2][24];
+    snprintf(base[0], sizeof base[0], "0x%llx", (unsigned long long)MAIN_BASE);
+    snprintf(base[1], sizeof base[1], "0x%llx", (unsigned long long)SDK_BASE);
     char nso[1100];
     snprintf(nso, sizeof nso, "%s" SEP "exefs" SEP "%s", game_dir, g->name);
     Args a = {0};

@@ -71,20 +71,32 @@ def version_for_build_id(build_id):
 ADDRESS = SimpleNamespace()
 SELECTED = None
 
+# The tables are written as desktop guest addresses, with main at DESKTOP_MAIN. A main module generated at another
+# base (Android puts the window at 0x20_0000_0000: runtime/rt.h GUEST_SHIFT) moves them all by the same distance, so
+# the patch and hook sites patches.py builds from ADDRESS line up with the instructions being lifted. Without this the
+# sites were never matched and an Android build silently came out with no patches and no hooks at all.
+DESKTOP_MAIN = 0x7000000000
 
-def select_version(key):
+
+def rebase(values, shift):
+    """Move every value inside the desktop window by shift; anything else is not an address and stays (as
+    runtime/game_addresses.c GA_REBASE does: MAIN_CODE_SIZE is a size)."""
+    return {k: v + shift if DESKTOP_MAIN <= v < 0x8000000000 else v for k, v in values.items()}
+
+
+def select_version(key, shift=0):
     """Fill ADDRESS from patches_<key>.h (in place: modules that imported it see the new values)."""
     global SELECTED
     if key not in VERSIONS:
         raise UnknownGameVersion(f'Unknown game version {key}')
     ADDRESS.__dict__.clear()
-    ADDRESS.__dict__.update(load_table(table_path(key)))
+    ADDRESS.__dict__.update(rebase(load_table(table_path(key)), shift))
     SELECTED = key
     return key
 
 
-def select_build_id(build_id):
-    return select_version(version_for_build_id(build_id))
+def select_build_id(build_id, shift=0):
+    return select_version(version_for_build_id(build_id), shift)
 
 
 def addr_text(code):

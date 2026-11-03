@@ -605,15 +605,18 @@ def main():
     m = Module(args.name, args.nso, args.base, args.simd)
     global HOOKS, PATCHES
     main_build = Nso(os.path.join(os.path.dirname(args.nso), 'main')).build_id[:16]
+    # patch and hook sites are written as desktop addresses (main at 0x70_0000_0000); a main module generated at
+    # another base gets them moved by the same distance (zero on the desktop: runtime/rt.h GUEST_SHIFT)
+    shift = args.base - 0x7000000000 if args.name == 'main' else 0
     if main_build in ZA_BUILDS:  # Pokémon Legends Z-A: its own patches, none of Link's Awakening's (nor its randomizer's)
         RANDO_CODE.clear()
         if args.name == 'main':
-            PATCHES.update(za_patches(main_build))
+            PATCHES.update({a + shift: p for a, p in za_patches(main_build).items()})
             print(f'{args.name}: Pokémon Legends Z-A (build {main_build}): {len(PATCHES)} game patch(es)')
     elif args.name == 'main':
         import game_addresses
         try:
-            version = game_addresses.select_build_id(m.nso.build_id)
+            version = game_addresses.select_build_id(m.nso.build_id, shift)
         except game_addresses.UnknownGameVersion as e:
             sys.exit(f'{args.name}: {e}')
         import patches
