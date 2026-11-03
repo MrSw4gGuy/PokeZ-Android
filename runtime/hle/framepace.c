@@ -54,31 +54,58 @@ uint32_t rt_frame_steps(uint32_t interval) {
 // (fps60_lock): 60, no backing off - for players who'd rather have some slow motion than 30 fps.
 // Seconds spent building shaders count neither way (#22: an RX 9070 XT with a cold pipeline cache had three 1-2 s
 // shader stalls in a battle and went back to 30 for the session, holding 60 otherwise).
+// Back up again (dynamic 30 / 60): held at 30, the frame's measured work (nvn/pace.c pace_frame_costs: the presenting
+// thread's busy time and the GPU's time per frame - what a frame costs at 60 too, Z-A stepping its world once a frame
+// either way) under FPS60_BACK_MS on both for FPS60_BACK_S seconds in a row tries 60 again, with a shorter test
+// (FPS60_RETRY_WARM_S + FPS60_RETRY_SLOW_S: each failed try is about that much slow motion). A try that fails within
+// FPS60_FLICKER_S doubles the wait, up to 8x (a phone right at the edge, cooling at 30 and warming at 60: no 60 / 30
+// flicker); a minute at 60 resets it. Unmeasured (no GPU timer): it stays at 30, as before. The overlay says each
+// change. LARECOMP_FPS60_DYNAMIC=0: back to 30 for the rest of the session, as before.
 #include "../settings.h"
 #include "../platform.h"
+#include "../nvn/pace.h"
 #define FPS60_MIN 50
 #define FPS60_SLOW_S 5
 #define FPS60_WARM_S 5
+#define FPS60_BACK_MS 12.5
+#define FPS60_BACK_S 5
+#define FPS60_RETRY_WARM_S 1
+#define FPS60_RETRY_SLOW_S 2
+#define FPS60_FLICKER_S 20
 bool g_za_frame_hook;    // (the game is Pokémon Z-A: exec.c leaves its GPU timing counters alone)
-bool g_fps60_fell_back;  // (60 fps chosen, but this session went back to 30: runtime/ui/menu.mm says so)
+bool g_fps60_fell_back;  // (60 fps chosen, but the game is at 30 now: runtime/ui/menu.mm says so)
 static bool fps60_holds(void) {
     extern uint64_t renderer_present_count(void);
     extern void menu_notice(const char *text, int seconds);
-    static int last_setting = -1, warm, slow;
-    static uint64_t t0, p0;
+    static int last_setting = -1, warm, slow, fits, backoff = 1, dyn = -1;
+    static bool retry;  // (60 again after a fall back: the shorter test)
+    static uint64_t t0, p0, back_at;
+    if (dyn < 0) dyn = !ENV("LARECOMP_FPS60_DYNAMIC") || atoi(ENV("LARECOMP_FPS60_DYNAMIC")) != 0;
     int setting = g_settings.fps60 | g_settings.fps60_lock << 1;
     if (last_setting != setting) {  // (chosen again in F1: a new try)
         last_setting = setting;
-        g_fps60_fell_back = false, warm = slow = 0, t0 = 0;
+        g_fps60_fell_back = retry = false, warm = slow = fits = 0, backoff = 1, t0 = back_at = 0;
     }
-    if (!g_settings.fps60 || g_fps60_fell_back) return false;
+    if (!g_settings.fps60) return false;
     if (g_settings.fps60_lock) return true;
     uint64_t now = plat_now_ns(), pc = renderer_present_count();
-    if (!t0) { t0 = now, p0 = pc; return true; }
-    if (now - t0 < 1000000000ull) return true;
+    if (!t0) { t0 = now, p0 = pc; return !g_fps60_fell_back; }
+    if (now - t0 < 1000000000ull) return !g_fps60_fell_back;
     double fps = (double)(pc - p0) * 1e9 / (double)(now - t0);
     t0 = now, p0 = pc;
-    if (warm < FPS60_WARM_S) { warm++; return true; }
+    if (g_fps60_fell_back) {  // (held at 30, once a second: is there room for 60 again?)
+        double busy, gpu;
+        pace_frame_costs(&busy, &gpu);
+        fits = dyn && busy >= 0 && gpu >= 0 && busy < FPS60_BACK_MS && gpu < FPS60_BACK_MS ? fits + 1 : 0;
+        if (fits < FPS60_BACK_S * backoff) return false;
+        LOG("[pace] room for 60 fps again (%.1f ms busy, GPU %.1f ms a frame): trying 60%s\n", busy, gpu,
+            backoff > 1 ? " (backing off)" : "");
+        menu_notice("Back to 60 fps.", 3);
+        g_fps60_fell_back = false, retry = true, warm = slow = fits = 0, back_at = now;
+        return true;
+    }
+    if (back_at && now - back_at > 60000000000ull) back_at = 0, backoff = 1, retry = false;  // (a minute at 60: as new)
+    if (warm < (retry ? FPS60_RETRY_WARM_S : FPS60_WARM_S)) { warm++; return true; }
     static double min = -1;  // LARECOMP_FPS60_MIN: another floor (tests: 59 makes a busy scene back off)
     if (min < 0) min = ENV("LARECOMP_FPS60_MIN") ? atof(ENV("LARECOMP_FPS60_MIN")) : FPS60_MIN;
     extern uint64_t renderer_shader_builds(void);  // (the renderer: builds done, top bit = one being built now)
@@ -87,11 +114,15 @@ static bool fps60_holds(void) {
     bool building = (b >> 63) || (b & ~(1ull << 63)) - (b0 & ~(1ull << 63)) >= 2;  // (one now, or a few this second)
     b0 = b;
     if (!building) slow = fps < min ? slow + 1 : 0;
-    if (slow < FPS60_SLOW_S) return true;
-    g_fps60_fell_back = true;
-    LOG("[pace] 60 fps not held (%.0f fps for %d s): back to 30 fps - below 60 the game moves in slow motion\n", fps, slow);
-    menu_notice("60 fps turned off: this PC didn't keep 60 fps, and below that the game moves in slow motion. "
-                "Back to 30 fps (choose 60 again in F1 to retry).", 8);
+    if (slow < (retry ? FPS60_RETRY_SLOW_S : FPS60_SLOW_S)) return true;
+    g_fps60_fell_back = true, fits = 0;
+    if (back_at && now - back_at < FPS60_FLICKER_S * 1000000000ull && backoff < 8) backoff *= 2;
+    LOG("[pace] 60 fps not held (%.0f fps for %d s): back to 30 fps - below 60 the game moves in slow motion%s\n", fps,
+        slow, dyn ? " (60 again when there is room)" : "");
+    if (dyn) menu_notice("30 fps for now: 60 wasn't held, and below that the game moves in slow motion. Back to 60 "
+                         "by itself when there is room.", 5);
+    else menu_notice("60 fps turned off: this PC didn't keep 60 fps, and below that the game moves in slow motion. "
+                     "Back to 30 fps (choose 60 again in F1 to retry).", 8);
     return false;
 }
 int32_t rt_za_frame_cfg(int32_t cfg) {

@@ -147,6 +147,11 @@ void pace_settings_changed(const char *what) {
 }
 
 bool pace_is_slow(void) { return pace_slow; }
+// (Pokémon Z-A's dynamic 30 / 60, hle/framepace.c) the presenting thread's busy time per presented frame and the
+// GPU's, moving averages over ~20 frames, ms (-1: not measured yet / no GPU timer). Whatever the rate: at 30 fps a
+// frame's work is what it would be at 60 - Z-A steps its world once a frame in either mode.
+static double g_busy_avg = -1, g_gpu_avg = -1;
+void pace_frame_costs(double *busy_ms, double *gpu_ms) { *busy_ms = g_busy_avg, *gpu_ms = g_gpu_avg; }
 uint64_t pace_frames_over(void) {
     uint64_t n = stat_pace_over;
     stat_pace_over = 0;
@@ -255,6 +260,7 @@ void pace_frame(void) {
     if (pace_slow && rc / 1e6 > cost && rc < 60000000ull) cost = rc / 1e6;
     avg = avg ? avg + (cost - avg) * 0.05 : cost;
     if (gpu_ms >= 0) gpu_avg = gpu_avg >= 0 ? gpu_avg + ((gpu_ms < 100 ? gpu_ms : 100) - gpu_avg) * 0.05 : gpu_ms;
+    g_busy_avg = g_busy_avg >= 0 ? g_busy_avg + (busy - g_busy_avg) * 0.05 : busy, g_gpu_avg = gpu_avg;
     static int log = -1;  // LARECOMP_LOG_PACE=1: each frame's period, vsync wait and busy time
     if (log < 0) log = getenv("LARECOMP_LOG_PACE") != NULL;
     extern __thread uint64_t g_rq_wait_ns;  // rqueue.c: waits for the render thread (translation), counted as busy

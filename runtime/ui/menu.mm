@@ -486,18 +486,21 @@ static void tab_display(bool in_game) {
                 g_settings.fps60 = fr == 1;
             bool fall = !g_settings.fps60_lock;
             ImGui::BeginDisabled(!g_settings.fps60);
-            if (opt_toggle(TR("Drop to 30 fps when needed", "Cair para 30 fps quando preciso"), &fall, false,
-                           TR("With 60 fps: when this PC doesn't keep 60 for a few seconds, the game goes back to 30 fps by "
-                              "itself instead of running in slow motion (choose 60 fps again to retry). Off: it stays at "
-                              "60 - smoother when the PC keeps up, slow motion whenever it doesn't.",
-                              "Com 60 fps: quando este PC não segura 60 por alguns segundos, o jogo volta para 30 fps sozinho "
-                              "em vez de rodar em câmera lenta (escolha 60 fps de novo para tentar outra vez). Desligado: "
-                              "fica em 60 - mais fluido quando o PC acompanha, câmera lenta quando não acompanha.")))
+            if (opt_toggle(TR("Dynamic 30 / 60 fps", "30 / 60 fps dinâmico"), &fall, false,
+                           TR("With 60 fps: when this PC doesn't keep 60 for a few seconds, the game goes to 30 fps by "
+                              "itself instead of running in slow motion, and back to 60 once there is room again (the "
+                              "frame's work measured at 30). Off: it stays at 60 - smoother when the PC keeps up, slow "
+                              "motion whenever it doesn't.",
+                              "Com 60 fps: quando este aparelho não segura 60 por alguns segundos, o jogo vai para 30 fps "
+                              "sozinho em vez de rodar em câmera lenta, e volta para 60 quando houver folga de novo (o "
+                              "trabalho de cada quadro medido a 30). Desligado: fica em 60 - mais fluido quando acompanha, "
+                              "câmera lenta quando não acompanha.")))
                 g_settings.fps60_lock = !fall;
             ImGui::EndDisabled();
             if (in_game && g_settings.fps60 && g_fps60_fell_back)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
-                                   TR("Running at 30 fps: this PC didn't keep 60 fps.", "Rodando a 30 fps: este PC não segurou 60 fps."));
+                                   TR("Running at 30 fps for now: 60 wasn't held (back to 60 when there is room).",
+                                      "Rodando a 30 fps por enquanto: 60 não segurou (volta para 60 quando houver folga)."));
         }
     }
     {   // (runtime/nvn/vulkan/textures.c vk_sampler_settings: every sampler made again, at once)
