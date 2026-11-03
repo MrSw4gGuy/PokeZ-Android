@@ -106,6 +106,8 @@ static void set_open(bool open) {
     }
     else { settings_save(); osk_cancel(); g_text_busy = false; }
 }
+// The touch overlay's menu button (touch_overlay.mm, on the event thread like F1)
+extern "C" void menu_toggle_from_touch(void) { set_open(!g_open.load()); }
 
 static ImGuiKey key_from_scancode(SDL_Scancode sc) {
     switch (sc) {
@@ -200,7 +202,7 @@ bool menu_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
         if (!e->key.repeat && e->key.scancode == SDL_SCANCODE_F10 && devtools_toggle && getenv("LARECOMP_DEVTOOLS")) { devtools_toggle(); return true; }
-        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
+        if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 || e->key.scancode == SDL_SCANCODE_AC_BACK ||
                                (e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
             if (!typing) set_open(!g_open.load());  // (Esc with the menu open goes to ImGui below: it cancels a field)
             return true;
@@ -967,6 +969,9 @@ extern "C" void tracker_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" bool chaos_overlay_wanted(void);
 extern "C" void chaos_overlay_draw(ImVec2 display, ImFont *font);
 extern "C" void inventory_overlay_draw(ImVec2 display, ImFont *font);
+extern "C" bool touch_overlay_wanted(void);
+extern "C" void touch_overlay_draw(ImVec2 display, float scale);
+extern "C" void touch_overlay_release(void);
 extern "C" bool race_overlay_wanted(void);
 extern "C" void race_overlay_draw(ImVec2 display, ImFont *font, float scale);
 extern "C" bool pickup_flyin_wanted(void);  // (silent pickups: pickup_flyin.mm)
@@ -1314,7 +1319,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     bool dt = dt_open();
     bool race = race_overlay_wanted();  // (run timer, race seed hash: race_overlay.mm)
     bool flyin = pickup_flyin_wanted() && !open;  // (a silent pickup's card)
-    if (!render_needed(open, kbd, inv, trk, trkd, chaos, race, flyin) && !notice && !dt) {
+    bool touch = !open && !kbd && touch_overlay_wanted();  // (on-screen controls: touch_overlay.mm)
+    if (!touch) touch_overlay_release();
+    if (!render_needed(open, kbd, inv, trk, trkd, chaos, race, flyin) && !notice && !dt && !touch) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         g_ov_same = 0;  // (shown again: built afresh first)
         return;
@@ -1339,7 +1346,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         fps_note(now, io.DeltaTime);
         char rk[64];
         // (only the FPS counter and the run timer; input only reaches ImGui while the menu or the name entry is up)
-        if (!open && !kbd && !inv && !trk && !trkd && !chaos && !flyin && race_overlay_key(rk, sizeof rk)) {
+        if (!open && !kbd && !inv && !trk && !trkd && !chaos && !flyin && !touch && race_overlay_key(rk, sizeof rk)) {
             pthread_mutex_lock(&q_lock);
             bool events = !q_events.empty();
             pthread_mutex_unlock(&q_lock);
@@ -1430,6 +1437,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (inv) {
         inventory_overlay_draw(io.DisplaySize, g_font_big ? g_font_big : ImGui::GetFont());
     }
+    if (touch) touch_overlay_draw(io.DisplaySize, scale);
 
     if (open) {
         // dim the game behind the menu (towards the start screen's night blue)

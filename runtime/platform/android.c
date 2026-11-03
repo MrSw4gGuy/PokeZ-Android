@@ -300,6 +300,8 @@ void plat_init(void) {
     // The UI is laid out for landscape. The manifest asks for sensorLandscape, but SDLActivity overrides it with
     // its own setRequestedOrientation from this hint, and without one it followed the phone into portrait.
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    // the Back gesture opens / closes the menu (menu.mm, as F1) instead of finishing the activity
+    SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     point_at_game_lib();
     pick_data_root();  // before log_to_file: that is the first thing to read the data folder
     log_to_file();

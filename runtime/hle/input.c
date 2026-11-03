@@ -26,6 +26,14 @@ enum {
 
 _Static_assert(BTN_DOWN == BIND_DOWN && BTN_ZL == BIND_ZL, "bindings follow the button bits");
 
+// On-screen controls (runtime/ui/touch_overlay.mm; on by default on Android, LARECOMP_TOUCH=0 off): its buttons and
+// sticks are added to the keyboard's and the controller's
+bool touch_overlay_enabled(void);
+bool touch_overlay_event(const SDL_Event *e);
+uint64_t touch_overlay_buttons(void);
+void touch_overlay_sticks(int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+void touch_overlay_pad_used(void);
+
 static _Atomic uint64_t key_buttons, pad_buttons;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
@@ -444,8 +452,9 @@ extern bool menu_cursor_needed(void);   // (the cursor wanted on screen: the men
 // Main thread, after each batch of events (runtime/nvn/vulkan/device.c ui_run): the cursor held while the game has
 // the window and the controls - not with the menu or the name entry up (they take the mouse), nor without focus.
 void input_mouse_update(SDL_Window *w) {
+    // (not with the on-screen controls: a phone's touches come as mouse events too, and a held cursor would eat them)
     bool want = g_settings.mouse_camera == MOUSE_CAM_CAPTURED && !menu_cursor_needed() && !input_user_blocked_any() &&
-                (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS);
+                !touch_overlay_enabled() && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS);
     if (want == mouse_held) return;
     SDL_SetWindowRelativeMouseMode(w, want);
     mouse_held = want;
@@ -492,6 +501,13 @@ void input_handle_event(const SDL_Event *e) {
         SDL_free(ids);
     }
     switch (e->type) {
+    case SDL_EVENT_FINGER_DOWN: case SDL_EVENT_FINGER_MOTION: case SDL_EVENT_FINGER_UP: case SDL_EVENT_FINGER_CANCELED: {
+        uint64_t before = touch_overlay_buttons();
+        touch_overlay_event(e);
+        uint64_t now = touch_overlay_buttons();
+        note_press(now & ~before, before & ~now);  // (a tap shorter than a game poll still counts)
+        break;
+    }
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: {
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F10 && !e->key.repeat) g_shot_request = 1;
@@ -515,6 +531,7 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) touch_overlay_pad_used();  // (a controller in hand: the overlay hides)
         if (!host_test || e->gbutton.which == TEST_DEVICE) {  // (the press as the event has it, before reading the pad)
             uint64_t b = pad_bits(e->gbutton.button);
             note_press(e->gbutton.down ? b : 0, e->gbutton.down ? 0 : b);
@@ -522,6 +539,7 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (abs(e->gaxis.value) > 12000) touch_overlay_pad_used();  // (stick drift stays below)
         if ((e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) &&
             !host_test) {  // (the triggers as buttons: past half way)
             static bool trig[2];
@@ -536,6 +554,7 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP: {
+        if (e->button.which == SDL_TOUCH_MOUSEID && touch_overlay_enabled()) break;  // (a touch: the overlay has it)
         int m = bind_mouse_from_sdl(e->button.button);
         if (m < 0) break;
         if (e->type == SDL_EVENT_MOUSE_BUTTON_UP) mouse_down[m] = 0;
@@ -545,6 +564,7 @@ void input_handle_event(const SDL_Event *e) {
     }
     case SDL_EVENT_MOUSE_MOTION:  // the mouse turns the camera (right stick): cursor held, or the right button held
         // (the cursor free while the game plays - hold, or a tool's panels beside the game: the right button held turns it)
+        if (e->motion.which == SDL_TOUCH_MOUSEID && touch_overlay_enabled()) break;
         if (mouse_held || (g_settings.mouse_camera != MOUSE_CAM_OFF && !menu_input_captured() && (e->motion.state & SDL_BUTTON_RMASK))) {
             atomic_fetch_add(&mouse_acc_x, (int32_t)lroundf(e->motion.xrel * 16));  // (mouse_stick turns it into speed)
             atomic_fetch_add(&mouse_acc_y, (int32_t)lroundf(e->motion.yrel * 16));
@@ -858,7 +878,9 @@ void input_frame(uint64_t frame) {
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
-uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }
+uint64_t input_buttons_now(void) {
+    return (menu_input_captured() ? 0 : key_buttons | pad_buttons | touch_overlay_buttons()) | script_buttons;
+}
 
 // Recorded play (tools/za/replay-record.sh / replay-play.sh, docs/dev-tools.md): LARECOMP_RECORD=<file> writes player 1's state as
 // the game reads it - "<read> <buttons hex> <lx> <ly> <rx> <ry>" each time it changes, <read> counting the game's
@@ -1013,7 +1035,8 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t held = key_buttons | pad_buttons | mouse_buttons;
+    uint64_t touch = touch_overlay_buttons();
+    uint64_t held = key_buttons | pad_buttons | mouse_buttons | touch;
     atomic_fetch_and(&press_unseen, ~held);  // (the game sees these now)
     static uint64_t tap, tap_frame;  // (pressed and released since the last poll: held for the rest of this frame)
     {
@@ -1031,10 +1054,13 @@ static void fill_state(Cpu *c) {
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
+    int32_t tlx, tly, trx, try_;
+    touch_overlay_sticks(&tlx, &tly, &trx, &try_);
+    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx + tlx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly + tly) + script_ly);
     int32_t mrx, mry;
     mouse_stick(&mrx, &mry);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry) + script_ry);
+    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mrx + trx) + script_rx),
+            ry = clamp_axis((menu ? 0 : key_ry + pad_ry + mry + try_) + script_ry);
     {
         extern uint64_t renderer_present_count(void);
         record_input(renderer_present_count(), b, (int32_t[4]){lx, ly, rx, ry});  // (before mirror mode swaps them)
@@ -1049,7 +1075,7 @@ static void fill_state(Cpu *c) {
     // d-pad / arrow keys walk (setting) while the stick is at rest. "At rest" has a dead zone: a controller's stick
     // never reads exactly 0 (a DualSense rests at a few hundred), which used to turn the d-pad off altogether.
     if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {
-        uint64_t d = key_buttons | pad_buttons | script_buttons;
+        uint64_t d = key_buttons | pad_buttons | touch | script_buttons;
         int dx = (int)((d >> BTN_RIGHT) & 1) - (int)((d >> BTN_LEFT) & 1);
         if (mirrored) dx = -dx;
         int dy = (int)((d >> BTN_UP) & 1) - (int)((d >> BTN_DOWN) & 1);
