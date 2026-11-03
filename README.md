@@ -55,7 +55,7 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
 | Intro cutscenes, train, Lumiose City | Works: no heavy visual bugs left (the eyes below), the game's own pop-in |
-| Frame rate | A steady 30 fps (the game's own rate on the Switch) in the scenes tested so far. 60 fps: about 53 at 75% resolution (the GPU is the limit); **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and back to 60 when there is room - not tested on the phone yet |
+| Frame rate | A steady 30 fps (the game's own rate on the Switch). 60 fps: a steady 60 in lighter scenes (the station with few people) with 50% shadows; crowded scenes need a GPU time per frame of about 22-25 ms, so there **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and tries 60 again after scene changes |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
 | Touch controls | Works (D-pad tested in the game's menus; the rest in progress) |
@@ -118,6 +118,8 @@ time the phone warms up (down to about 45%). In **Settings > Video**:
 - **Upscaler**: *Snapdragon GSR* (the default: Qualcomm's own, made for Adreno), *AMD FSR 1*, or *Bilinear* (softest).
 - **Internal resolution**: *Match display* (100%) for a sharper picture, at the cost of more heat (and so more steps
   down later).
+- **Shadow resolution**: *50%* (the Android default), *75%*, the *game's* (1024 x 1024) or higher. The sun's shadows are
+  about half of the GPU's time in each frame on a phone; at 50% their edges are a little coarser.
 - **Anti-aliasing**: *SMAA* smooths jagged edges, at a small cost.
 
 ## Saves

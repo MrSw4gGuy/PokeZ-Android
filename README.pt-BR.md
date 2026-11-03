@@ -55,7 +55,7 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
 | Cenas da introdução, trem, Lumiose | Funciona: sem bugs visuais pesados (fora os olhos, abaixo), só o pop-in do próprio jogo |
-| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch) nas cenas testadas até agora. 60 fps: cerca de 53 a 75% de resolução (o limite é a GPU); **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e volta para 60 quando há folga - ainda não testado no celular |
+| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch). 60 fps: 60 estáveis em cenas mais leves (a estação com pouca gente) com sombras a 50%; cenas cheias pedem cerca de 22-25 ms de GPU por quadro, então ali o **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e tenta 60 de novo depois das trocas de cena |
 | Textos e caixas de diálogo | Funciona |
 | Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
 | Controles de toque | Funciona (direcional testado nos menus do jogo; o resto em teste) |
@@ -120,6 +120,8 @@ celular esquenta (até cerca de 45%). Em **Configurações > Vídeo**:
   mais suave).
 - **Resolução interna**: *Igual à tela* (100%) para uma imagem mais nítida, ao custo de mais calor (e por isso mais
   degraus depois).
+- **Resolução das sombras**: *50%* (o padrão no Android), *75%*, a *do jogo* (1024 x 1024) ou maior. As sombras do sol
+  são cerca de metade do tempo da GPU em cada quadro num celular; a 50% as bordas ficam um pouco mais grossas.
 - **Anti-aliasing**: *SMAA* suaviza as bordas serrilhadas, com um custo pequeno.
 
 ## Saves
