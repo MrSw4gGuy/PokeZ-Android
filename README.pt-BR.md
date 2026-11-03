@@ -2,291 +2,157 @@
 
 <img src="docs/icon/icon_1024.png" alt="ZA Recomp" width="128">
 
-# ZA Recomp
+# PokeZ-Android
 
-**Um port nativo para PC de *Pokémon Legends: Z-A*, feito por recompilação estática.**
+**Um port para Android do ZA Recomp: *Pokémon Legends: Z-A* (versão do Switch 1) rodando nativo num celular arm64,
+feito por recompilação estática.**
 
 [English](README.md) · **Português (Brasil)**
 
-[Download](https://github.com/Hexveil404/PokeZ-ARecomp/releases/latest) ·
-[Relatar um bug](https://github.com/Hexveil404/PokeZ-ARecomp/issues) ·
-[Port para macOS (MonZaMac)](https://github.com/lucabravi/MonZaMac)
+[Reportar um bug](https://github.com/MrSw4gGuy/PokeZ-Android/issues) ·
+[ZA Recomp para PC](https://github.com/Hexveil404/PokeZ-ARecomp) ·
+[Guia de compilação](tools/linux/android-port/README.md)
 
 </div>
 
 ---
 
-O ZA Recomp transforma o código do jogo do Nintendo Switch em um programa nativo do Windows. O código ARM64 é
-traduzido antecipadamente para C e compilado para x86-64 no seu PC, e o sistema operacional e a GPU (NVN) do Switch
-são reimplementados sobre Vulkan. Nenhum emulador roda enquanto você joga.
+> [!WARNING]
+> **Em desenvolvimento.** No celular de teste, o jogo vai de um save novo até a introdução e a chegada em Lumiose,
+> com bugs visuais pendentes (veja [Estado](#estado)). Foi testado num único celular.
 
-Ele é baseado no **[LAS Recomp](https://github.com/peiikai/LASRecomp)**, do Peiikai, o recompilador estático feito
-para *The Legend of Zelda: Link's Awakening*.
+Este branch (`android-port`) pega o [ZA Recomp](https://github.com/Hexveil404/PokeZ-ARecomp) - o código do jogo do
+Switch traduzido antecipadamente para C, com o sistema operacional e a GPU (NVN) do Switch reimplementados sobre Vulkan -
+e o compila para Android em arm64. O código ARM64 do jogo vira código arm64 nativo de novo (as instruções NEON ficam
+como são), então nenhum emulador e nenhuma tradução de instruções rodam enquanto você joga.
+
+É baseado no **[LAS Recomp](https://github.com/peiikai/LASRecomp)**, do Peiikai, e no **ZA Recomp**, do Hexveil404.
 
 > [!IMPORTANT]
-> **Você precisa da sua própria cópia do jogo.** O ZA Recomp não inclui arquivos, código, assets nem fontes do jogo.
+> **Você precisa da sua própria cópia do jogo, e compila o APK você mesmo.** Nenhum arquivo, código, recurso ou fonte
+> do jogo vem incluído. O APK que você compila contém o código do jogo recompilado a partir do *seu* dump, por isso
+> não existe APK pronto para baixar, e você nunca deve compartilhar o seu.
 
 ## Conteúdo
 
-- [Imagens](#imagens)
-- [Recursos](#recursos)
+- [Estado](#estado)
 - [Requisitos](#requisitos)
-- [Instalação](#instalação) ([DLC Mega Dimension](#dlc-mega-dimension), [Linux (experimental)](#linux-experimental))
+- [Compilar e instalar](#compilar-e-instalar)
 - [Controles](#controles)
 - [Saves](#saves)
-- [Mods](#mods)
-- [Solução de problemas](#solução-de-problemas)
-- [Compilando o código-fonte](#compilando-o-código-fonte)
-- [Ferramentas de desenvolvimento](#ferramentas-de-desenvolvimento)
+- [O que muda em relação à versão de PC](#o-que-muda-em-relação-à-versão-de-pc)
+- [Problemas](#problemas)
 - [Créditos](#créditos)
 - [Aviso legal](#aviso-legal)
 
-## Imagens
+## Estado
+
+Testado num **Samsung Galaxy S25+** (Snapdragon 8 Elite, Adreno 830, 12 GB de RAM, Android 17, driver Vulkan da
+própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo.
 
 | | |
 |---|---|
-| ![Lumiose City a 60 fps](docs/screenshots/lumiose.jpg) | ![A tela inicial](docs/screenshots/start-screen-pt.png) |
-| Lumiose City a 60 fps | A tela inicial, com o seu time |
-| ![O menu do jogo](docs/screenshots/menu.jpg) | ![A mochila](docs/screenshots/bag.jpg) |
-| O menu do jogo (com mod de tradução) | A mochila |
+| Tela inicial, verificação dos arquivos do jogo | Funciona |
+| Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
+| Cenas da introdução, trem, Lumiose | Funciona, com os bugs visuais abaixo |
+| Taxa de quadros | 30 fps (a taxa do próprio jogo no Switch) nas cenas testadas até agora |
+| Textos e caixas de diálogo | Funciona |
+| Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
+| Controles de toque | Funciona (direcional testado nos menus do jogo; o resto em teste) |
+| Salvar | Funciona |
+| Memória | Cerca de 3 GB em uso |
+| Aquecimento | A resolução baixa sozinha conforme o celular esquenta (folga térmica) |
+| DLC *Mega Dimension* | Ainda não testado |
 
-## Recursos
-
-**Desempenho**
-- 60 fps na velocidade normal do jogo, ou 30 fps como no Switch
-- Resolução interna de 25% até 4x (1x = 1080p), além de Dinâmica e Igual à tela
-- Opção de ritmo dos quadros (Suave / Padrão) para telas em que o fps parece irregular
-
-**Gráficos** (todos opcionais, desligados por padrão)
-- Upscaling com AMD FSR 1, anti-aliasing com SMAA ou AMD FSR 2 (temporal), nitidez
-- Saída HDR (HDR10 / scRGB)
-- Oclusão de ambiente (GTAO), luz indireta (GI em espaço de tela) e reflexos na água
-- Sombras mais nítidas (mapa de sombras em resolução maior) e filtragem de texturas de alta qualidade
-- Pacotes de texturas HD (`textures/hd/`)
-
-**Controles**
-- Qualquer controle do SDL3: Xbox, PlayStation (DualShock 4 / DualSense), Switch Pro, Steam Deck e outros
-- Teclado e mouse, com câmera pelo mouse
-- Todos os botões e teclas podem ser remapeados; os ícones dos botões seguem o seu controle (Xbox, PlayStation,
-  Nintendo, Steam Deck, teclado)
-- Golpes por posição e encaixe do analógico direito no eixo
-
-**Tela inicial**
-- Prepara o jogo a partir dos seus arquivos e compila uma única vez no seu PC
-- Gerenciador de mods (mods de romfs), importação / exportação de saves e backups
-- Inglês e português (Brasil)
+**Bugs visuais conhecidos** (em correção):
+- Alguns olhos aparecem errados: a íris desenhada em quadradinhos azuis e brancos, um retângulo escuro atrás do olho
+  de alguns Pokémon.
+- Faixas claras retas e retângulos translúcidos sobre rostos e corpos em algumas cenas.
 
 ## Requisitos
 
 | | |
 |---|---|
-| **Sistema** | Windows 10 (1903 ou mais novo) ou Windows 11, 64 bits. Linux x86-64: experimental, veja [Linux](#linux-experimental) |
-| **CPU** | x86-64 com AVX2 (2013 ou mais nova). CPUs mais antigas com SSE4.2 também funcionam, mas compilam e rodam mais devagar |
-| **GPU** | Vulkan 1.2 ou mais novo (1.3 recomendado), com driver atualizado |
-| **RAM** | 8 GB (16 GB recomendado) |
-| **Disco** | Cerca de 12 GB livres |
-| **Jogo** | Pokémon Legends: Z-A **1.0.0, 2.0.0 ou 2.0.2**, com ou sem a DLC *Mega Dimension* |
+| **Celular** | Android 12 ou mais novo, arm64 (64 bits), Vulkan 1.3. Testado: só Snapdragon 8 Elite (Adreno 830) |
+| **RAM** | 8 GB no mínimo; testado com 12 GB |
+| **Armazenamento** | Cerca de 7 GB livres no celular (os dados do jogo têm 6 GB, o APK cerca de 500 MB) |
+| **Jogo** | Pokémon Legends: Z-A **2.0.2** (versão do Switch 1): o jogo base e a atualização, com as `prod.keys` do seu próprio Switch |
+| **Para compilar** | Um PC com Windows 10/11 e WSL2 (Ubuntu 22.04), ou qualquer Linux x86-64; cerca de 30 GB livres; um cabo USB e o [platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`) |
 
-O Linux roda nativamente (x86-64, sem Wine nem Proton) em uma versão **experimental**: veja [Linux (experimental)](#linux-experimental).
-No Mac, use o [MonZaMac](https://github.com/lucabravi/MonZaMac), do
-[@lucabravi](https://github.com/lucabravi), um port nativo para macOS baseado neste projeto.
+## Compilar e instalar
 
-## Instalação
+A compilação toda roda no seu PC, com os scripts de [`tools/linux/android-port/`](tools/linux/android-port/README.md);
+esse guia tem cada passo e opção. Resumindo:
 
-1. Baixe o `ZA-Recomp-windows.zip` mais recente em [Releases](https://github.com/Hexveil404/PokeZ-ARecomp/releases/latest)
-   e extraia em uma pasta à sua escolha (por exemplo `C:\Jogos\ZA Recomp`).
-2. Deixe a sua própria cópia do jogo em uma pasta, de um destes jeitos:
-   - **Jogo extraído**: as pastas `exefs` e `romfs`, como um emulador ou o seu Switch extraem. Não precisa de keys.
-   - **Dump**: o jogo base (`.xci` ou `.nsp`), se quiser a atualização e a DLC *Mega Dimension* (`.nsp`), junto com o `prod.keys` do seu
-     próprio Switch.
-3. Abra o `lasrecomp.exe`. Na tela inicial, escolha essa pasta (ou arraste para a janela) e clique em
-   **Preparar o jogo**.
-4. Os arquivos do jogo são lidos e o código é compilado para o seu PC. Isso leva de 10 a 30 minutos, dependendo da CPU,
-   e acontece **uma única vez**. Depois de uma atualização do ZA Recomp, só o que mudou é compilado de novo.
-5. Clique em **Jogar**.
-
-Os seus arquivos nunca são alterados. Se quiser, importe as fontes do seu console na tela inicial
-(**Configurações > Arquivos**) para o texto e os ícones de botões originais; sem elas, é usada uma fonte substituta.
-
-### DLC Mega Dimension
-
-A DLC é suportada pelo caminho do **dump** (as pastas extraídas `exefs` / `romfs` não incluem ela):
-
-1. Coloque estes arquivos juntos em uma pasta: o jogo base (`.xci` ou `.nsp`), a **atualização** (`.nsp`, versão 2.0.0
-   ou mais nova - o conteúdo da DLC vem com ela), a **DLC** (`.nsp`) e o `prod.keys` do seu Switch (e o `title.keys`
-   se a tela inicial pedir).
-2. Escolha essa pasta na tela inicial e clique em **Preparar o jogo**.
-3. A tela inicial mostra **+ DLC** ao lado da versão do jogo quando ela foi encontrada.
-
-Já preparou o jogo sem a DLC? Clique em **Trocar pasta do jogo**, escolha a pasta de novo com a DLC junto e prepare de
-novo. Os seus saves e configurações são mantidos.
-
-### Linux (experimental)
-
-O ZA Recomp roda nativamente no Linux x86-64, sem Wine nem Proton. Quando a release tiver arquivos para Linux, escolha
-um: `zarecomp_<versão>_amd64.deb` (Ubuntu / Linux Mint / Debian: `sudo apt install ./zarecomp_<versão>_amd64.deb`, depois
-**ZA Recomp** no menu ou `zarecomp` no terminal), o `.AppImage` (dê `chmod +x` e abra) ou o `.zip` (descompacte onde
-quiser e abra `./zarecomp`), e prepare o jogo como no passo 3 abaixo. Senão, você compila uma vez na sua máquina (os
-scripts fazem tudo).
-
-**Testado até agora:** Linux Mint 22.3 com GPU integrada Intel UHD e 8 GB de RAM, Pokémon Legends: Z-A 2.0.2. Cutscenes,
-áudio e movimentação funcionam; nessa GPU integrada as cenas 3D rodam a cerca de 15-26 fps (menus a 60). Controles,
-saves, mods, outras GPUs e sessões longas ainda não foram testados - relatos são bem-vindos.
-
-**Precisa de:** uma distribuição 64 bits com glibc 2.35 ou mais nova (Ubuntu 22.04+, Linux Mint 21+, Debian 12, Fedora,
-Arch...), driver Vulkan 1.3 (Mesa ou o da NVIDIA), CPU com AVX2, 8 GB de RAM e cerca de 12 GB livres. Os comandos abaixo
-são para Ubuntu / Linux Mint / Debian; nas outras distribuições os pacotes têm nomes equivalentes (no Debian, o
-`dotnet-sdk-8.0` vem do repositório de pacotes da Microsoft).
-
-1. Instale as ferramentas e bibliotecas de compilação (uma vez):
+1. Prepare as ferramentas uma vez: `setup_wsl.sh`, `install_ndk.sh`, `install_sdk.sh`, depois as bibliotecas com
+   `deps_android.sh all`.
+2. Importe o seu jogo: coloque o jogo base e a atualização (`.nsp` / `.xci`) e as `prod.keys` numa pasta e rode
+   `import_za.sh <essa pasta>`.
+3. Compile o código do jogo e o APK: `build_za.sh`, depois `za_apk.sh`. O código do jogo demora na primeira vez.
+4. Ative a depuração USB no celular, depois instale o APK e copie os arquivos do jogo:
 
    ```bash
-   sudo apt install git clang lld cmake ninja-build nasm pkg-config python3-venv curl patchelf dotnet-sdk-8.0 \
-       libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxtst-dev \
-       libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libdrm-dev libgbm-dev \
-       libpulse-dev libasound2-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev libibus-1.0-dev libvulkan-dev
+   adb install -r ZARecomp-za-debug.apk
+   adb push za-extracted/exefs /sdcard/Android/data/org.recomp.za/files/extracted/exefs
+   adb push za-extracted/romfs.bin /sdcard/Android/data/org.recomp.za/files/extracted/romfs.bin
    ```
 
-2. Baixe o código e gere o AppImage (na primeira vez ele baixa e compila as bibliotecas, o que demora um pouco):
-
-   ```bash
-   git clone https://github.com/Hexveil404/PokeZ-ARecomp.git
-   cd PokeZ-ARecomp
-   tools/za/dist-linux.sh
-   ```
-
-   O resultado é `build/dist/ZA Recomp-<versão>-linux-x86_64.AppImage` (e os mesmos arquivos em `.zip` e `.deb`).
-   Copie para onde quiser.
-
-3. Abra o AppImage (se precisar, dê `chmod +x` antes). Na tela inicial, escolha a pasta do jogo (`exefs` + `romfs`
-   extraídos, ou os seus `.xci` / `.nsp` com o seu `prod.keys`), clique em **Preparar o jogo** e depois em **Jogar**,
-   como no Windows. Configurações, saves e arquivos do jogo ficam em `~/.local/share/zarecomp`.
-
-Se a preparação pela tela inicial falhar, há um caminho manual, que é o testado de ponta a ponta até agora. Troque os
-caminhos pelos dos seus arquivos:
-
-```bash
-tools/za/build-linux.sh                       # o programa
-build/linux/x86_64/zaimport/zaimport ~/caminho/prod.keys extracted ~/caminho/base.nsp ~/caminho/update.nsp
-GAME=1 JOBS=3 tools/za/build-linux.sh         # compila o código do jogo: cerca de 20 minutos, uma vez
-build/linux/x86_64/za/lasrecomp extracted --play
-```
-
-Numa GPU integrada, baixe a **Resolução** no menu F1 para o jogo rodar mais liso. Mais detalhes, outras opções e
-problemas conhecidos: [docs/linux.md](docs/linux.md#za-recomp-on-linux-native-x86-64).
+5. Abra o **ZA Recomp** no celular e toque em **Play**.
 
 ## Controles
 
-Aperte **F1** no jogo (ou abra **Configurações** na tela inicial) para o menu de configurações: fps, resolução,
-opções gráficas, controles, ícones dos botões e mais. As configurações são salvas na hora no `larecomp.ini`.
-
-Na primeira vez que abre, o ZA Recomp escolhe a resolução e o fps para o seu PC (pela placa de vídeo, CPU e RAM); quem
-vem de uma versão anterior recebe uma pergunta única na tela inicial. Com 60 fps, **Cair para 30 fps quando preciso**
-(desligado por padrão) volta para 30 fps quando o PC não segura 60, em vez de ficar em câmera lenta.
-
-| Teclado (padrão) | Switch |
-|---|---|
-| W A S D | Analógico esquerdo |
-| Setas | Direcional |
-| K / J / L / I | A / B / X / Y |
-| Q / E | L / R |
-| 1 / 3 | ZL / ZR |
-| Enter / Backspace | + / − |
-| F / Numpad 0 | Clique do analógico esquerdo / direito |
-| Numpad 8 / 4 / 5 / 6 | Analógico direito |
-| Mouse | Câmera; botão esquerdo ZR (arremessar), direito ZL (mirar) |
-
-| Tecla | Ação |
-|---|---|
-| F1 / Esc | Menu de configurações |
-| F11 / Alt+Enter | Tela cheia |
-| F10 | Captura de tela (`screenshots/`) |
-
-Todos os comandos podem ser trocados em **Configurações > Controles > Configurar comandos**.
+- **Controle**: qualquer controle que o Android reconheça (Bluetooth ou USB). É detectado sozinho.
+- **Toque**: botões na tela, desenhados por cima do jogo - A/B/X/Y, direcional, L/R/ZL/ZR, + e −, um analógico
+  esquerdo que aparece onde o polegar encosta, e arrastar na metade direita da tela para a câmera. Somem enquanto um
+  controle está em uso e voltam no próximo toque.
+- **Menu de configurações**: o botão ☰ no alto da tela, ou o gesto de Voltar do Android.
 
 ## Saves
 
-Os saves são os arquivos do próprio jogo, guardados em `save/save_0/` ao lado do `lasrecomp.exe`. São os mesmos do
-Switch, então passam de um para o outro sem conversão. A página **Saves** da tela inicial importa, exporta e restaura
-backups; toda importação guarda o seu save anterior como backup.
+Os saves são os arquivos do próprio jogo, em `Android/data/org.recomp.za/files/save/save_0/` no celular. São os mesmos
+arquivos do Switch e da versão de PC, então passam de um para o outro sem conversão (JKSV no Switch).
 
-- **Switch → PC**: faça o backup do save com o **JKSV** no Switch, copie a pasta do backup (ela tem um arquivo chamado
-  `main`) para o PC e importe na página **Saves**.
-- **PC → Switch**: exporte o save, copie os arquivos para uma pasta de backup do JKSV no cartão SD e restaure com o JKSV.
-- **Versões do jogo**: um save da 2.0.x precisa do jogo preparado com a atualização 2.0.x. A versão 2.0.0 converte um
-  save da 1.0.0 na primeira vez que salva, e o save convertido não abre mais na 1.0.0. Guarde um backup.
+## O que muda em relação à versão de PC
 
-## Mods
+- O código do jogo é compilado antes, no seu PC, e não pela tela inicial: um app Android não consegue rodar o
+  compilador.
+- O driver da Qualcomm não consegue compartilhar a memória do jogo com a GPU do jeito que os drivers de PC fazem, então
+  parte dela é compartilhada por um buffer de hardware do Android. É isso que faz o 3D, os personagens e os textos
+  aparecerem.
+- A imagem é girada pelo próprio renderizador (a orientação natural do celular é retrato), e a resolução desce um
+  degrau quando o celular esquenta.
+- Detalhes técnicos: [tools/linux/android-port/README.md](tools/linux/android-port/README.md#what-is-different-on-android).
 
-Mods que trocam arquivos do jogo (uma pasta `romfs`): traduções, texturas, modelos. Instale pela página **Mods** (ou
-arraste o mod para a janela); eles ficam em `mods/`. Quando dois mods trocam o mesmo arquivo, vale o que está mais
-acima na lista.
+## Problemas
 
-Mods que mudam o código do jogo (`exefs`, patches IPS, plugins de cheats) não funcionam num jogo recompilado.
-
-## Solução de problemas
-
-- **Logs**: cada sessão grava `logs/play.log` ao lado do exe (o anterior fica como `logs/play-anterior.log`). Anexe esse
-  arquivo em qualquer relato de bug.
-- **Erros do driver de vídeo** ("Your graphics driver crashed", falha de página da GPU): abra
-  **Configurações > Vídeo > Compatibilidade** e desligue as opções uma de cada vez. Elas valem a partir do próximo
-  início.
-- **Fps baixo**: diminua a resolução interna ou ligue a resolução Dinâmica, e desligue os recursos gráficos opcionais.
-- **Relatar um bug**: [abra uma issue](https://github.com/Hexveil404/PokeZ-ARecomp/issues) com a sua GPU, a versão do
-  driver, a versão do jogo e o `logs/play.log`.
-
-## Compilando o código-fonte
-
-O ZA Recomp compila no Windows com o MSYS2 (UCRT64: clang, SDL3, FFmpeg, shaderc, headers do Vulkan) e Python 3. Veja
-[docs/BUILD-windows.md](docs/BUILD-windows.md) para a configuração. `bash tools/za/dist.sh` monta a pasta da release
-(`build/dist-za/ZA Recomp/`; `ZIP=1` para o zip), que vai sem nenhum código do jogo: a tela inicial compila no PC do
-jogador.
-
-Onde ficam as coisas: o recompilador em `tools/`, o runtime em `runtime/` (serviços HLE, a implementação do NVN em
-`runtime/nvn/`, o backend Vulkan em `runtime/nvn/vulkan/` e o tradutor de shaders Maxwell em `runtime/nvn/maxwell/`), e
-as ferramentas do Pokémon Z-A em `tools/za/`.
-
-Contribuições são bem-vindas. Nunca faça commit nem anexe arquivos da Nintendo (arquivos do jogo, dados extraídos,
-código gerado, fontes, saves).
-
-## Ferramentas de desenvolvimento
-
-Para quem trabalha no próprio port. Quem só joga não precisa delas, e elas ficam desligadas numa execução normal.
-
-- **ZA DevTools**: um programa separado com log ao vivo, gráficos de desempenho e inspetor de frame. Dá para marcar um
-  bug enquanto joga e depois reproduzir até aquele momento.
-- **Gravar e reproduzir**: `tools/za/replay-record.sh` e `tools/za/replay-play.sh`.
-- **Captura de frame**: todos os passes e draws de um frame, com scripts de análise em `tools/devtools/analysis/`.
-
-O [guia das ferramentas de desenvolvimento](docs/dev-tools.pt-BR.md) explica a preparação e como usar cada uma. Para
-compilar o ZA DevTools no Windows: `bash tools/devtools/build.sh`.
+- **Log**: `Android/data/org.recomp.za/files/lasrecomp.log` no celular (depois de um travamento, o log da execução que
+  travou é `lasrecomp-backup-*.log`). Anexe-o a qualquer relato de bug, com o modelo do celular e a versão do Android.
+- **Opções de depuração**: as opções do renderizador (`LARECOMP_*`) vão em `Android/data/org.recomp.za/files/env.txt`,
+  uma por linha no formato `NOME=valor`, lidas ao abrir.
 
 ## Créditos
 
 - **[Peiikai](https://github.com/peiikai)**: criador do [LAS Recomp](https://github.com/peiikai/LASRecomp), o
   recompilador estático, o runtime, os renderizadores e o tradutor de shaders em que este port se baseia.
-- **[Hexveil404](https://github.com/Hexveil404)**: o port de Pokémon Legends: Z-A.
-- **Contribuidores do ZA Recomp**: [@Primus92](https://github.com/Primus92), [@Atterax](https://github.com/Atterax),
-  [@wimw85](https://github.com/wimw85), [@lucabravi](https://github.com/lucabravi),
-  [@gabrielsem16-bot](https://github.com/gabrielsem16-bot), [@gdsistemas-web](https://github.com/gdsistemas-web) e
-  todos que relataram problemas e testaram builds.
-- **Contribuidores do LAS Recomp**: veja [docs/LASRecomp-README.md](docs/LASRecomp-README.md#credits).
+- **[Hexveil404](https://github.com/Hexveil404)**: o [ZA Recomp](https://github.com/Hexveil404/PokeZ-ARecomp), o port de
+  Pokémon Legends: Z-A, e seus colaboradores.
+- **[MrSw4gGuy](https://github.com/MrSw4gGuy)**: o port para Android e os testes.
+- **Colaboradores do LAS Recomp**: veja [docs/LASRecomp-README.md](docs/LASRecomp-README.md#credits).
 - **[Ryujinx](https://github.com/Ryujinx/Ryujinx)**, usado como referência de comportamento (nenhum código copiado),
   **[envytools](https://github.com/envytools/envytools)** e **[Switchbrew](https://switchbrew.org)** pela documentação
   da GPU e do sistema.
 - **Bibliotecas**: [SDL 3](https://libsdl.org), [FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui),
   [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
-  [shaderc](https://github.com/google/shaderc), [SMAA](https://github.com/iryoku/smaa),
-  [AMD FidelityFX FSR 1 e FSR 2](https://github.com/GPUOpen-Effects), [XeGTAO](https://github.com/GameTechDev/XeGTAO),
-  [LibHac](https://github.com/Thealexbarney/LibHac), [Zig](https://ziglang.org) e as outras listadas em
-  [docs/LASRecomp-README.md](docs/LASRecomp-README.md#license).
+  [shaderc](https://github.com/google/shaderc), [LibHac](https://github.com/Thealexbarney/LibHac) e as outras listadas
+  em [docs/LASRecomp-README.md](docs/LASRecomp-README.md#license). Fontes incluídas no APK: BIZ UDPGothic (SIL OFL) e
+  DejaVu Sans.
 
 ## Aviso legal
 
-O ZA Recomp é um projeto de fãs. Não é afiliado, endossado nem patrocinado pela Nintendo, Game Freak, Creatures ou
-The Pokémon Company. *Pokémon* e *Pokémon Legends: Z-A* são marcas registradas dos seus respectivos donos. Nenhum
-arquivo, código, asset ou fonte do jogo está incluído; você precisa fornecer a sua própria cópia do jogo, obtida
-legalmente.
+O PokeZ-Android é um projeto de fãs. Não é afiliado, endossado nem patrocinado pela Nintendo, Game Freak, Creatures ou
+The Pokémon Company. *Pokémon* e *Pokémon Legends: Z-A* são marcas de seus respectivos donos. Nenhum arquivo, código,
+recurso ou fonte do jogo vem incluído; você precisa fornecer sua própria cópia obtida legalmente, e o APK compilado a
+partir dela é só para o seu aparelho.
 
-O código é distribuído sob a [Licença MIT](LICENSE) (LAS Recomp © Peiikai). Componentes de terceiros mantêm as suas
+O código é distribuído sob a [Licença MIT](LICENSE) (LAS Recomp © Peiikai). Componentes de terceiros mantêm suas
 próprias licenças; veja [docs/LASRecomp-README.md](docs/LASRecomp-README.md#license).
