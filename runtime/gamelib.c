@@ -63,6 +63,12 @@ bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
     char want[GAMELIB_FULL_ID_SIZE];
     if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
+    // LARECOMP_GAME_LIB: as gamelib_load takes it - as given, the library's own id decides - rather than asking
+    // for a <library>.id beside it. On Android that file cannot exist: the library ships in the APK's lib
+    // directory, which only ever holds .so files, and without this the start screen would try to build the game
+    // code (spawning a compiler, which an app cannot do).
+    const char *env = getenv("LARECOMP_GAME_LIB");
+    if (env && *env && exists(env)) return gamelib_load(game_dir, NULL, 0);
     char c[3][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)

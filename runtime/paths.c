@@ -352,6 +352,15 @@ void rt_paths_init(void) {
 const char *rt_data_root(void) { return g_root; }
 
 bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
+    // LARECOMP_RESOURCE_DIR first: where a package keeps its bundled files when nothing can sit next to the
+    // executable - on Android the "executable" is libmain.so in the APK's lib directory, which holds only .so files,
+    // so runtime/platform/android.c unpacks the APK's assets to internal storage and names that folder here
+    const char *rdir = getenv("LARECOMP_RESOURCE_DIR");
+    if (name && rdir && *rdir) {
+        char p[1100];
+        snprintf(p, sizeof p, "%s" SEP "%s", rdir, name);
+        if (exists(p)) return (size_t)snprintf(out, n, "%s", p) < n;
+    }
     char c[4][1100] = {{0}};
     if (name) {
         snprintf(c[0], sizeof c[0], "%s" SEP "%s", g_exe_dir, name);
