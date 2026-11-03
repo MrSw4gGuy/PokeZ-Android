@@ -67,6 +67,11 @@ typedef struct {
     bool game_drs;  // Pokémon Z-A: its own dynamic resolution (else always full: runtime/nvn/vulkan/exec.c)
     int gtao;            // ambient occlusion (GTAO): 0 off, 1 low, 2 medium, 3 high (vulkan/exec.c)
     int gtao_strength;   // its strength, percent (25-100; 100 the default look)
+    // Pokémon Z-A 2.0.2's graphics tweaks (runtime/hle/za_tweaks.c, tools/za_patches.py ZA_TWEAKS), at once:
+    int za_lod;          // 0 the game's level of detail, 1 more detail at a distance (less pop-in, more GPU time)
+    int za_dof_off;      // 1: no depth of field
+    int za_fxaa_off;     // 1: no FXAA (the game's own anti-aliasing)
+    int za_bloom_off;    // 1: no bloom (its pass skipped too: less GPU time)
     int ssgi;            // indirect light (screen-space GI): 0 off, 1 low, 2 medium, 3 high (vulkan/exec.c ssgi_apply)
     int ssgi_strength;   // its strength, percent (50-300; 100 one physical bounce)
     bool water_ssr;      // water reflections (vulkan/exec.c water_apply)

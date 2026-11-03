@@ -317,8 +317,10 @@ static int vk_counter_mode(void) {
         counter_mode = e && !strcmp(e, "cpu") ? 0 : e && !strcmp(e, "frozen") ? 1 : e && !strcmp(e, "legacy") ? 3 : 2;
         if (counter_mode == 2 && !g_vk.props.limits.timestampComputeAndGraphics) counter_mode = 0;
     }
+    // (Pokémon Z-A by the game, not by its frame hook: a build without that hook - an exefs mod took its site - got
+    // real GPU times, our translation's passes included, and its own frame controller held 30 fps on a phone)
     extern bool g_za_frame_hook;
-    if (!env && g_za_frame_hook && !g_settings.game_drs) return 1;
+    if (!env && (g_za_frame_hook || !g_game_is_la) && !g_settings.game_drs) return 1;
     return counter_mode;
 }
 

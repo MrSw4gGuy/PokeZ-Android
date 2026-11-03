@@ -326,6 +326,10 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
+        else if (!strcmp(key, "za_lod")) g_settings.za_lod = atoi(val) == 1;
+        else if (!strcmp(key, "za_dof_off")) g_settings.za_dof_off = atoi(val) != 0;
+        else if (!strcmp(key, "za_fxaa_off")) g_settings.za_fxaa_off = atoi(val) != 0;
+        else if (!strcmp(key, "za_bloom_off")) g_settings.za_bloom_off = atoi(val) != 0;
         else if (!strcmp(key, "ambient_occlusion_strength")) { int v = atoi(val); g_settings.gtao_strength = v < 25 ? 25 : v > 100 ? 100 : v; }
         else if (!strcmp(key, "indirect_light")) { int v = atoi(val); g_settings.ssgi = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "indirect_light_strength")) { int v = atoi(val); g_settings.ssgi_strength = v < 50 ? 50 : v > 300 ? 300 : v; }
@@ -467,6 +471,10 @@ void settings_save(void) {
     else fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
     fprintf(f, "shadow_sharpness = %d\n", g_settings.shadow_sharp);
     fprintf(f, "ambient_occlusion = %d\n", g_settings.gtao);
+    fprintf(f, "za_lod = %d\n", g_settings.za_lod);
+    fprintf(f, "za_dof_off = %d\n", g_settings.za_dof_off);
+    fprintf(f, "za_fxaa_off = %d\n", g_settings.za_fxaa_off);
+    fprintf(f, "za_bloom_off = %d\n", g_settings.za_bloom_off);
     fprintf(f, "ambient_occlusion_strength = %d\n", g_settings.gtao_strength);
     fprintf(f, "indirect_light = %d\n", g_settings.ssgi);
     fprintf(f, "indirect_light_strength = %d\n", g_settings.ssgi_strength);

@@ -73,7 +73,11 @@ bool plat_gpu_share(uint64_t addr, uint64_t size);
 // The shared range and its AHardwareBuffer (NULL: none)
 void *plat_gpu_shared(uint64_t *addr, uint64_t *size);
 double plat_thermal_scale(double now);
+// The presenting thread's frame: what it took and what it may take (Android's performance hints, ADPF: the CPU clocks
+// it keeps follow the real frame budget, not a guess)
+void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
 #else
+static inline void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) { (void)work_ns, (void)target_ns; }
 static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
 #endif
 

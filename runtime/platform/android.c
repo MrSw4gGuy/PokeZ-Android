@@ -217,6 +217,43 @@ int plat_protect(uint64_t addr, uint64_t size, int prot) {
     return mprotect((void *)(uintptr_t)addr, size, p);
 }
 
+// ---- performance hints (platform.h plat_perf_hint): Android's ADPF, API 33 - looked up at run time (the app runs from
+// API 31, where there's none: then nothing). A session for the presenting thread gets the frame's real budget (33.3 ms
+// at 30 fps, 16.7 at 60) and each frame's work: the scheduler keeps the CPU clocks that meet it instead of holding them
+// up for a frame rate the game doesn't run at (ACNHRecomp found the same on its Snapdragon port: less heat at the same
+// frame rate). Only the thread that first calls in. LARECOMP_PERF_HINT=0: off.
+typedef struct APerformanceHintManager APerformanceHintManager;
+typedef struct APerformanceHintSession APerformanceHintSession;
+void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) {
+    static int state = -1;  // (-1 not tried, 0 none, 1 on)
+    static APerformanceHintSession *s;
+    static int64_t cur_target;
+    static int (*report)(APerformanceHintSession *, int64_t);
+    static int (*update)(APerformanceHintSession *, int64_t);
+    if (state < 0) {
+        state = 0;
+        const char *e = getenv("LARECOMP_PERF_HINT");
+        if (e && !atoi(e)) return;
+        void *h = dlopen("libandroid.so", RTLD_NOW);
+        APerformanceHintManager *(*get)(void) = h ? (APerformanceHintManager * (*)(void)) dlsym(h, "APerformanceHint_getManager") : NULL;
+        APerformanceHintSession *(*create)(APerformanceHintManager *, const int32_t *, size_t, int64_t) =
+            h ? (APerformanceHintSession * (*)(APerformanceHintManager *, const int32_t *, size_t, int64_t))
+                    dlsym(h, "APerformanceHint_createSession") : NULL;
+        report = h ? (int (*)(APerformanceHintSession *, int64_t))dlsym(h, "APerformanceHint_reportActualWorkDuration") : NULL;
+        update = h ? (int (*)(APerformanceHintSession *, int64_t))dlsym(h, "APerformanceHint_updateTargetWorkDuration") : NULL;
+        APerformanceHintManager *m = get ? get() : NULL;
+        int32_t tid = (int32_t)gettid();
+        s = m && create && report && update ? create(m, &tid, 1, (int64_t)target_ns) : NULL;
+        cur_target = (int64_t)target_ns;
+        state = s != NULL;
+        fprintf(stderr, "[perfhint] %s\n", s ? "performance hint session on (the frame budget goes to the scheduler)"
+                                             : "no performance hints here (API 33+)");
+    }
+    if (state != 1 || !work_ns) return;
+    if ((int64_t)target_ns != cur_target) update(s, (int64_t)target_ns), cur_target = (int64_t)target_ns;
+    report(s, (int64_t)work_ns);
+}
+
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
 // next forecast seconds, to its severe throttling point - 1.0 is that point. Measured on an SM-S936B after ~35 min of

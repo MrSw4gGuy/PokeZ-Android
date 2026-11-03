@@ -750,6 +750,36 @@ static void tab_display(bool in_game) {
                           "mesmo tempo da GPU em qualquer intensidade. Muda na hora.")))
             g_settings.gtao_strength = pct[pi];
     }
+    if (!menu_la_rows()) {  // Pokémon Z-A 2.0.2's own effects (runtime/hle/za_tweaks.c): each at once, in game
+        opt_section(TR("Game effects (Pokemon Z-A 2.0.2)", "Efeitos do jogo (Pokémon Z-A 2.0.2)"));
+        const char *lod[] = {TR("Game's", "Do jogo"), TR("High", "Alto")};
+        opt_choice(TR("Level of detail", "Nível de detalhe"), &g_settings.za_lod, lod, 2, 0,
+                   TR("High: characters and buildings keep their detailed models farther away - less pop-in, at more "
+                      "GPU time. Changes at once.",
+                      "Alto: personagens e prédios mantêm os modelos detalhados até mais longe - menos pop-in, por mais "
+                      "tempo da GPU. Muda na hora."));
+        bool b = !g_settings.za_bloom_off;
+        if (opt_toggle("Bloom", &b, true,
+                       TR("The glow around bright lights and the sky. Off: a little less GPU time (its pass is skipped). "
+                          "Changes at once.",
+                          "O brilho em volta de luzes fortes e do céu. Desligado: um pouco menos de tempo da GPU (a passada "
+                          "dele é pulada). Muda na hora.")))
+            g_settings.za_bloom_off = !b;
+        b = !g_settings.za_dof_off;
+        if (opt_toggle(TR("Depth of field", "Profundidade de campo"), &b, true,
+                       TR("The blur of what is far away in cutscenes and menus. Changes at once.",
+                          "O desfoque do que está longe nas cenas e nos menus. Muda na hora.")))
+            g_settings.za_dof_off = !b;
+        b = !g_settings.za_fxaa_off;
+        if (opt_toggle(TR("Game's anti-aliasing (FXAA)", "Anti-aliasing do jogo (FXAA)"), &b, true,
+                       TR("The game's own edge smoothing. Off: sharper, more jagged edges (SMAA above can take its place). "
+                          "Changes at once.",
+                          "A suavização de bordas do próprio jogo. Desligado: bordas mais nítidas e mais serrilhadas (o SMAA "
+                          "acima pode ficar no lugar). Muda na hora.")))
+            g_settings.za_fxaa_off = !b;
+        ImGui::TextDisabled("%s", TR("Found by Fl4sh9174's mods for Switch emulators.",
+                                     "Descobertos pelos mods do Fl4sh9174 para emuladores de Switch."));
+    }
     {   // indirect light (vulkan/exec.c ssgi_apply): one bounce of the game's light from what is on screen
         const char *gi[] = {TR("Off", "Desligada"), TR("Low", "Baixa"), TR("Medium", "Média"), TR("High", "Alta")};
         opt_choice(TR("Indirect light", "Luz indireta"), &g_settings.ssgi, gi, 4, 0,

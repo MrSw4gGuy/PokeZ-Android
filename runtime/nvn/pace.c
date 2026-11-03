@@ -251,6 +251,11 @@ void pace_frame(void) {
         return;
     }
     double busy = (p > wt ? p - wt : 0) / 1e6;
+    // (Android's performance hints: this thread's CPU time for the frame against its budget - 33.3 ms in the game's
+    // 30 fps mode, its period over 25 ms, else 16.7. CPU time, not busy time: Pokémon Z-A's wait for its next frame
+    // counts as busy, and a frame reported as filling its budget kept the clocks up. platform.h plat_perf_hint, a no-op
+    // elsewhere)
+    plat_perf_hint(tc ? tc : 1, p > 25000000ull ? 33333333ull : 16666667ull);
     // What the frame would cost at 60 fps: a frame of the game's 30 fps mode (two vsyncs or more) runs its world twice,
     // and the second step - about half this thread's CPU time then (measured: 3.0 -> 6.0 ms, 4.9 -> 9.3 ms) - is work
     // a 60 fps frame doesn't have. Without that, the 30 fps mode's frames looked 3-5 ms slower than they would be at 60
