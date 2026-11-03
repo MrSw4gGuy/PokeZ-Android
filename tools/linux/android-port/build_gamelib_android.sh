@@ -6,7 +6,11 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-/root/lasrecomp}
 P=$WORK/build/android/deps
-B=$WORK/build/android
+# GEN_DIR / BREL: the generated tree and build folder, relative to the checkout - one pair per game, since each
+# game's code library is generated from its own exefs (Link's Awakening by default; build_za.sh passes Z-A's)
+GEN_DIR=${GEN_DIR:-generated-android}
+BREL=${BREL:-build/android}
+B=$WORK/$BREL
 N=/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
 JOBS=$(nproc)
 
@@ -21,7 +25,7 @@ rm -f "$B"/obj/*.o            # (that shortcut's flattened objects: not what the
 rm -f "$B/lasgame.so" "$B/lasgame.so.id"
 # relative target: the Makefile's rule is $(B)/lasgame.so with B=build/android, and make does not consider an
 # absolute spelling of the same file to be that target ("No rule to make target")
-make -j"$JOBS" PLATFORM=android DEPS="$P" build/android/lasgame.so > /root/gamelib_android.log 2>&1 \
+make -j"$JOBS" PLATFORM=android DEPS="$P" GEN="$GEN_DIR" B="$BREL" "$BREL/lasgame.so" > /root/gamelib_android.log 2>&1 \
     || { echo "FAIL: make"; tail -20 /root/gamelib_android.log; exit 1; }
 ls -lh "$B/lasgame.so" | sed 's/.* \([0-9.]*[MK]\) .*/size: \1/'
 

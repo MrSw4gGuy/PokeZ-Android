@@ -14,8 +14,10 @@ APP=$WORK/build/android/app
 PKG=org.recomp.za
 PKGDIR=org/recomp/za
 JNI=$APP/app/src/main/jniLibs/arm64-v8a
+# GAME_BUILD: the build folder whose libmain.so and lasgame.so go in (build_gamelib_android.sh BREL): one per game
+GAME_BUILD=${GAME_BUILD:-$WORK/build/android}
 
-[ -f "$WORK/build/android/libmain.so" ] || { echo "no libmain.so: make PLATFORM=android first"; exit 1; }
+[ -f "$GAME_BUILD/libmain.so" ] || { echo "no libmain.so in $GAME_BUILD: build_gamelib_android.sh first"; exit 1; }
 
 echo "=== project skeleton from SDL3's template ==="
 rm -rf "$APP"
@@ -151,7 +153,7 @@ android {
 GRADLE
 
 echo "=== native libraries into jniLibs/arm64-v8a ==="
-cp "$WORK/build/android/libmain.so" "$JNI/"
+cp "$GAME_BUILD/libmain.so" "$JNI/"
 for l in libSDL3.so libavformat.so libavcodec.so libavutil.so libswscale.so libshaderc_shared.so; do
     cp "$DEPS/lib/$l" "$JNI/"
 done
@@ -169,8 +171,8 @@ cp "$WORK/third_party/fonts/DejaVu/DejaVuSans.ttf" "$A/"
 cp "$WORK/third_party/fonts/DejaVu/LICENSE" "$A/DejaVu-LICENSE.txt"
 ls -1 "$A" | sed 's/^/  /'
 # the recompiled game itself, if it has been built
-if [ -f "$WORK/build/android/lasgame.so" ]; then
-    cp "$WORK/build/android/lasgame.so" "$JNI/"
+if [ -f "$GAME_BUILD/lasgame.so" ]; then
+    cp "$GAME_BUILD/lasgame.so" "$JNI/"
 else
     echo "  (no lasgame.so yet - the APK will install but have no game code)"
 fi
