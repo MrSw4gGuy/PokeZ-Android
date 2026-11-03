@@ -55,7 +55,7 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
 | Intro cutscenes, train, Lumiose City | Works: no heavy visual bugs left (the eyes below), the game's own pop-in |
-| Frame rate | A steady 30 fps (the game's own rate on the Switch) in the scenes tested so far |
+| Frame rate | A steady 30 fps (the game's own rate on the Switch) in the scenes tested so far. 60 fps: about 53 at 75% resolution (the GPU is the limit); **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and back to 60 when there is room - not tested on the phone yet |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
 | Touch controls | Works (D-pad tested in the game's menus; the rest in progress) |
