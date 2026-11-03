@@ -763,7 +763,9 @@ static void create_device(void) {
     VkPhysicalDevicePresentIdFeaturesKHR have_pid = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &have_pw};
     VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                                .pNext = x_pw ? (void *)&have_pid : x_rb2 ? (void *)&have_rb2 : NULL};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have12};
+    VkPhysicalDeviceVulkan13Features have13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &have12};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &have13};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
 #if defined(__linux__) && defined(VK_EXT_map_memory_placed)
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT have_placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     if (placed_ext) have_placed.pNext = have12.pNext, have12.pNext = &have_placed;
@@ -861,7 +863,7 @@ static void create_device(void) {
     if (getenv("LARECOMP_VK_GPL_PROBE") && atoi(getenv("LARECOMP_VK_GPL_PROBE"))) LOG("[gpl] probe: this build's Vulkan headers have no graphics pipeline library; skipped\n");
 #endif
 #if defined(__linux__) && defined(VK_EXT_map_memory_placed)
-    have12.pNext = NULL;
+    have12.pNext = NULL, have11.pNext = NULL, have13.pNext = NULL;
     g_vk.map_placed = placed_ext && have_placed.memoryMapPlaced;
     g_vk.unmap_reserve = g_vk.map_placed && have_placed.memoryUnmapReserve;
     if (g_vk.map_placed) {
@@ -917,14 +919,24 @@ static void create_device(void) {
                                             .scalarBlockLayout = VK_TRUE, .bufferDeviceAddress = g_vk.bda, .shaderOutputLayer = have12.shaderOutputLayer,
                                             .samplerFilterMinmax = have12.samplerFilterMinmax,
                                             .shaderOutputViewportIndex = have12.shaderOutputViewportIndex, .pNext = v13 ? (void *)&f13 : tail};
-    if (!v13) {  // (an older driver may lack some: say which, and ask only for what it has)
+    // Always, not only on a pre-1.3 driver: a driver reporting Vulkan 1.3 still has each of these as
+    // optional, which desktop GPUs hide by supporting them all. Asking for one the driver lacks makes
+    // vkCreateDevice fail with VK_ERROR_FEATURE_NOT_PRESENT and say nothing about which.
+    {
 #define VK_WANT12(x) if (f12.x && !have12.x) { LOG("[vk] warning: the GPU driver has no " #x "\n"); f12.x = VK_FALSE; }
         VK_WANT12(timelineSemaphore) VK_WANT12(shaderInt8) VK_WANT12(samplerMirrorClampToEdge)
         VK_WANT12(uniformAndStorageBuffer8BitAccess) VK_WANT12(storageBuffer8BitAccess) VK_WANT12(scalarBlockLayout)
 #undef VK_WANT12
     }
+    if (v13) {  // the Vulkan 1.3 features were never checked against the driver at all
+#define VK_WANT13(x) if (f13.x && !have13.x) { LOG("[vk] warning: the GPU driver has no " #x "\n"); f13.x = VK_FALSE; }
+        VK_WANT13(dynamicRendering) VK_WANT13(synchronization2) VK_WANT13(subgroupSizeControl)
+        VK_WANT13(shaderDemoteToHelperInvocation) VK_WANT13(shaderTerminateInvocation) VK_WANT13(maintenance4)
+#undef VK_WANT13
+    }
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+                                            .storageBuffer16BitAccess = have11.storageBuffer16BitAccess, .pNext = &f12};
+    if (!have11.storageBuffer16BitAccess) LOG("[vk] warning: the GPU driver has no storageBuffer16BitAccess\n");
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
@@ -1119,6 +1131,11 @@ static VkPresentModeKHR present_mode(void) {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+// Whether the window should be HDR: create_swapchain decides with it and vk_frame_begin compares against it, so the
+// two can never disagree - they did once pre-rotation turned HDR off, and every frame recreated the swapchain.
+static bool hdr_blocked;  // (create_swapchain: Android pre-rotation has no HDR pass)
+static bool hdr_wanted(void) { return g_vk.hdr_capable && g_settings.hdr && !ENV("LARECOMP_NO_HDR") && !hdr_blocked; }
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -1146,7 +1163,23 @@ static void create_swapchain(void) {
         if (pq || (scrgb && !hf.format)) hf = fmts[i];
     }
     g_vk.hdr_capable = hf.format != VK_FORMAT_UNDEFINED;
-    bool hdr = g_vk.hdr_capable && g_settings.hdr && !ENV("LARECOMP_NO_HDR");
+    // A desktop surface always reports an identity transform. A phone's natural orientation is portrait, so held in
+    // landscape it reports ROTATE_90 / 270, with currentExtent in the landscape size. The swapchain is made for that
+    // transform, in the display's native (portrait) size, and vk_frame_end writes the landscape image everything drew
+    // into it turned (vk_rotate_encode) - so the compositor turns nothing. Presenting as identity instead made the
+    // compositor rotate every frame, a display cost on top of the game's; passing the transform back without turning
+    // the content showed the start screen sideways and stretched.
+    VkSurfaceTransformFlagBitsKHR pre = caps.currentTransform;
+    uint32_t rotate = 0;
+    VkExtent2D wext = ext;
+#ifdef __ANDROID__
+    rotate = pre == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR    ? 90
+           : pre == VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR ? 180
+           : pre == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR ? 270 : 0;
+    if (rotate == 90 || rotate == 270) wext = (VkExtent2D){ext.height, ext.width};
+#endif
+    hdr_blocked = rotate != 0;  // (the rotate pass writes SDR: HDR waits for the phone held the native way)
+    bool hdr = hdr_wanted();
     VkSurfaceFormatKHR wf = hdr ? hf : sf;
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
@@ -1154,16 +1187,19 @@ static void create_swapchain(void) {
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
-        .imageFormat = wf.format, .imageColorSpace = wf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
+        .imageFormat = wf.format, .imageColorSpace = wf.colorSpace, .imageExtent = wext, .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = pre,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     static const char *const modes[] = {"immediate", "mailbox", "fifo", "fifo-relaxed"};
-    LOG("[vk] swapchain %ux%u, %u images, %s%s\n", ext.width, ext.height, count,
+    LOG("[vk] swapchain %ux%u, %u images, %s%s", ext.width, ext.height, count,
         ci.presentMode < 4 ? modes[ci.presentMode] : "other present mode",
-        hdr ? (wf.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ? ", HDR10" : ", HDR scRGB") : g_vk.hdr_capable ? " (HDR available)" : "");
+        hdr ? (wf.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ? ", HDR10" : ", HDR scRGB")
+            : g_vk.hdr_capable && !rotate ? " (HDR available)" : "");
+    if (rotate) LOG(", turned %u degrees into %ux%u (pre-rotation: the compositor turns nothing)", rotate, wext.width, wext.height);
+    LOG("\n");
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
         if (g_vk.sdr_mem[i]) vmaDestroyImage(g_vk.vma, g_vk.sc_images[i], g_vk.sdr_mem[i]), g_vk.sdr_mem[i] = VK_NULL_HANDLE;
@@ -1180,8 +1216,11 @@ static void create_swapchain(void) {
     g_vk.hdr_space = wf.colorSpace;
     g_vk.sc_format = sf.format;
     g_vk.sc_extent = ext;
+    g_vk.rotate = rotate, g_vk.sc_transform = pre, g_vk.win_extent = wext;
     g_vk.sc_count = 8;
-    VkImage *wimg = hdr ? g_vk.hdr_images : g_vk.sc_images;
+    // HDR or turned: the window's images are hdr_images / hdr_views, and everything draws into SDR images of its own
+    bool sep = hdr || rotate;
+    VkImage *wimg = sep ? g_vk.hdr_images : g_vk.sc_images;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, wimg);
     // (an SDR image to draw into: sampled by vk_hdr_encode, copied for the window shots and the overlay's base)
     VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = sf.format,
@@ -1194,7 +1233,7 @@ static void create_swapchain(void) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = wimg[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = wf.format,
                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        if (hdr) {
+        if (sep) {
             VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &g_vk.hdr_views[i]));
             VK_CHECK(vmaCreateImage(g_vk.vma, &ici, &ai, &g_vk.sc_images[i], &g_vk.sdr_mem[i], NULL));
             vi.image = g_vk.sc_images[i], vi.format = sf.format;
@@ -1272,8 +1311,20 @@ bool vk_frame_begin(const float clear[4]) {
     WAITING(rec_wait_presents(rec_presents_queued()));
     if (rec_present_recreate()) recreate_swapchain();
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
-    else if (g_vk.hdr != (g_vk.hdr_capable && g_settings.hdr && !ENV("LARECOMP_NO_HDR"))) recreate_swapchain();  // (HDR switched)
+    else if (g_vk.hdr != hdr_wanted()) recreate_swapchain();  // (HDR switched)
     else if (present_fifo_made != g_settings.present_fifo) recreate_swapchain();  // (Frame pacing switched)
+#ifdef __ANDROID__
+    // The phone turned over (landscape left <-> right): the surface's transform goes 90 <-> 270 with no change of size,
+    // and the turned image (create_swapchain) would show upside down until the swapchain follows. A cheap query, every
+    // half second or so: record.c no longer recreates on SUBOPTIMAL, which is what would otherwise have noticed it.
+    static unsigned turn_check;
+    if (g_vk.swapchain && ++turn_check % 30 == 0) {
+        VkSurfaceCapabilitiesKHR caps;
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps) == VK_SUCCESS &&
+            caps.currentTransform != g_vk.sc_transform)
+            recreate_swapchain();
+    }
+#endif
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = ENV("LARECOMP_VK_TRACE") != NULL;
@@ -1709,6 +1760,13 @@ void vk_frame_end(const char *shot_path) {
         } else {
             image_barrier(cb, hi, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         }
+    } else if (g_vk.rotate) {  // pre-rotation (create_swapchain): the landscape image drawn -> the window's native one
+        extern void vk_rotate_encode(VkCommandBuffer cb, VkImageView src, VkImageView dst);
+        VkImage wi = g_vk.hdr_images[cur_frame.image];
+        image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        image_barrier(cb, wi, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        vk_rotate_encode(cb, g_vk.sc_views[cur_frame.image], g_vk.hdr_views[cur_frame.image]);
+        image_barrier(cb, wi, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else {
         image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     }

@@ -300,6 +300,25 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(location = 0) out vec4 o;\n"
                "void main() { o = texture(t, uv); }\n";
     }
+    // ---- Android pre-rotation (exec.c vk_rotate_encode): the landscape window image (W x H: r.y, r.z) -> the display's
+    // native one, the content turned r.x degrees clockwise (VK_SURFACE_TRANSFORM_ROTATE_*: "rotated clockwise").
+    // Inverted per destination texel d: 90 takes source (d.y, H-1-d.x) - source top-left lands top-right -, 270
+    // (W-1-d.y, d.x), 180 both axes. texelFetch: the sizes only swap, so it is an exact copy.
+    if (!strcmp(name, "rotate.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+               "layout(push_constant) uniform P { ivec4 r; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 d = ivec2(gl_FragCoord.xy), s;\n"
+               "  int W = pc.r.y, H = pc.r.z;\n"
+               "  if (pc.r.x == 90) s = ivec2(d.y, H - 1 - d.x);\n"
+               "  else if (pc.r.x == 270) s = ivec2(W - 1 - d.y, d.x);\n"
+               "  else s = ivec2(W - 1 - d.x, H - 1 - d.y);\n"
+               "  o = texelFetch(src, s, 0);\n"
+               "}\n";
+    }
     // ---- HDR output (F1 > Video > HDR; exec.c vk_hdr_encode): the window's SDR image -> its HDR10 / scRGB image.
     // Everything is paper white bright (cfg.x, in scRGB units of 80 nits) except the game's highlights: above the knee
     // (cfg.z, linear, on the brightest channel) the scene brightens smoothly up to the peak (cfg.y x paper white) - an

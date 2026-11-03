@@ -10397,6 +10397,79 @@ void vk_hdr_encode(VkCommandBuffer cb, VkImageView sdr, VkImageView base, VkImag
     rec_CmdEndRendering(cb);
 }
 
+// Android pre-rotation (device.c create_swapchain / vk_frame_end): the landscape window image everything drew (src,
+// g_vk.sc_extent) -> the window's own image in the display's native orientation (dst, g_vk.win_extent), turned
+// g_vk.rotate degrees clockwise by rotate.frag. A texel per texel copy - the sizes only swap - so nothing is filtered.
+void vk_rotate_encode(VkCommandBuffer cb, VkImageView src, VkImageView dst) {
+    static VkPipelineLayout layout;
+    static VkDescriptorSetLayout dsl;
+    static VkPipeline pipe;
+    static VkFormat pipe_fmt;
+    if (!layout) {
+        VkDescriptorSetLayoutBinding bd = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &bd};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &dsl));
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &layout));
+    }
+    if (!pipe || pipe_fmt != g_vk.sc_format) {  // (an old one may still be in flight: kept)
+        VkPipelineShaderStageCreateInfo stages[2] = {
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+             .module = vk_builtin_shader("post.vert"), .pName = "main"},
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+             .module = vk_builtin_shader("rotate.frag"), .pName = "main"}};
+        VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                     .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+        VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+        VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                     .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+        VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                   .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+        VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+        VkPipelineColorBlendStateCreateInfo cbs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+                                                   .pAttachments = &cba};
+        VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        uint32_t ndyn = 2;
+        fullscreen_vertex_dyn(dyn, &ndyn, 3);
+        VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = ndyn, .pDynamicStates = dyn};
+        VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                            .pColorAttachmentFormats = &g_vk.sc_format};
+        VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                           .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                           .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                           .pColorBlendState = &cbs, .pDynamicState = &dy, .layout = layout};
+        VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pipe));
+        pipe_fmt = g_vk.sc_format;
+    }
+    VkDescriptorSet set = vk_alloc_set(dsl);
+    VkDescriptorImageInfo ii = {vk_default_sampler(false), src, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    rec_UpdateDescriptorSets(1, &wr);
+    VkExtent2D ext = g_vk.win_extent;
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst,
+                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, ext}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    rec_CmdBeginRendering(cb, &ri);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+    VkViewport vp = {0, 0, (float)ext.width, (float)ext.height, 0, 1};
+    VkRect2D sc = {{0, 0}, ext};
+    rec_CmdSetViewport(cb, 0, 1, &vp);
+    rec_CmdSetScissor(cb, 0, 1, &sc);
+    int32_t pc[4] = {(int32_t)g_vk.rotate, (int32_t)g_vk.sc_extent.width, (int32_t)g_vk.sc_extent.height, 0};
+    rec_CmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
+    fullscreen_vertex_bind(cb);
+    rec_CmdDraw(cb, 3, 1, 0, 0);
+    rec_CmdEndRendering(cb);
+}
+
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
 // Only the part its contents occupy (Dynamic resolution: the top-left part; the rest holds older frames).
 void renderer_save_texture_tex(TexBackend *b, const char *path) {

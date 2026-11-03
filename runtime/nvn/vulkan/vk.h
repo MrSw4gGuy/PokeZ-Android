@@ -171,6 +171,13 @@ typedef struct {
     VkImage hdr_base;  // the window image before the overlay (vk_hdr_mark_base): what ImGui drew is told apart from it
     VmaAllocation hdr_base_mem;
     VkImageView hdr_base_view;
+    // Android pre-rotation (device.c create_swapchain): a phone held in landscape reports its surface ROTATE_90 / 270.
+    // The window's images are then hdr_images / hdr_views too, in the display's native portrait size win_extent, written
+    // by vk_rotate_encode (exec.c) from sc_images, which keep the landscape size everything draws at - so the compositor
+    // rotates nothing (it did each frame before, at a display cost). No HDR while rotating.
+    uint32_t rotate;                           // 0, 90, 180 or 270: the content's clockwise turn into the window image
+    VkSurfaceTransformFlagBitsKHR sc_transform;  // the surface transform the swapchain was made for
+    VkExtent2D win_extent;                     // the window images' size (sc_extent, turned when rotate is 90 / 270)
 } VkG;
 void vk_log_memory(const char *why);  // (device.c: per-heap budget and use, at start and on allocation failures)
 extern VkG g_vk;

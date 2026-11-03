@@ -615,7 +615,16 @@ static void present_run(const void *p) {
         if (n++ < 20) LOG("[vk] vkQueuePresentKHR took %llu ms\n", (unsigned long long)(dt / 1000000));
     }
     __atomic_fetch_add(&g_vk_frame_waits[3], 1, __ATOMIC_RELAXED);
+#ifdef __ANDROID__
+    // On Android SUBOPTIMAL means the swapchain's transform no longer matches the surface's. When the compositor did the
+    // rotation it came back on every present and recreating on it rebuilt the swapchain every frame; with pre-rotation
+    // (device.c create_swapchain) it only follows the phone being turned over, which vk_frame_begin checks for itself.
+    // A real change of surface size still arrives as OUT_OF_DATE.
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) atomic_store_explicit(&present_recreate, 1, memory_order_release);
+    else if (r == VK_SUBOPTIMAL_KHR) { if (a->id) vk_present_watch(a->id); }
+#else
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store_explicit(&present_recreate, 1, memory_order_release);
+#endif
     else if (r == VK_SUCCESS) { if (a->id) vk_present_watch(a->id); }
     else {
         static int n;
