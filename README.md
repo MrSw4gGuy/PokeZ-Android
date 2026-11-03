@@ -120,6 +120,11 @@ time the phone warms up (down to about 45%). In **Settings > Video**:
   down later).
 - **Shadow resolution**: *50%* (the Android default), *75%*, the *game's* (1024 x 1024) or higher. The sun's shadows are
   about half of the GPU's time in each frame on a phone; at 50% their edges are a little coarser.
+- **Game effects** (Pokémon Z-A 2.0.2, change at once): *Level of detail* High keeps the detailed models farther
+  away (less pop-in, more GPU time); *Bloom*, *Depth of field* and the game's *FXAA* can be turned off (bloom off also
+  skips its pass). Their sites in the game were found by [Fl4sh9174's mods](https://github.com/Fl4sh9174/Switch-Emulator-Ultrawide-FPS-Mods).
+- **Text entry** (the character's name and our menus' fields) uses the app's own on-screen keyboard, by touch or
+  controller; Android's keyboard doesn't come up.
 - **Anti-aliasing**: *SMAA* smooths jagged edges, at a small cost.
 
 ## Saves

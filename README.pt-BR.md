@@ -122,6 +122,12 @@ celular esquenta (até cerca de 45%). Em **Configurações > Vídeo**:
   degraus depois).
 - **Resolução das sombras**: *50%* (o padrão no Android), *75%*, a *do jogo* (1024 x 1024) ou maior. As sombras do sol
   são cerca de metade do tempo da GPU em cada quadro num celular; a 50% as bordas ficam um pouco mais grossas.
+- **Efeitos do jogo** (Pokémon Z-A 2.0.2, mudam na hora): *Nível de detalhe* Alto mantém os modelos detalhados até
+  mais longe (menos pop-in, mais tempo da GPU); *Bloom*, *Profundidade de campo* e o *FXAA* do jogo podem ser
+  desligados (o bloom desligado também pula a passada dele). Os pontos no jogo foram encontrados pelos
+  [mods do Fl4sh9174](https://github.com/Fl4sh9174/Switch-Emulator-Ultrawide-FPS-Mods).
+- **Digitar texto** (o nome do personagem e os campos dos nossos menus) usa o teclado próprio do app na tela, por
+  toque ou controle; o teclado do Android não aparece.
 - **Anti-aliasing**: *SMAA* suaviza as bordas serrilhadas, com um custo pequeno.
 
 ## Saves
