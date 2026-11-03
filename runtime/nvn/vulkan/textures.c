@@ -1471,10 +1471,56 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
+    // A square 2D texture bound where the shader samples a cube (Pokémon Z-A: a 32x32 BC7 one, at characters coming
+    // into view - the Switch's texture unit reads the 2D image there). Vulkan views no 2D image as a cube, and the black
+    // stand-in drew those characters white until their own maps came. A 6-face copy of it instead (vk_cube_of_2d), made
+    // once. LARECOMP_CUBE_FROM_2D=0: the stand-in, as before.
+    if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D && b->width == b->height && b->uploaded) {
+        static int on = -1;
+        if (on < 0) on = !ENV("LARECOMP_CUBE_FROM_2D") || atoi(ENV("LARECOMP_CUBE_FROM_2D")) != 0;
+        TexBackend *cb_ = on ? vk_cube_of_2d(b) : NULL;
+        if (cb_) return vk_image_view(cb_, want, fmt, lv0, nlv, 0, 6, sw, aspect);
+    }
     static int nlog;
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
     return vk_dummy_view(want_textype);
+}
+
+// The 6-face copy of a square 2D image (vk_texture_view: a shader samples it as a cube), made the first time: each of
+// its levels copied into every face, in the upload command buffer that runs before the draws. Not made again when the
+// 2D image changes (the one Pokémon Z-A binds so is a fixed 32x32 map); freed with nothing (a few KB, once).
+TexBackend *vk_cube_of_2d(TexBackend *b) {
+    if (b->cube) return b->cube->image ? b->cube : NULL;
+    TexBackend *c = calloc(1, sizeof *c);
+    b->cube = c;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
+                            .imageType = VK_IMAGE_TYPE_2D, .format = b->format, .extent = {b->width, b->height, 1},
+                            .mipLevels = b->levels ? b->levels : 1, .arrayLayers = 6, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateImage(g_vk.vma, &ci, &ai, &c->image, &c->mem, NULL) != VK_SUCCESS) {
+        c->image = VK_NULL_HANDLE;
+        return NULL;
+    }
+    c->format = b->format, c->base_type = VK_IMAGE_VIEW_TYPE_CUBE, c->width = b->width, c->height = b->height;
+    c->depth = 1, c->layers = 6, c->levels = ci.mipLevels, c->samples = 1, c->aspect = b->aspect, c->uploaded = true;
+    VkCommandBuffer cb = vk_upload_cmd();
+    vk_image_init_layout(cb, c->image, b->aspect);
+    VkImageCopy r[96];  // (a region per level and face: the layer counts of a copy's two sides must match)
+    uint32_t n = 0;
+    for (uint32_t lv = 0; lv < ci.mipLevels && n + 6 <= 96; lv++) {
+        uint32_t w = b->width >> lv ? b->width >> lv : 1, h = b->height >> lv ? b->height >> lv : 1;
+        for (uint32_t f = 0; f < 6; f++)
+            r[n++] = (VkImageCopy){.srcSubresource = {b->aspect, lv, 0, 1}, .dstSubresource = {b->aspect, lv, f, 1},
+                                   .extent = {w, h, 1}};
+    }
+    rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, c->image, VK_IMAGE_LAYOUT_GENERAL, n, r);
+    static int nlog;
+    if (nlog++ < 8) LOG("[tex] %ux%u 2D image sampled as a cube: a 6-face copy made (fmt %d, %u levels)\n", b->width, b->height,
+                        b->format, ci.mipLevels);
+    return c;
 }
 
 // 1x1 black textures for unbound slots, per type

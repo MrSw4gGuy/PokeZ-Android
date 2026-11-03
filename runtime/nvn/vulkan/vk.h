@@ -222,6 +222,7 @@ typedef struct TexBackend {
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
     bool prefetched;  // (uploaded at its registration, not drawn yet: textures.c backend_prefetch_texture)
+    struct TexBackend *cube;  // (a square 2D image a shader samples as a cube: its 6-face copy, textures.c vk_cube_of_2d)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
@@ -267,6 +268,7 @@ VkImageView vk_render_view(NvnTexture *t, const NvnTextureView *v, bool has_view
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
+TexBackend *vk_cube_of_2d(TexBackend *b);  // (a square 2D image's 6-face copy, for a shader sampling it as a cube)
 VkImageView vk_dummy_depth_view(int textype);  // shadow (depth compare) slots: 1x1 depth, cleared to 1.0
 bool vk_format_depth_compare(VkFormat f);  // SAMPLED_IMAGE_DEPTH_COMPARISON
 bool vk_tex_depth_compare(NvnTexture *t);  // t's image can be sampled with a depth compare
