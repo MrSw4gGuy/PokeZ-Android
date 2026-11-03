@@ -482,10 +482,13 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_Q25) h *= 0.25;
         else if (mode == RES_Q50) h *= 0.5;
     }
-    h = fmax(h, 0.1);  // (.25x of a small window)
     // The device's temperature (platform.h plat_thermal_scale: Android's thermal headroom, always 1 on a desktop), on
-    // top of any mode: a smaller part of the same render targets, the way Dynamic draws, so a step reallocates nothing.
-    dyn *= plat_thermal_scale(now);
+    // top of any mode, as a lower resolution: the render targets are made again at each step, as when the setting
+    // changes. (It was first a smaller part of the same targets, the way Dynamic draws, so a step reallocated nothing -
+    // but some of Pokémon Z-A's passes take the whole target then: from the cutscene where the tower turns pink on, the
+    // picture sat in the top left corner. Steps are seconds apart at least, a few a session.)
+    h *= plat_thermal_scale(now);
+    h = fmax(h, 0.1);  // (.25x of a small window)
     // The game sizes its render targets for the screen of the mode it was told (handheld: 1280x720, else 1920x1080), and
     // sx/sy are relative to that size. A fixed N x means N times the game's own image; only "match the display" and dynamic
     // resolution come from the window in units of the docked 1080 lines and need 1080/720 for a handheld game.
