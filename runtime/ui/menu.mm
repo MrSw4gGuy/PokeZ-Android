@@ -16,6 +16,7 @@
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
 #include "osk.h"
+#include "ui_touch.h"
 #include "pad_nav.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
@@ -186,6 +187,21 @@ extern "C" bool menu_cursor_needed(void) { return capturing() || dt_open(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
+#ifdef __ANDROID__
+    {   // a finger on our pages: a tap clicks on the lift, a drag scrolls (ui_touch.h) - each event it makes, as an event
+        static bool in_touch;
+        bool mouse = e->type == SDL_EVENT_MOUSE_MOTION || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_UP;
+        if (mouse && !in_touch && (capturing() || dt_open())) {
+            SDL_Event te[3];
+            int tn = ui_touch_filter(e, te, 5 * 34 * ui_touch_scale() / g_pixel_density);
+            bool r = false;
+            in_touch = true;
+            for (int ti = 0; ti < tn; ti++) r |= menu_handle_event(&te[ti]);
+            in_touch = false;
+            return tn ? r : capturing();
+        }
+    }
+#endif
     if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
@@ -1443,7 +1459,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
     drain_events(io);
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
-    float scale = (float)(th / 1080.0);
+    float scale = (float)(th / 1080.0) * ui_touch_scale();  // (a phone: bigger - ui_touch.h)
     if (scale < 0.45f) scale = 0.45f;
     io.FontGlobalScale = scale;
 

@@ -25,6 +25,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner)
 #include "option_rows.h"
 #include "osk.h"
+#include "ui_touch.h"
 #include "pad_nav.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
@@ -2404,7 +2405,11 @@ extern "C" void launcher_run(const char *root) {
                 }
                 continue;
             }
-            if (!launcher_pad_event(e)) ImGui_ImplSDL3_ProcessEvent(&e);
+            if (!launcher_pad_event(e)) {  // (a finger: a tap clicks, a drag scrolls - ui_touch.h)
+                SDL_Event te[3];
+                int tn = ui_touch_filter(&e, te, 5 * 34 * io.FontGlobalScale);
+                for (int ti = 0; ti < tn; ti++) ImGui_ImplSDL3_ProcessEvent(&te[ti]);
+            }
             if (e.type == SDL_EVENT_QUIT) exit(0);
         }
         // setup finished: check again
@@ -2459,7 +2464,8 @@ extern "C" void launcher_run(const char *root) {
             ImVec2 ds = io.DisplaySize;
             float s = ds.y / 720.0f;
             g_s = s, g_o = ImVec2(0, 0), W_ = ds.x / s, H_ = 720;
-            io.FontGlobalScale = s * 0.5f;  // (the in-game menu's tabs and the questions: fonts built for ~2x)
+            io.FontGlobalScale = s * 0.5f * ui_touch_scale();  // (the in-game menu's tabs and the questions: fonts built for ~2x;
+                                                               // a phone: bigger - ui_touch.h)
             bool typing = typed_before || ui_text_busy();
             bool popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 
@@ -2961,7 +2967,7 @@ extern "C" void launcher_run(const char *root) {
 
             // ================= Settings: the in-game menu's tabs (runtime/ui/menu.mm), in a panel
             if (g_tab == TAB_SETTINGS) {
-                float sc = ds.y / 1080.0f;
+                float sc = ds.y / 1080.0f * ui_touch_scale();  // (a phone: bigger - ui_touch.h)
                 ImGui::SetCursorScreenPos(P(40, 80));
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.03f, 0.07f, 0.12f, 0.94f));
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 18 * g_s);
