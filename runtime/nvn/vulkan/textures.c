@@ -1678,7 +1678,7 @@ static VkCompareOp compare_op(uint32_t f) {
 //    the textures' mip bias by log2 of the ratio, in half steps down to -2, so their detail is the window's, as
 //    upscalers ask. Only the game's material samplers (sample_bias_ok). LARECOMP_NO_LOD_BIAS=1: off.
 static uint32_t samp_gen = 1;
-static float samp_bias;  // (<= 0)
+static float samp_bias;  // (<= 0, but for F1's texture quality)
 static bool samp_high;
 
 // (render thread, each presented frame: device.c) ratio = the frame's lines per window line of its image
@@ -1686,6 +1686,10 @@ void vk_sampler_settings(double ratio) {
     static int off = -1;
     if (off < 0) off = ENV("LARECOMP_NO_LOD_BIAS") != NULL;
     float bias = off || !(ratio > 0 && ratio < 1) ? 0 : fmaxf(-2.0f, roundf((float)log2(ratio) * 2) / 2);
+    // F1 > Texture quality (g_settings.tex_quality): Medium / Low read a smaller mip level of every material texture
+    // (+1 / +2: half / a quarter of their size) - less memory traffic for the GPU, softer textures; on a phone's small
+    // screen it hardly shows
+    bias += g_settings.tex_quality == 1 ? 1.0f : g_settings.tex_quality == 2 ? 2.0f : 0.0f;
     if (bias == samp_bias && g_settings.aniso16 == samp_high) return;
     LOG("[vk] samplers: mip bias %.1f, texture filtering %s\n", bias, g_settings.aniso16 ? "high" : "game's");
     samp_bias = bias, samp_high = g_settings.aniso16;

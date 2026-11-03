@@ -327,6 +327,7 @@ void settings_load(void) {
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "za_lod")) g_settings.za_lod = atoi(val) == 1;
+        else if (!strcmp(key, "texture_quality")) { int v = atoi(val); g_settings.tex_quality = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "za_dof_off")) g_settings.za_dof_off = atoi(val) != 0;
         else if (!strcmp(key, "za_fxaa_off")) g_settings.za_fxaa_off = atoi(val) != 0;
         else if (!strcmp(key, "za_bloom_off")) g_settings.za_bloom_off = atoi(val) != 0;
@@ -471,6 +472,7 @@ void settings_save(void) {
     else fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
     fprintf(f, "shadow_sharpness = %d\n", g_settings.shadow_sharp);
     fprintf(f, "ambient_occlusion = %d\n", g_settings.gtao);
+    fprintf(f, "texture_quality = %d\n", g_settings.tex_quality);
     fprintf(f, "za_lod = %d\n", g_settings.za_lod);
     fprintf(f, "za_dof_off = %d\n", g_settings.za_dof_off);
     fprintf(f, "za_fxaa_off = %d\n", g_settings.za_fxaa_off);

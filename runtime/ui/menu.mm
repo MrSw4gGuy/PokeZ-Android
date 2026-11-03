@@ -768,6 +768,12 @@ static void tab_display(bool in_game) {
     }
     if (!menu_la_rows()) {  // Pokémon Z-A 2.0.2's own effects (runtime/hle/za_tweaks.c): each at once, in game
         opt_section(TR("Game effects (Pokemon Z-A 2.0.2)", "Efeitos do jogo (Pokémon Z-A 2.0.2)"));
+        const char *tq[] = {TR("High", "Alta"), TR("Medium", "Média"), TR("Low", "Baixa")};
+        opt_choice(TR("Texture quality", "Qualidade das texturas"), &g_settings.tex_quality, tq, 3, 0,
+                   TR("Medium / Low: the textures at half / a quarter of their size - less memory traffic for the GPU (less "
+                      "heat), softer up close; on a phone's screen it hardly shows. Changes at once.",
+                      "Média / Baixa: as texturas na metade / num quarto do tamanho - menos tráfego de memória para a GPU "
+                      "(menos calor), mais suaves de perto; na tela de um celular quase não se nota. Muda na hora."));
         const char *lod[] = {TR("Game's", "Do jogo"), TR("High", "Alto")};
         opt_choice(TR("Level of detail", "Nível de detalhe"), &g_settings.za_lod, lod, 2, 0,
                    TR("High: characters and buildings keep their detailed models farther away - less pop-in, at more "
