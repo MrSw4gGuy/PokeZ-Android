@@ -128,7 +128,7 @@ SHADERC  ?= -lshaderc_shared
 # put the NDK's libc++ into the process with RTLD_GLOBAL before HWUI brought up Vulkan - Qualcomm's gralloc
 # then died in a std::string call (tombstone: snapalloc::SnapConstraintParser::StringToEnumType). Nothing
 # here passes C++ objects across a library boundary, so a private copy is safe.
-LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lm
+LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lnativewindow -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o

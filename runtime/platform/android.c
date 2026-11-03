@@ -5,6 +5,7 @@
 // /proc/self/pagemap, and it cannot start a child process at all. Each of those is noted where it bites.
 #define _GNU_SOURCE
 #include <SDL3/SDL.h>
+#include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/thermal.h>
 #include <math.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/ucontext.h>
@@ -125,7 +127,87 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     return true;
 }
 
+// ---- guest memory the GPU shares (platform.h plat_gpu_share)
+// Qualcomm's driver has no VK_EXT_external_memory_host, so the guest window can't be imported by pointer and shader
+// global memory (every storage buffer on the Switch's GPU) read zero: no 3D, no characters, empty text boxes. What it
+// does import is an AHardwareBuffer. So one range of guest memory is an AHardwareBuffer BLOB: its dma-buf (one of the
+// file descriptors AHardwareBuffer_sendHandleToUnixSocket hands out - the NDK's only way to a native handle) mapped
+// MAP_SHARED at the guest address, and the same buffer imported by the renderer (exec.c gmem_import). Checked on an
+// SM-S936B with tools/linux/android-port/test_ahb_gmem.c: CPU writes reach the GPU and GPU writes the CPU at 256 MB.
+// Never much bigger: 1 GB is refused (-129), and 2 GB or more crashed the vendor allocator service on its size
+// arithmetic, which restarts Android's whole display stack. One range per boot; LARECOMP_GPU_SHARE=0: off.
+#define GPU_SHARE_MAX (512ull << 20)
+static struct { uint64_t addr, size; AHardwareBuffer *ahb; } g_share;
+
+static int ahb_fds(AHardwareBuffer *b, int *fds, int max) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return -1;
+    if (AHardwareBuffer_sendHandleToUnixSocket(b, sv[0])) { close(sv[0]); close(sv[1]); return -1; }
+    char data[4096], ctl[CMSG_SPACE(sizeof(int) * 32)];
+    struct iovec iov = {data, sizeof data};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+    ssize_t r = recvmsg(sv[1], &m, 0);
+    close(sv[0]);
+    close(sv[1]);
+    if (r < 0) return -1;
+    int n = 0;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
+            for (int i = 0; i < (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int)) && n < max; i++) fds[n++] = ((int *)CMSG_DATA(c))[i];
+    return n;
+}
+
+bool plat_gpu_share(uint64_t addr, uint64_t size) {
+    const char *e = getenv("LARECOMP_GPU_SHARE");
+    if (g_share.ahb || (e && !atoi(e)) || size > GPU_SHARE_MAX || (addr | size) & 0xFFF) return false;
+    AHardwareBuffer_Desc d = {.width = (uint32_t)size, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
+                              .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                       AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+    AHardwareBuffer *b = NULL;
+    int err = AHardwareBuffer_allocate(&d, &b);
+    if (err) { fprintf(stderr, "[share] AHardwareBuffer of %llu MB: %d\n", (unsigned long long)(size >> 20), err); return false; }
+    int fds[32], n = ahb_fds(b, fds, 32), fd = -1;
+    for (int i = 0; i < n; i++)  // (the dma-buf is the descriptor as long as the buffer; the other is gralloc's metadata)
+        if (fd < 0 && lseek(fds[i], 0, SEEK_END) >= (off_t)size) fd = fds[i];
+    void *m = fd < 0 ? MAP_FAILED
+                     : mmap((void *)(uintptr_t)addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    for (int i = 0; i < n; i++) close(fds[i]);  // (the mapping keeps the dma-buf)
+    if (m != (void *)(uintptr_t)addr) {
+        fprintf(stderr, "[share] %llx +%llx: %s\n", (unsigned long long)addr, (unsigned long long)size,
+                fd < 0 ? "no dma-buf among the buffer's descriptors" : strerror(errno));
+        if (m != MAP_FAILED) munmap(m, size);
+        plat_reset_guest(addr, addr + size);  // (MAP_FIXED may have taken the old pages: fresh ones, as before)
+        AHardwareBuffer_release(b);
+        return false;
+    }
+    g_share.addr = addr, g_share.size = size, g_share.ahb = b;
+    fprintf(stderr, "[share] guest memory %llx +%llx (%llu MB) is an AHardwareBuffer the GPU imports\n",
+            (unsigned long long)addr, (unsigned long long)size, (unsigned long long)(size >> 20));
+    return true;
+}
+
+void *plat_gpu_shared(uint64_t *addr, uint64_t *size) {
+    *addr = g_share.addr, *size = g_share.size;
+    return g_share.ahb;
+}
+
+// Pages back to zero. Inside the shared range they stay that memory (the renderer's import holds the same pages):
+// zeroed in place - unless the whole range goes (a reboot), which lets the buffer go too.
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
+    uint64_t s0 = g_share.addr, s1 = g_share.addr + g_share.size;
+    if (g_share.ahb && lo < s1 && s0 < hi) {
+        if (lo <= s0 && hi >= s1) {
+            AHardwareBuffer_release(g_share.ahb);  // (the renderer's import keeps its own reference until it is freed)
+            memset(&g_share, 0, sizeof g_share);
+        } else {
+            uint64_t a = lo > s0 ? lo : s0, z = hi < s1 ? hi : s1;
+            memset((void *)(uintptr_t)a, 0, z - a);
+            bool ok = true;
+            if (lo < a) ok = plat_reset_guest(lo, a);
+            if (z < hi) ok = plat_reset_guest(z, hi) && ok;
+            return ok;
+        }
+    }
     return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == (void *)(uintptr_t)lo;
 }
@@ -295,6 +377,27 @@ static void unpack_bundled_resources(void) {
     setenv("LARECOMP_RESOURCE_DIR", dir, 1);
 }
 
+// An app has no environment of its own to set, and the runtime's switches (LARECOMP_*) are environment variables:
+// <data root>/env.txt holds them, one NAME=value a line (# comments), pushed with adb for a test run. Read after
+// pick_data_root, so LARECOMP_DATA_ROOT itself can't come from here; a variable already set wins.
+static void load_env_file(void) {
+    const char *root = getenv("LARECOMP_DATA_ROOT");
+    if (!root) return;
+    char p[1024], line[1024];
+    snprintf(p, sizeof p, "%s/env.txt", root);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq || eq == line) continue;
+        *eq = 0;
+        setenv(line, eq + 1, 0);
+        __android_log_print(ANDROID_LOG_INFO, "ZARecomp", "env.txt: %s=%s", line, eq + 1);
+    }
+    fclose(f);
+}
+
 void plat_init(void) {
     unpack_bundled_resources();
     // The UI is laid out for landscape. The manifest asks for sensorLandscape, but SDLActivity overrides it with
@@ -304,6 +407,7 @@ void plat_init(void) {
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
     point_at_game_lib();
     pick_data_root();  // before log_to_file: that is the first thing to read the data folder
+    load_env_file();
     log_to_file();
     raise_open_file_limit();
 }

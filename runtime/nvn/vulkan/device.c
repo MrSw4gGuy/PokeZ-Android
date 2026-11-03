@@ -704,6 +704,16 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+#ifdef __ANDROID__
+    // Qualcomm: no host-pointer import. The guest memory shaders reach is an AHardwareBuffer instead (platform/android.c
+    // plat_gpu_share), imported here (exec.c gmem_import)
+    g_vk.ahb_import = !g_vk.host_import && has_ext(ep, ne, "VK_ANDROID_external_memory_android_hardware_buffer") &&
+                      has_ext(ep, ne, "VK_EXT_queue_family_foreign");
+    if (g_vk.ahb_import) {
+        ext[n_ext++] = "VK_ANDROID_external_memory_android_hardware_buffer";
+        ext[n_ext++] = "VK_EXT_queue_family_foreign";
+    }
+#endif
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;

@@ -1023,7 +1023,19 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
             x[0] = R_LIMIT_REACHED;
             break;
         }
+#ifdef __ANDROID__
+        {   // Pokémon Z-A maps all its free memory as one pool (~3.2 GB): the top 256 MB of it - the window of shader
+            // global memory on an integrated GPU (exec.c gmem_window_get) - is made memory the GPU shares while it is
+            // still fresh (platform/android.c plat_gpu_share: Qualcomm's driver can't import it by pointer)
+            const uint64_t share = 256ull << 20;
+            if (x[1] >= (1ull << 30) && phys_new_bytes(x[0], x[1]) == x[1]) {
+                phys_map(x[0], x[1]);
+                plat_gpu_share(x[0] + ((x[1] - share) & ~0xFFFFFull), share);
+            } else phys_map(x[0], x[1]);
+        }
+#else
         phys_map(x[0], x[1]);
+#endif
         pthread_mutex_unlock(&g_mlock);
         x[0] = R_OK;
         break;

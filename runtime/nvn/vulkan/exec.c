@@ -17,6 +17,12 @@
 #endif
 
 #include "../../kernel.h"
+#ifdef __ANDROID__
+#include <android/hardware_buffer.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_android.h>  // (the shared guest memory's import: ahb_import)
+#include "../../platform.h"
+#endif
 #include "shaders.h"
 #include "vk.h"
 #include "record.h"
@@ -4434,11 +4440,73 @@ static bool whole_import_probe_oom(void) {
     return oom;
 }
 
+#ifdef __ANDROID__
+// (Android, no host-pointer import) Guest memory [addr, addr + size) as a buffer: only the range the platform made
+// GPU-shared memory (platform/android.c plat_gpu_share: an AHardwareBuffer mapped there), imported as that buffer.
+// Memory type: host-visible coherent where offered - writes in both directions were checked there
+// (tools/linux/android-port/test_ahb_gmem.c).
+static VkResult ahb_import(uint64_t addr, uint64_t size, VkBuffer *out_buf, VkDeviceMemory *out_mem) {
+    uint64_t sa, ss;
+    AHardwareBuffer *ahb = plat_gpu_shared(&sa, &ss);
+    if (!ahb || !g_vk.ahb_import) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (addr != sa || size != ss) {
+        LOG("[vk] gmem: the window %llx +%llx is not the shared range %llx +%llx\n", (unsigned long long)addr,
+            (unsigned long long)size, (unsigned long long)sa, (unsigned long long)ss);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    PFN_vkGetAndroidHardwareBufferPropertiesANDROID props =
+        (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(g_vk.dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+    VkAndroidHardwareBufferPropertiesANDROID ap = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+    VkResult r = props ? props(g_vk.dev, ahb, &ap) : VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (r != VK_SUCCESS) return r;
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+    VkBuffer buf;
+    if ((r = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf)) != VK_SUCCESS) return r;
+    VkMemoryRequirements rq;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &rq);
+    uint32_t bits = ap.memoryTypeBits & rq.memoryTypeBits, type = bits ? (uint32_t)__builtin_ctz(bits) : 0;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    const VkMemoryPropertyFlags coh = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & coh) == coh) { type = i; break; }
+    VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb};
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = buf};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded, .allocationSize = ap.allocationSize,
+                               .memoryTypeIndex = type};
+    VkDeviceMemory mem;
+    if (!bits || (r = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem)) != VK_SUCCESS) {
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        return bits ? r : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if ((r = vkBindBufferMemory(g_vk.dev, buf, mem, 0)) != VK_SUCCESS) {
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        return r;
+    }
+    LOG("[vk] gmem: the shared AHardwareBuffer imported (%llu MB, memory type %u, flags %#x)\n", (unsigned long long)(size >> 20),
+        type, mp.memoryTypes[type].propertyFlags);
+    *out_buf = buf, *out_mem = mem;
+    return VK_SUCCESS;
+}
+#endif
+
 // Guest window bytes [lo, lo + size) for shader global memory (gmem_info; the window: gwin - the heap, or Pokémon Z-A's
 // physical memory)
 static bool gmem_import(uint64_t lo, uint64_t size) {
     VkBuffer buf;
     VkDeviceMemory mem;
+#ifdef __ANDROID__
+    if (g_vk.ahb_import) {
+        VkResult r = ahb_import(gwin_base + lo, size, &buf, &mem);
+        if (r != VK_SUCCESS) { LOG("[vk] gmem import (AHardwareBuffer): %d (%llu MB)\n", r, (unsigned long long)(size >> 20)); return false; }
+        goto imported;
+    }
+#endif
 #ifdef _WIN32
     // (test, #39 #72) LARECOMP_VK_GMEM_PREFAULT=1: every page of the window touched before the import - committed
     // pages the game never wrote have no physical page yet, and a driver that maps only the pages present at the
@@ -4461,6 +4529,9 @@ static bool gmem_import(uint64_t lo, uint64_t size) {
         extern uint64_t g_gmem_va, g_gmem_guest, g_gmem_va_size;
         g_gmem_va = va, g_gmem_guest = gwin_base + lo, g_gmem_va_size = size;
     }
+#ifdef __ANDROID__
+imported:
+#endif
     if (gmem_buf) vk_defer_buffer(gmem_buf, gmem_mem);  // the heap grew: the pending submission may still use the old import
     gmem_buf = buf;
     gmem_mem = mem;
@@ -4699,7 +4770,8 @@ static uint64_t gmem_tried;  // heap size the import was last attempted for (gme
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
-    if (off < 0) off = ENV("LARECOMP_VK_NO_GMEM") != NULL || !g_vk.host_import || gc_lazy;  // (lazy: chunks instead)
+    // (lazy: chunks instead; Android: the AHardwareBuffer import stands in for the host-pointer one)
+    if (off < 0) off = ENV("LARECOMP_VK_NO_GMEM") != NULL || !(g_vk.host_import || g_vk.ahb_import) || gc_lazy;
     uint64_t want = (gwin_want() + 0xFFFF) & ~0xFFFFull;
     if (want > gwin_max) want = gwin_max;
     uint64_t wlo, wlen;

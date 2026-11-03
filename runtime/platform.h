@@ -67,6 +67,11 @@ static inline void plat_thread_perf_core(int role) { (void)role; }
 // thermal headroom forecast and steps it down before the system throttles (runtime/platform/android.c); a desktop
 // has the fans for it, so elsewhere it is always 1. Applied by runtime/nvn/output_scale.c on top of every mode.
 #ifdef __ANDROID__
+// [addr, addr + size) of fresh guest memory becomes memory the GPU can import (an AHardwareBuffer mapped there: the
+// driver has no host-pointer import). Before anything writes there; one range, false if not (it stays as it was).
+bool plat_gpu_share(uint64_t addr, uint64_t size);
+// The shared range and its AHardwareBuffer (NULL: none)
+void *plat_gpu_shared(uint64_t *addr, uint64_t *size);
 double plat_thermal_scale(double now);
 #else
 static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
