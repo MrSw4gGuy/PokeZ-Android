@@ -687,16 +687,26 @@ static void tab_display(bool in_game) {
                   "Suaviza as bordas serrilhadas da imagem antes de ela ser ampliada para a janela. SMAA: acha as bordas "
                   "e mistura só ao longo delas, então as texturas continuam nítidas. Ajuda mais numa resolução interna menor."));
     {   // shadow map size (vulkan/textures.c tex_shadow_scale: taken at start) and filter width (vulkan/exec.c texture_info)
-        const char *sz[] = {TR("Game's", "Do jogo"), "2x", "3x", "4x"};
-        int si = g_settings.shadow_res - 1;
-        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, sz, 4, 0,
+        // (50% / 75% first: below the game's size, for phones - SHADOW_RES_HALF / _3Q)
+        const char *sz[] = {"50%", "75%", TR("Game's", "Do jogo"), "2x", "3x", "4x"};
+        static const int code[] = {SHADOW_RES_HALF, SHADOW_RES_3Q, 1, 2, 3, 4};
+        int si = 2;
+        for (int i = 0; i < 6; i++) if (code[i] == g_settings.shadow_res) si = i;
+#ifdef __ANDROID__
+        const int sdef = 0;
+#else
+        const int sdef = 2;
+#endif
+        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, sz, 6, sdef,
                        TR("The size of the map the sun's shadows are drawn from (the game's: 1024 x 1024). Higher: smoother "
                           "shadow edges, without the stair steps, at a little GPU time and more GPU memory (4x: about 240 MB, "
-                          "2x: 60 MB). From the next start.",
+                          "2x: 60 MB). 50% / 75%: a little coarser edges, for less GPU time - on a phone the shadows are "
+                          "about half of each frame. From the next start.",
                           "O tamanho do mapa de onde saem as sombras do sol (o do jogo: 1024 x 1024). Maior: bordas das "
                           "sombras mais lisas, sem os degraus, por um pouco de tempo da GPU e mais memória da GPU (4x: uns "
-                          "240 MB, 2x: 60 MB). A partir do próximo início.")))
-            g_settings.shadow_res = si + 1;
+                          "240 MB, 2x: 60 MB). 50% / 75%: bordas um pouco mais grossas, por menos tempo da GPU - num "
+                          "celular as sombras são cerca de metade de cada quadro. A partir do próximo início.")))
+            g_settings.shadow_res = code[si];
         int sh = g_settings.shadow_sharp - 1;
         const char *shd = TR("How soft the edges of the sun's shadows are: the game's own blur, or 2-4 times narrower - "
                              "sharper shadows. At most the shadow resolution (its blur is measured in the map's texels). "
@@ -704,7 +714,8 @@ static void tab_display(bool in_game) {
                              "O quanto as bordas das sombras do sol são suaves: o desfoque do próprio jogo, ou 2-4 vezes "
                              "mais estreito - sombras mais nítidas. No máximo a resolução das sombras (o desfoque é medido "
                              "nos texels do mapa). Muda na hora.");
-        if (g_settings.shadow_res == 1) opt_disable_next();  // (nothing to narrow at the game's size)
+        if (g_settings.shadow_res == 1 || g_settings.shadow_res >= SHADOW_RES_HALF)
+            opt_disable_next();  // (nothing to narrow at the game's size or below)
         if (opt_choice(TR("Shadow sharpness", "Nitidez das sombras"), &sh, sz, 4, 0, shd))
             g_settings.shadow_sharp = sh + 1;
     }

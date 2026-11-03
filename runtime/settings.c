@@ -57,7 +57,13 @@ Settings g_settings = {
     .show_fps = false,
     .fps60_lock = true,  // ("Drop to 30 fps when needed" off unless the player turns it on)
     .tex_hd = true,
+#ifdef __ANDROID__
+    // (a phone: the cascades' depth pass was about half the GPU's frame; at 50% an empty station holds 60 fps where the
+    // game's size held 53 - its shadow edges a little coarser)
+    .shadow_res = SHADOW_RES_HALF,
+#else
     .shadow_res = 1,
+#endif
     .shadow_sharp = 1,
     .gtao_strength = 100,
     .ssgi_strength = 100,
@@ -313,7 +319,11 @@ void settings_load(void) {
         else if (!strcmp(key, "operation_mode")) g_settings.opmode = !strcmp(val, "handheld") ? 2 : !strcmp(val, "docked") ? 1 : 0;
         else if (!strcmp(key, "dynamic_res")) g_settings.game_drs = !strcmp(val, "game");
         else if (!strcmp(key, "tex_hd")) g_settings.tex_hd = atoi(val) != 0;
-        else if (!strcmp(key, "shadow_resolution")) { int v = atoi(val); g_settings.shadow_res = v < 1 ? 1 : v > 4 ? 4 : v; }
+        else if (!strcmp(key, "shadow_resolution")) {  // (1-4, or 0.5 / 0.75)
+            double v = atof(val);
+            g_settings.shadow_res = v > 0.4 && v < 0.6 ? SHADOW_RES_HALF : v > 0.6 && v < 0.9 ? SHADOW_RES_3Q
+                                  : v < 1 ? 1 : v > 4 ? 4 : (int)v;
+        }
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "ambient_occlusion_strength")) { int v = atoi(val); g_settings.gtao_strength = v < 25 ? 25 : v > 100 ? 100 : v; }
@@ -452,7 +462,9 @@ void settings_save(void) {
     fprintf(f, "operation_mode = %s\n", g_settings.opmode == 2 ? "handheld" : g_settings.opmode == 1 ? "docked" : "auto");
     fprintf(f, "dynamic_res = %s\n", g_settings.game_drs ? "game" : "off");
     fprintf(f, "tex_hd = %d\n", g_settings.tex_hd);
-    fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
+    if (g_settings.shadow_res == SHADOW_RES_HALF || g_settings.shadow_res == SHADOW_RES_3Q)
+        fprintf(f, "shadow_resolution = %s\n", g_settings.shadow_res == SHADOW_RES_HALF ? "0.5" : "0.75");
+    else fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
     fprintf(f, "shadow_sharpness = %d\n", g_settings.shadow_sharp);
     fprintf(f, "ambient_occlusion = %d\n", g_settings.gtao);
     fprintf(f, "ambient_occlusion_strength = %d\n", g_settings.gtao_strength);

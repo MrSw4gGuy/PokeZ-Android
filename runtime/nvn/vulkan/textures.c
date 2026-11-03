@@ -220,12 +220,16 @@ static bool tex_scalable(const NvnTexture *t) {
 // quarter of the bigger map was drawn), so square render-target arrays of 2-4 layers are scaled too, depth or not.
 // Z-A at 4x: 4096x4096 x 3, ~240 MB of GPU memory for the two (15 MB at the game's size); RTX 4060, 1.5x, the shadow
 // passes 3.1-3.4 -> 3.7 ms a frame. 1 (the game's size) by default.
+// Below the game's size too (F1's 50% / 75%: SHADOW_RES_HALF / _3Q; LARECOMP_SHADOW_SCALE takes a fraction): on a phone
+// the cascades' depth pass was ~half of the GPU's frame (Galaxy S25+, 1440x810: 6.0 + 1.9 ms of 16; at 50% the frame
+// 16 -> 14.4 ms and the station at a steady 60 fps - the pass is bound by its geometry more than by its size).
 static float tex_shadow_scale(const NvnTexture *t) {
-    static int k = -1;
+    static float k = -1;
     if (k < 0) {
         const char *e = getenv("LARECOMP_SHADOW_SCALE");
-        k = e ? atoi(e) : g_settings.shadow_res;
-        if (k < 1) k = 1;
+        int r = g_settings.shadow_res;
+        k = e ? (float)atof(e) : r == SHADOW_RES_HALF ? 0.5f : r == SHADOW_RES_3Q ? 0.75f : (float)r;
+        if (k < 0.25f) k = 1;
         if (k > 4) k = 4;
     }
     if (k == 1 || !(t->flags & 8) || t->samples > 1 || t->width != t->height || t->width < 256 || t->width * k > 8192) return 1;
@@ -233,7 +237,7 @@ static float tex_shadow_scale(const NvnTexture *t) {
     if (!array && !(t->target == 1 && renderer_format_is_depth(t->format))) return 1;
     static int nlog;
     if (nlog++ < 4) LOG("[vk] shadow map %s %ux%u (%u layers) drawn at %ux%u\n", renderer_format_is_depth(t->format) ? "depth" : "colour", t->width, t->height, t->target == 4 ? t->depth : 1,
-                        t->width * k, t->height * k);
+                        (unsigned)(t->width * k), (unsigned)(t->height * k));
     return (float)k;
 }
 
@@ -293,7 +297,7 @@ bool renderer_texture_presented(NvnTexture *t) {
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
-    if (b && (b->scalable || b->hd || b->shadow_k > 1)) { *sx = b->sx; *sy = b->sy; }
+    if (b && (b->scalable || b->hd || (b->shadow_k > 0 && b->shadow_k != 1))) { *sx = b->sx; *sy = b->sy; }
     else { *sx = 1; *sy = 1; }
 }
 
@@ -369,7 +373,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         if (tw < 1) tw = 1;
         if (th < 1) th = 1;
     }
-    if (b->shadow_k > 1) {
+    if (b->shadow_k > 0 && b->shadow_k != 1) {  // (bigger, or smaller on a phone)
         tw = (uint32_t)lroundf(tw * b->shadow_k); th = (uint32_t)lroundf(th * b->shadow_k);
         b->sx = b->sy = b->shadow_k;
     }

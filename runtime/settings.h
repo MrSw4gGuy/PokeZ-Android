@@ -15,6 +15,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { SHADOW_RES_HALF = 5, SHADOW_RES_3Q = 6 };  // (shadow_res codes below the game's size: 50%, 75%)
 // Sharpening (AMD FSR 1's RCAS, runtime/nvn/vulkan/exec.c post_process): Auto = FSR's own after its upscale only
 enum { SHARPEN_AUTO = 0, SHARPEN_OFF, SHARPEN_LOW, SHARPEN_MEDIUM, SHARPEN_HIGH, SHARPEN_N };
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3, PROMPTS_KEYBOARD = 4, PROMPTS_STEAMDECK = 5 };  // (keyboard: Pokémon Z-A's font glyphs, runtime/hle/pl.c)
@@ -74,7 +75,8 @@ typedef struct {
     bool water_caustics; // water: moving light patterns on the floor under it
     bool water_vivid;    // water: a more turquoise, slightly glowing look (stylized; off: the game's colours)
     bool tex_hd, tex_dump;  // HD texture packs (textures/hd) on; dump the game's textures (textures/dump): vulkan/textures.c
-    int shadow_res;    // 1-4: shadow maps drawn at that many times the game's size, from the next start (vulkan/textures.c)
+    int shadow_res;    // 1-4: shadow maps drawn at that many times the game's size, from the next start (vulkan/textures.c);
+                       // SHADOW_RES_HALF / _3Q: 50% / 75% of it (a phone: their pass is about half its GPU's frame)
     int shadow_sharp;  // 1-4: the game's shadow filter that many times narrower, up to shadow_res (vulkan/exec.c)
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool rumble;         // controller vibration from the game (runtime/hle/input.c)
