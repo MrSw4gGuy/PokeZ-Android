@@ -405,6 +405,10 @@ void plat_init(void) {
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     // the Back gesture opens / closes the menu (menu.mm, as F1) instead of finishing the activity
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");
+    // Android's own keyboard never comes up (it covered half the screen and its text often didn't reach the field):
+    // text input stays on for a hardware keyboard, and the name entry and our text fields use the app's on-screen
+    // keyboard instead, by touch too (runtime/ui/osk.mm, menu.mm keyboard_draw)
+    SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0");
     point_at_game_lib();
     pick_data_root();  // before log_to_file: that is the first thing to read the data folder
     load_env_file();

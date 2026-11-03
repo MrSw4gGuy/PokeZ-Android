@@ -1056,7 +1056,12 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s", TR("Enter your name", "Digite seu nome"));
     ImGui::PopFont();
     static bool was_open, was_pad;
-    bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
+#ifdef __ANDROID__
+    bool pad = true;  // (a phone: always the on-screen keyboard - its keys take touches too; Android's own stays hidden)
+#else
+    bool pad = g_last_pad.load();
+#endif
+    bool appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
     was_open = true, was_pad = pad;
     if (!pad) {  // keyboard: type straight into the field
         if (appearing) ImGui::SetKeyboardFocusHere();

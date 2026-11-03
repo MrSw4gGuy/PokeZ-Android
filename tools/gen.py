@@ -611,7 +611,17 @@ def main():
     if main_build in ZA_BUILDS:  # Pokémon Legends Z-A: its own patches, none of Link's Awakening's (nor its randomizer's)
         RANDO_CODE.clear()
         if args.name == 'main':
-            PATCHES.update({a + shift: p for a, p in za_patches(main_build).items()})
+            # (an exefs mod applied to this NSO - tools/linux/android-port/apply_pchtxt.py - may have taken a site:
+            # the frame-mode site is where a dynamic-FPS mod hooks in. Its instruction then isn't the one the patch
+            # replaces: the mod's code is lifted as it is, the patch left out)
+            orig = Nso(os.path.join(os.path.dirname(args.nso), 'main.orig')) if os.path.exists(
+                os.path.join(os.path.dirname(args.nso), 'main.orig')) else None
+            for a, p in za_patches(main_build).items():
+                off = a - 0x7000000000
+                if orig and m.nso.image[off:off + 4] != orig.image[off:off + 4]:
+                    print(f'{args.name}: patch site {a:#x} taken by an exefs mod: left to it')
+                    continue
+                PATCHES[a + shift] = p
             print(f'{args.name}: Pokémon Legends Z-A (build {main_build}): {len(PATCHES)} game patch(es)')
     elif args.name == 'main':
         import game_addresses

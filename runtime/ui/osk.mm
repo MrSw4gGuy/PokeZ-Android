@@ -77,7 +77,13 @@ bool ui_input_text(const char *label, char *buf, size_t size, ImGuiInputTextFlag
     // activated from the controller: A (ImGui's "activate", which leaves a text field alone), Y (its "input"), or a
     // focus request (SetKeyboardFocusHere) while the controller drives the menu. A mouse click types directly.
     bool by_nav = g.NavActivateId == id || (ImGui::IsItemActivated() && g.ActiveIdSource != ImGuiInputSource_Mouse);
-    if (by_nav && g.NavInputSource == ImGuiInputSource_Gamepad && !s.open && !(flags & ImGuiInputTextFlags_ReadOnly)) {
+#ifdef __ANDROID__
+    // (a phone: a tap on the field opens it as well - touches arrive as the mouse, and there is no keyboard to type on)
+    bool want = by_nav || ImGui::IsItemActivated();
+#else
+    bool want = by_nav && g.NavInputSource == ImGuiInputSource_Gamepad;
+#endif
+    if (want && !s.open && !(flags & ImGuiInputTextFlags_ReadOnly)) {
         if (g.ActiveId == id) ImGui::ClearActiveID();
         s.open = 1, s.appearing = true, s.done = 0;
         s.field = id, s.buf = buf, s.size = size, s.flags = flags;
@@ -118,7 +124,11 @@ int osk_keys(char *text, size_t cap, int max_chars, bool appearing, float scale,
     static const char *rows_u[] = {"ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ-.'!", "0123456789"};
     static const char *rows_l[] = {"abcdefghij", "klmnopqrst", "uvwxyz-.'!", "0123456789"};
     const char **rows = upper ? rows_u : rows_l;
+#ifdef __ANDROID__
+    float k = 96 * scale;  // (keys for a finger: 10 of them still fit the 1100-wide window)
+#else
     float k = 70 * scale;
+#endif
     for (int row = 0; row < 4; row++) {
         for (int i = 0; rows[row][i]; i++) {
             if (i) ImGui::SameLine();

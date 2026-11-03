@@ -9,6 +9,18 @@ WORK=${WORK:-/root/lasrecomp}
 ZA=${ZA:-/root/za-extracted}
 
 [ -f "$ZA/exefs/main" ] || { echo "no $ZA/exefs/main: import_za.sh first"; exit 1; }
+# ZA_MODS=<folder of exefs mods (.pchtxt)>: the game generated from a patched copy of its exefs (apply_pchtxt.py) -
+# /root/za-modded, the original main kept beside as main.orig (gen.py: a patch site a mod took is left to it). Push
+# that exefs to the phone too: the runtime loads the patched data from it. The mods are the player's own files.
+if [ -n "${ZA_MODS:-}" ]; then
+    MZ=${MZ:-/root/za-modded}
+    rm -rf "$MZ" && mkdir -p "$MZ/exefs"
+    for f in "$ZA"/exefs/*; do [ "$(basename "$f")" = main ] || cp "$f" "$MZ/exefs/"; done
+    cp "$ZA/exefs/main" "$MZ/exefs/main.orig"
+    "$WORK/tools/venv/bin/python" "$HERE/apply_pchtxt.py" "$ZA/exefs/main" "$MZ/exefs/main" "$ZA_MODS"
+    ln -sfn "$ZA/romfs.bin" "$MZ/romfs.bin"
+    ZA=$MZ
+fi
 cd "$WORK"
 # the Makefile resolves EXEFS against the checkout; extracted/ is never synced or committed, so the link lives there
 mkdir -p extracted
