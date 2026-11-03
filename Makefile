@@ -25,6 +25,24 @@ GEN      := generated-$(ARCH)
 B        ?= build/$(ARCH)
 endif
 GENSIMD  := --simd $(if $(filter aarch64,$(ARCH)),asm,c)
+else ifeq ($(PLATFORM),android)
+# PLATFORM=android is always a cross build (the NDK runs on the desktop, the result runs on the phone), so unlike
+# Linux there is no host arch to fall back on. arm64-v8a only: a 32-bit Android build would need the guest's
+# 64-bit address space to fit in 4 GB, which it does not.
+ANDROID_NDK ?= /opt/android-ndk
+ANDROID_API ?= 31
+ARCH     := aarch64
+NDKBIN   := $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin
+CLANG    := $(NDKBIN)/clang
+CLANGXX  := $(NDKBIN)/clang++
+CROSS    := --target=aarch64-linux-android$(ANDROID_API)
+# a tree of its own: the guest window sits at 0x20_0000_0000 here (runtime/rt.h), so this generated code is not
+# interchangeable with the aarch64 Linux one
+GEN      := generated-android
+MAIN_ADDR := 0x2000000000
+SDK_ADDR  := 0x2008000000
+B        ?= build/android
+GENSIMD  := --simd asm
 endif
 
 # B: build dir. MACOS_MIN: oldest macOS to run on (default: this one). DEPS: prefix with SDL3 / FFmpeg instead of
@@ -33,8 +51,11 @@ B         ?= build
 MACOS_MIN ?=
 DEPS      ?=
 MINFLAG  := $(if $(MACOS_MIN),-mmacosx-version-min=$(MACOS_MIN))
-CC       := clang $(MINFLAG) $(CROSS)
-CXX      := clang++ $(MINFLAG) $(CROSS)
+# CLANG / CLANGXX: the compiler itself, so an Android build can point at the NDK's without it being on PATH
+CLANG    ?= clang
+CLANGXX  ?= clang++
+CC       := $(CLANG) $(MINFLAG) $(CROSS)
+CXX      := $(CLANGXX) $(MINFLAG) $(CROSS)
 IMGUI    := third_party/imgui
 # GENOPT: the generated code's optimization (-O0 builds in seconds: some lifted functions take clang -O1 minutes)
 GENOPT   ?= -O1
@@ -47,7 +68,7 @@ GENFLAGS := $(GENOPT) -fno-strict-aliasing -Wno-return-type -Wno-unused-label -f
 GEN_SRC  := $(strip $(wildcard $(GEN)/main/*.c) $(wildcard $(GEN)/sdk/*.c))
 GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
 RT_SRC   := $(wildcard runtime/*.c runtime/*.cpp) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
-            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
+            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c $(wildcard runtime/platform/$(PLATFORM)_*.c)
 RT_HDRS  := $(wildcard runtime/*.h runtime/game_addresses/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
@@ -91,6 +112,33 @@ UIFLAGS  := -x c++  # the .mm UI sources are plain C++ apart from __APPLE__ bloc
 GAMELIB  := $(B)/lasgame.so
 GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the app's own, -rdynamic)
 GAMELIB_SHARED := -shared
+else ifeq ($(PLATFORM),android)
+# An Android app owns no executable: SDL3's Java Activity (SDLActivity.java) loads libmain.so and calls SDL_main,
+# so what the Makefile produces here is a library, not a program.
+EXE      := $(B)/libmain.so
+DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
+GENFLAGS += -fPIC
+PIC      := -fPIC  # (the whole runtime goes into a shared library here, not an executable)
+OSFLAGS  := -Wno-format
+SHADERC  ?= -lshaderc_shared
+# --export-dynamic stands in for Linux's -rdynamic: the game code library resolves the runtime's functions through
+# it, and crash backtraces can still name host functions (runtime/platform/android.c plat_symbol).
+# No -lpthread / -ldl: bionic has both inside libc. -llog is logcat, -landroid the native app glue.
+# -static-libstdc++: libmain.so was the only packaged library still needing libc++_shared.so, and shipping it
+# put the NDK's libc++ into the process with RTLD_GLOBAL before HWUI brought up Vulkan - Qualcomm's gralloc
+# then died in a std::string call (tombstone: snapalloc::SnapConstraintParser::StringToEnumType). Nothing
+# here passes C++ objects across a library boundary, so a private copy is safe.
+LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lm
+BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
+BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
+IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
+UIFLAGS  := -x c++  # as on Linux: the .mm UI sources are plain C++ apart from __APPLE__ blocks
+GAMELIB  := $(B)/lasgame.so
+# -lmain: on Android a dlopen'd library resolves its undefined symbols only from its own DT_NEEDED list, not from
+# whatever happens to be loaded (libmain.so came in through System.loadLibrary, not RTLD_GLOBAL). The game code
+# calls into the runtime, so it has to name libmain.so - the copy already loaded is the one it gets.
+GAMELIB_LDFLAGS := -shared -fuse-ld=lld -L$(B) -lmain
+GAMELIB_SHARED := -shared
 else
 EXE      := $(B)/lasrecomp.exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
@@ -132,8 +180,8 @@ GAMELIB_BASE_ID := $(shell (cat $(GAMELIB_BASE_SRCS); echo '$(GENFLAGS) $(GAMELI
                      (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)
 
 RT_OBJ   := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)))
-RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
-CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
+RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS) $(PIC)
+CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC) $(PIC)
 
 all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
 
@@ -176,8 +224,8 @@ $(B)/rt/nvn/vulkan/fsr2_shaders.o: $(B)/inc/fsr2_shaders.inc
 $(B)/rt/nvn/vulkan/fsr2_shaders.o: CXXFLAGS += -I$(B)/inc
 FSR2_OBJ := $(B)/fsr2/ffx_fsr2.o $(B)/fsr2/ffx_assert.o $(B)/fsr2/vk/ffx_fsr2_vk.o
 # (FFX_GCC: FidelityFX's own switch for an empty FFX_API - without it every API function is __declspec(dllexport),
-# which only Windows' clang accepts; Linux: "'__declspec' attributes are not enabled")
-ifeq ($(PLATFORM),linux)
+# which only Windows' clang accepts; Linux and Android: "'__declspec' attributes are not enabled")
+ifneq ($(filter linux android,$(PLATFORM)),)
 $(FSR2_OBJ) $(B)/rt/nvn/vulkan/fsr2.o $(B)/rt/nvn/vulkan/fsr2_shaders.o: CXXFLAGS += -DFFX_GCC
 endif
 $(B)/fsr2/%.o: third_party/fsr2/%.cpp
@@ -242,9 +290,12 @@ PY := $(firstword $(wildcard tools/venv/bin/python) $(wildcard tools/venv/Script
 
 # EXEFS: the game's exefs folder (another version's: with its own GEN and B)
 EXEFS ?= extracted/exefs
+# MAIN_ADDR / SDK_ADDR must match runtime/rt.h's MAIN_BASE / SDK_BASE: the generated code bakes them in
+MAIN_ADDR ?= 0x7000000000
+SDK_ADDR  ?= 0x7008000000
 gen:
-	cd tools && ../$(PY) gen.py sdk ../$(EXEFS)/sdk 0x7008000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
-	cd tools && ../$(PY) gen.py main ../$(EXEFS)/main 0x7000000000 ../$(GEN)/main $(GENSIMD)
+	cd tools && ../$(PY) gen.py sdk ../$(EXEFS)/sdk $(SDK_ADDR) ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
+	cd tools && ../$(PY) gen.py main ../$(EXEFS)/main $(MAIN_ADDR) ../$(GEN)/main $(GENSIMD)
 
 gen-objs: $(GEN_OBJ)
 

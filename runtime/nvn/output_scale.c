@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "../hle.h"
+#include "../platform.h"
 #include "../settings.h"
 #include "output_scale.h"
 
@@ -482,6 +483,9 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_Q50) h *= 0.5;
     }
     h = fmax(h, 0.1);  // (.25x of a small window)
+    // The device's temperature (platform.h plat_thermal_scale: Android's thermal headroom, always 1 on a desktop), on
+    // top of any mode: a smaller part of the same render targets, the way Dynamic draws, so a step reallocates nothing.
+    dyn *= plat_thermal_scale(now);
     // The game sizes its render targets for the screen of the mode it was told (handheld: 1280x720, else 1920x1080), and
     // sx/sy are relative to that size. A fixed N x means N times the game's own image; only "match the display" and dynamic
     // resolution come from the window in units of the docked 1080 lines and need 1080/720 for a handheld game.

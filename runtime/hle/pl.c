@@ -236,7 +236,11 @@ static void load_fonts(void) {
                                      // outlines, which the game's font engine crashes on (it wants TrueType)
                                      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                                      "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                                     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", NULL};
+                                     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                                     // Android: Roboto, read from the device's own system fonts (nothing shipped).
+                                     // The static cut first - Roboto-Regular itself is a variable font on recent
+                                     // Android. Not NotoSansCJK-Regular.ttc there either: CFF, as above.
+                                     "/system/fonts/RobotoStatic-Regular.ttf", "/system/fonts/Roboto-Regular.ttf", NULL};
     static const char *const zh_cn[] = {"fonts/nintendo_udsg-r_org_zh-cn_003.bfttf",
                                         "fonts/nintendo_udsg-r_org_zh-cn_003.ttf",
                                         "/System/Library/Fonts/Hiragino Sans GB.ttc",

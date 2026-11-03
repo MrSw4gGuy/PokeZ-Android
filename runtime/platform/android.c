@@ -1,0 +1,480 @@
+// Android host layer (runtime/platform.h). arm64.
+//
+// Android is Linux, so most of this is runtime/platform/linux.c unchanged. It is its own file rather than #ifdefs
+// in that one because the differences are not cosmetic: bionic has no <execinfo.h>, an app cannot read
+// /proc/self/pagemap, and it cannot start a child process at all. Each of those is noted where it bites.
+#define _GNU_SOURCE
+#include <SDL3/SDL.h>
+#include <android/log.h>
+#include <android/thermal.h>
+#include <math.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/system_properties.h>
+#include <sys/ucontext.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <unistd.h>
+#include <unwind.h>
+
+#include "../paths.h"
+#include "../platform.h"
+#include "posix_log.h"
+
+void rt_crash_explain(char *out, size_t n, const char *log_path);  // runtime/crash_explain.c
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+// ---- page write tracking: not available to an app
+// Linux does this with a userfaultfd in write-protect mode plus PAGEMAP_SCAN over /proc/self/pagemap. On Android
+// /proc/<pid>/pagemap has been privileged since Android 10, and userfaultfd is reachable only through a seccomp
+// hole most devices do not open. The callers already cope with no tracking (it is also how an older Linux kernel
+// behaves), so this reports nothing rather than pretending.
+void plat_write_tracking_off(const char *why) { (void)why; }
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    (void)addr, (void)size, (void)pages, (void)max, (void)page;
+    return -1;
+}
+int plat_written_pages_peek(uint64_t addr, uint64_t size) { (void)addr; (void)size; return -1; }
+bool plat_page_state(uint64_t addr, char *out, size_t n) { (void)addr; (void)out; (void)n; return false; }
+void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+bool plat_mem_usage(uint64_t *process, uint64_t *guest) { (void)process; (void)guest; return false; }
+void plat_sample_focus(void) {}
+
+// ---- guest address space
+// As on Linux: everything readable/writable from the start, MAP_NORESERVE so the untouched part of the window
+// costs nothing. The window sits near 0x7000000000 (~481 GB), which fits a 39-bit user address space (512 GB) but
+// not by much - MAP_FIXED_NOREPLACE makes a clash a clean failure instead of a silent relocation.
+// On failure this says why, to logcat: the caller (reserve_guest_space in runtime/main.c) is a static
+// constructor that runs during dlopen, long before any log file exists, and on Android it cannot re-exec to get a
+// fresh layout the way the desktop does - so this is the only chance to find out what went wrong.
+static void report_reservation_failure(uint64_t lo, uint64_t hi, int err) {
+    __android_log_print(ANDROID_LOG_ERROR, "ZARecomp",
+                        "guest window %llx-%llx (%llu MB) refused: %s",
+                        (unsigned long long)lo, (unsigned long long)hi,
+                        (unsigned long long)((hi - lo) >> 20), strerror(err));
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m) return;
+    char line[512];
+    uint64_t top = 0;
+    int overlaps = 0;
+    while (fgets(line, sizeof line, m)) {
+        uint64_t a, b;
+        if (sscanf(line, "%llx-%llx", (unsigned long long *)&a, (unsigned long long *)&b) != 2) continue;
+        if (b > top) top = b;
+        if (a < hi && b > lo && overlaps < 8) {  // what is sitting inside the window we wanted
+            overlaps++;
+            for (char *c = line; *c; c++)
+                if (*c == '\n') *c = 0;
+            __android_log_print(ANDROID_LOG_ERROR, "ZARecomp", "  in the way: %s", line);
+        }
+    }
+    fclose(m);
+    __android_log_print(ANDROID_LOG_ERROR, "ZARecomp",
+                        "  %d mapping(s) overlap; highest address in this process: %llx",
+                        overlaps, (unsigned long long)top);
+
+    // Where could the window go instead? The base is a choice the port makes (rt.h GUEST_LO / MAIN_BASE, and the
+    // address passed to tools/gen.py), not something the Switch fixes, so a free gap of the right size is a
+    // candidate - as long as it still fits the 39 bits the generated code assumes.
+    m = fopen("/proc/self/maps", "r");
+    if (!m) return;
+    uint64_t need = hi - lo, prev_end = 0x1000000, found = 0;
+    while (fgets(line, sizeof line, m) && found < 6) {
+        uint64_t a, b;
+        if (sscanf(line, "%llx-%llx", (unsigned long long *)&a, (unsigned long long *)&b) != 2) continue;
+        if (a > prev_end && a - prev_end >= need) {
+            found++;
+            __android_log_print(ANDROID_LOG_ERROR, "ZARecomp", "  free gap: %llx-%llx (%llu GB)",
+                                (unsigned long long)prev_end, (unsigned long long)a,
+                                (unsigned long long)((a - prev_end) >> 30));
+        }
+        if (b > prev_end) prev_end = b;
+    }
+    fclose(m);
+    if (!found)
+        __android_log_print(ANDROID_LOG_ERROR, "ZARecomp", "  no free gap of %llu GB anywhere",
+                            (unsigned long long)(need >> 30));
+}
+
+bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
+    void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED) { report_reservation_failure(lo, hi, errno); return false; }
+    if (p != (void *)(uintptr_t)lo) {
+        munmap(p, hi - lo);
+        __android_log_print(ANDROID_LOG_ERROR, "ZARecomp",
+                            "guest window %llx: the kernel ignored MAP_FIXED_NOREPLACE and offered %p",
+                            (unsigned long long)lo, p);
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "ZARecomp", "guest window %llx-%llx reserved",
+                        (unsigned long long)lo, (unsigned long long)hi);
+    return true;
+}
+
+bool plat_reset_guest(uint64_t lo, uint64_t hi) {
+    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == (void *)(uintptr_t)lo;
+}
+
+int plat_protect(uint64_t addr, uint64_t size, int prot) {
+    int p = prot == PLAT_PROT_NONE ? PROT_NONE : prot == PLAT_PROT_READ ? PROT_READ : PROT_READ | PROT_WRITE;
+    return mprotect((void *)(uintptr_t)addr, size, p);
+}
+
+// ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
+// AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
+// next forecast seconds, to its severe throttling point - 1.0 is that point. Measured on an SM-S936B after ~35 min of
+// Link's Awakening on a USB cable: skin 41.8 C, thermal status moderate, the battery discharging all the same. Rather
+// than wait for the system to clamp the clocks (frames then drop unevenly), the render scale steps down early and
+// climbs back slowly: a step down at >= 0.90, at most every 10 s (a step takes a while to show in the temperature); a
+// step up below 0.70, at most every 30 s. Steps of each axis: 100, 85, 70, 60 % (60 %: about a third of the pixels).
+// The API wants a call a second at most (more often it answers NaN). A "[thermal]" line every 30 s and on each step.
+// LARECOMP_THERMAL=0: off.
+static const double thermal_steps[] = {1.0, 0.85, 0.7, 0.6};
+
+double plat_thermal_scale(double now) {
+    static AThermalManager *mgr;
+    static int off = -1, step;
+    static double next_read, last_change = -1e9, last_line = -1e9;
+    if (off < 0) {
+        const char *e = getenv("LARECOMP_THERMAL");
+        off = e && !strcmp(e, "0");
+        if (!off && !(mgr = AThermal_acquireManager())) off = 1;
+        fprintf(stderr, "[thermal] render scale by thermal headroom: %s\n", off ? "off" : "on");
+    }
+    if (off || now < next_read) return thermal_steps[step];
+    next_read = now + 1.0;
+    float h = AThermal_getThermalHeadroom(mgr, 10);
+    if (isnan(h)) return thermal_steps[step];
+    int last = (int)(sizeof thermal_steps / sizeof *thermal_steps) - 1, was = step;
+    if (h >= 0.90f && step < last && now - last_change >= 10) step++;
+    else if (h < 0.70f && step > 0 && now - last_change >= 30) step--;
+    if (step != was) last_change = now;
+    if (step != was || now - last_line >= 30) {
+        last_line = now;
+        fprintf(stderr, "[thermal] headroom %.2f (10 s forecast): render scale %.0f%%%s\n", h, thermal_steps[step] * 100,
+                step > was ? " - stepped down" : step < was ? " - stepped up" : "");
+    }
+    return thermal_steps[step];
+}
+
+// ---- time (identical to Linux: bionic has all of these)
+uint64_t plat_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t plat_thread_cpu_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0 ? (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec : 0;
+}
+
+void plat_sleep_until_ns(uint64_t t) {
+    struct timespec ts = {.tv_sec = (time_t)(t / 1000000000u), .tv_nsec = (long)(t % 1000000000u)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+}
+
+int plat_cpu_count(void) {
+    cpu_set_t set;
+    return sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 0;
+}
+
+void plat_thread_guest(int prio) { (void)prio; }
+
+// SCHED_FIFO needs a privilege an app never has, so in practice this is the setpriority path. Worth keeping: on a
+// phone the vsync thread competing with the guest threads is the difference between steady and stuttering frames.
+void plat_thread_realtime(uint64_t period_ns) {
+    (void)period_ns;
+    struct sched_param sp = {.sched_priority = 1};
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) return;
+    setpriority(PRIO_PROCESS, (id_t)gettid(), -10);
+}
+int plat_thread_realtime_check(uint64_t period_ns) { (void)period_ns; return -1; }
+
+// ---- entry point
+// SDLActivity does not call main(): it dlsym's the name getMainFunction() returns, which is "SDL_main", out of
+// libmain.so. On the desktop SDL3/SDL_main.h arranges that with a #define over main, but runtime/main.c includes
+// only SDL.h, and changing it would reach every platform. This bridge is Android-only and costs one call.
+int main(int argc, char **argv);
+int SDL_main(int argc, char **argv);
+int SDL_main(int argc, char **argv) { return main(argc, argv); }
+
+// ---- process
+static char g_log_path[1024];
+
+// An app has no terminal and its stderr goes nowhere useful by default, so the log always goes to a file (and a
+// copy of the fatal lines to logcat, which is what `adb logcat` shows while debugging on a cable).
+static void log_to_file(void) {
+    char dir[900];
+    if (!rt_data_root_early(dir, sizeof dir)) return;
+    for (char *c = dir + 1; *c; c++)
+        if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
+    mkdir(dir, 0755);
+    session_log_open(dir, g_log_path, sizeof g_log_path);
+}
+
+// runtime/paths.c works out the data folder from $HOME, which on Android points nowhere useful. The app's own
+// directories are what it should use, and paths.c already honours LARECOMP_DATA_ROOT, so setting that is the whole
+// fix. External storage first on purpose: /sdcard/Android/data/<package>/files is reachable from a file manager
+// and over USB, and the player has to copy several GB of game files into it by hand. Internal storage would be
+// private to the app and need root to write to.
+static void pick_data_root(void) {
+    if (getenv("LARECOMP_DATA_ROOT")) return;  // an explicit choice wins (adb shell setprop / a dev run)
+    const char *p = SDL_GetAndroidExternalStoragePath();
+    if (!p || !*p) p = SDL_GetAndroidInternalStoragePath();
+    if (p && *p) setenv("LARECOMP_DATA_ROOT", p, 1);
+}
+
+// The game code library ships in the APK next to libmain.so, which is where gamelib.c looks anyway - but it also
+// wants lasgame.so.id beside it, and an APK's lib directory only ever holds .so files. Naming the library through
+// LARECOMP_GAME_LIB makes gamelib.c take it as given and let the id embedded in it decide instead.
+static void point_at_game_lib(void) {
+    if (getenv("LARECOMP_GAME_LIB")) return;
+    char p[1024];
+    if (!plat_exe_path(p, sizeof p)) return;
+    char *slash = strrchr(p, '/');
+    if (!slash) return;
+    snprintf(slash + 1, sizeof p - (size_t)(slash + 1 - p), "lasgame.so");
+    if (access(p, R_OK) == 0) setenv("LARECOMP_GAME_LIB", p, 1);
+}
+
+// The free fonts the desktop builds ship beside the executable (third_party/fonts: BIZ UDPGothic under the SIL OFL,
+// DejaVu Sans under its own free licence) travel as APK assets here, because the APK's lib directory only holds .so
+// files. runtime/hle/pl.c needs one of them on a phone with no font dump from the player's console: Android's own
+// Roboto lacks the "□" (U+25A1) the game looks up unchecked at startup (issue #45), so pl.c rightly passes it over.
+// Copied out to internal storage once (again only if the size changed); rt_resource finds them through
+// LARECOMP_RESOURCE_DIR. SDL_IOFromFile reads a relative path from the APK's assets on Android.
+static void unpack_bundled_resources(void) {
+    if (getenv("LARECOMP_RESOURCE_DIR")) return;
+    const char *base = SDL_GetAndroidInternalStoragePath();
+    if (!base || !*base) return;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/res", base);
+    mkdir(dir, 0755);
+    static const char *const files[] = {"BIZUDPGothic-Regular.ttf", "DejaVuSans.ttf"};
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        char asset[128], out[1100], tmp[1110];
+        snprintf(asset, sizeof asset, "fonts/%s", files[i]);
+        snprintf(out, sizeof out, "%s/%s", dir, files[i]);
+        SDL_IOStream *in = SDL_IOFromFile(asset, "rb");
+        if (!in) {
+            __android_log_print(ANDROID_LOG_WARN, "ZARecomp", "asset %s: %s", asset, SDL_GetError());
+            continue;
+        }
+        Sint64 size = SDL_GetIOSize(in);
+        struct stat st;
+        if (size > 0 && stat(out, &st) == 0 && st.st_size == size) { SDL_CloseIO(in); continue; }  // (already there)
+        snprintf(tmp, sizeof tmp, "%s.tmp", out);
+        FILE *f = fopen(tmp, "wb");
+        bool ok = f != NULL;
+        char buf[65536];
+        size_t k;
+        while (ok && (k = SDL_ReadIO(in, buf, sizeof buf)) > 0) ok = fwrite(buf, 1, k, f) == k;
+        SDL_CloseIO(in);
+        if (f) ok = fclose(f) == 0 && ok;
+        if (ok && rename(tmp, out) == 0)
+            __android_log_print(ANDROID_LOG_INFO, "ZARecomp", "unpacked %s (%lld bytes)", asset, (long long)size);
+        else
+            remove(tmp);
+    }
+    setenv("LARECOMP_RESOURCE_DIR", dir, 1);
+}
+
+void plat_init(void) {
+    unpack_bundled_resources();
+    // The UI is laid out for landscape. The manifest asks for sensorLandscape, but SDLActivity overrides it with
+    // its own setRequestedOrientation from this hint, and without one it followed the phone into portrait.
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    point_at_game_lib();
+    pick_data_root();  // before log_to_file: that is the first thing to read the data folder
+    log_to_file();
+    raise_open_file_limit();
+}
+
+// /proc/self/exe is app_process64 (every app is forked from the zygote), which tells the caller nothing. The
+// equivalent here is our own shared library, which is what the paths code actually wants to sit next to.
+bool plat_exe_path(char *buf, size_t size) {
+    Dl_info di = {0};
+    if (!dladdr((void *)plat_exe_path, &di) || !di.dli_fname) return false;
+    snprintf(buf, size, "%s", di.dli_fname);
+    return true;
+}
+
+// There is no /etc/os-release: the Android release and the device come from system properties.
+void plat_os_name(char *buf, size_t size) {
+    char rel[PROP_VALUE_MAX] = "", sdk[PROP_VALUE_MAX] = "", model[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.build.version.release", rel);
+    __system_property_get("ro.build.version.sdk", sdk);
+    __system_property_get("ro.product.model", model);
+    struct utsname u;
+    const char *kern = uname(&u) == 0 ? u.release : "?";
+    snprintf(buf, size, "Android %s (API %s)%s%s (%s)", rel[0] ? rel : "?", sdk[0] ? sdk : "?",
+             model[0] ? ", " : "", model, kern);
+}
+
+void plat_system_info(PlatSysInfo *si) {
+    memset(si, 0, sizeof *si);
+    plat_os_name(si->os, sizeof si->os);
+    // /proc/cpuinfo on arm64 has no "model name": the SoC is a property, and the core count is what we can count.
+    char soc[PROP_VALUE_MAX] = "", manuf[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.soc.model", soc);
+    __system_property_get("ro.soc.manufacturer", manuf);
+    if (soc[0]) snprintf(si->cpu, sizeof si->cpu, "%s%s%s", manuf, manuf[0] ? " " : "", soc);
+    else snprintf(si->cpu, sizeof si->cpu, "arm64");
+    // arm64 has no SMT, so every hardware thread is a core: the two counts are the same here.
+    si->cores = si->threads = (int)sysconf(_SC_NPROCESSORS_CONF);
+    long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psz > 0) si->ram = (uint64_t)pages * (uint64_t)psz;
+    si->package = "apk";
+}
+
+// Re-exec means restarting the process, which an app does not get to do: the Activity is the one that can.
+void plat_exec(char *const argv[]) { (void)argv; }
+
+// ---- diagnostics
+const char *plat_symbol(uint64_t pc, uint64_t *offset) {
+    Dl_info di = {0};
+    if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_sname) return NULL;
+    if (offset) *offset = pc - (uint64_t)(uintptr_t)di.dli_saddr;
+    return di.dli_sname;
+}
+
+void plat_fatal_notice(void) {
+    char text[1600];
+    rt_crash_explain(text, sizeof text, g_log_path);
+    __android_log_write(ANDROID_LOG_FATAL, "ZARecomp", text);
+    if (!g_log_path[0]) return;
+    fflush(stderr);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "ZA Recomp", text, NULL);
+}
+
+static void *notice_thread(void *text) {
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "ZA Recomp", text, NULL);
+    free(text);
+    return NULL;
+}
+void plat_notice(const char *text) {
+    __android_log_write(ANDROID_LOG_WARN, "ZARecomp", text);
+    if (!g_log_path[0]) return;
+    pthread_t t;
+    char *copy = strdup(text);
+    if (copy && !pthread_create(&t, NULL, notice_thread, copy)) pthread_detach(t);
+    else free(copy);
+}
+
+bool plat_module_name(uint64_t pc, char *out, size_t n) {
+    Dl_info di = {0};
+    if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_fname) return false;
+    snprintf(out, n, "%s", di.dli_fname);
+    return true;
+}
+
+const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
+
+// bionic has no backtrace(): the unwinder is reached through <unwind.h>, which is what libc++ and the platform's
+// own crash reporter use. Same output as the Linux version, so the log lines stay comparable between the two.
+typedef struct { void **pcs; int n, max; } Unwind;
+
+static _Unwind_Reason_Code unwind_frame(struct _Unwind_Context *ctx, void *arg) {
+    Unwind *u = arg;
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (!pc || u->n >= u->max) return _URC_END_OF_STACK;
+    u->pcs[u->n++] = (void *)pc;
+    return _URC_NO_REASON;
+}
+
+void plat_print_backtrace(void) {
+    void *bt[64];
+    Unwind u = {.pcs = bt, .n = 0, .max = 64};
+    _Unwind_Backtrace(unwind_frame, &u);
+    Dl_info self = {0};
+    dladdr((void *)plat_print_backtrace, &self);
+    for (int i = 0; i < u.n; i++) {
+        uint64_t pc = (uint64_t)(uintptr_t)bt[i], off = 0;
+        Dl_info di = {0};
+        if (!dladdr(bt[i], &di)) di.dli_fname = NULL;
+        bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;
+        const char *s = plat_symbol(pc, &off);
+        if (!s && ours) s = rt_host_fn_name(pc, &off);
+        const char *mod = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
+        uint64_t moff = pc - (uint64_t)(uintptr_t)di.dli_fbase;
+        if (s && ours) fprintf(stderr, "  #%-2d %016llx %s+%llx (lasrecomp+%llx)\n", i, (unsigned long long)pc, s,
+                               (unsigned long long)off, (unsigned long long)moff);
+        else if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx (%s)\n", i, (unsigned long long)pc, s, (unsigned long long)off, mod);
+        else fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, mod, (unsigned long long)moff);
+    }
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = ctx;
+    static volatile int depth;
+    if (sig == SIGABRT && depth++ > 0) { signal(SIGABRT, SIG_DFL); abort(); }
+    uint64_t fa = (uint64_t)(uintptr_t)si->si_addr;
+    uint64_t pc = uc->uc_mcontext.pc, lr = uc->uc_mcontext.regs[30];
+    if (rt_fault_watch(fa, pc)) return;
+    char what[32];
+    snprintf(what, sizeof what, "signal %d", sig);
+    rt_fault_report(what, fa, pc, lr);
+}
+
+// Our handler runs first and debuggerd stays chained behind it, so a fault we do not recognise still produces the
+// system tombstone. rt_fault_watch returning true (a guest page fault we handle) never reaches debuggerd at all.
+void plat_crash_handler_install(void) {
+    stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = {0};
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+}
+
+// ---- child processes: there are none
+// An app cannot exec a binary of its own (W^X on the data directory), which is exactly what the start screen does
+// on the desktop when it compiles the game code. On Android that library is built ahead of time and shipped, so
+// nothing here should ever be called; failing cleanly is what lets the caller say so instead of crashing.
+#include <ftw.h>
+#include <sys/wait.h>
+
+PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+    (void)argv, (void)log_path, (void)append_log;
+    errno = ENOSYS;
+    return 0;
+}
+void plat_proc_kill(PlatProc p) { (void)p; }
+int plat_proc_wait(PlatProc p, bool block) { (void)p, (void)block; return 255; }
+
+static int rm_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
+    (void)sb, (void)flag, (void)ftw;
+    return remove(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS) == 0; }
+bool plat_onedrive_synced(const char *dir) { (void)dir; return false; }
+
+void plat_terminate(void) { _exit(0); }
+
+int plat_open_file(const char *path, int flags) { return open(path, flags, 0644); }
+int plat_rename(const char *from, const char *to) {
+    if (!access(to, F_OK)) { errno = EEXIST; return -1; }
+    return rename(from, to);
+}
+
+bool plat_window_screen_hash(void *hwnd, uint32_t *out) { (void)hwnd, (void)out; return false; }

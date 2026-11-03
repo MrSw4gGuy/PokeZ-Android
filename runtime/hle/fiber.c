@@ -21,9 +21,18 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__ANDROID__)
+#include <sys/mman.h>
+// bionic has no ucontext switch on arm64 (the header declares it, libc does not export it)
+#include "../platform/android_fiber.h"
 #else
 #include <sys/mman.h>
 #include <ucontext.h>
+// the seam the Android backend plugs into: same three operations, same field names
+typedef ucontext_t CoCtx;
+#define co_ctx_get(c)        getcontext(c)
+#define co_ctx_make(c, fn)   makecontext((c), (fn), 0)
+#define co_ctx_swap(a, b)    swapcontext((a), (b))
 #endif
 
 #include "../hle.h"
@@ -37,7 +46,7 @@ typedef struct Co {
     void *fiber;   // the Win32 fiber: ours (CreateFiberEx) when own, else a thread's (ConvertThreadToFiber)
     bool own;
 #else
-    ucontext_t uc;
+    CoCtx uc;
     void *stack;
 #endif
     Cpu *cpu;
@@ -55,7 +64,7 @@ static __thread Co *t_from, *t_to;
 #ifdef _WIN32
 static __thread void *t_tramp;
 #else
-static __thread ucontext_t t_tramp_uc, t_dummy_uc;
+static __thread CoCtx t_tramp_uc, t_dummy_uc;
 static __thread void *t_tramp_stack;
 #endif
 
@@ -128,7 +137,7 @@ static void WINAPI tramp_main(void *p) {
 }
 #else
 static void tramp_main(void) {
-    for (;;) { tramp_step(); swapcontext(&t_dummy_uc, &t_to->uc); }
+    for (;;) { tramp_step(); co_ctx_swap(&t_dummy_uc, &t_to->uc); }
 }
 #endif
 
@@ -178,11 +187,11 @@ HLE_FUNC("_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonE
             dst->stack = mmap(NULL, CO_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
             if (dst->stack == MAP_FAILED) FATAL("[fiber] no host stack\n");
         }
-        getcontext(&dst->uc);
+        co_ctx_get(&dst->uc);
         dst->uc.uc_stack.ss_sp = dst->stack;
         dst->uc.uc_stack.ss_size = CO_STACK;
         dst->uc.uc_link = NULL;
-        makecontext(&dst->uc, co_main, 0);
+        co_ctx_make(&dst->uc, co_main);
         dst->started = 1;
     }
 #endif
@@ -198,13 +207,13 @@ HLE_FUNC("_ZN2nn2os6detail20DispatchFiberContextEPPNS1_22FiberContextForHorizonE
     if (!t_tramp_stack) {
         t_tramp_stack = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (t_tramp_stack == MAP_FAILED) FATAL("[fiber] no trampoline stack\n");
-        getcontext(&t_tramp_uc);
+        co_ctx_get(&t_tramp_uc);
         t_tramp_uc.uc_stack.ss_sp = t_tramp_stack;
         t_tramp_uc.uc_stack.ss_size = 1 << 16;
         t_tramp_uc.uc_link = NULL;
-        makecontext(&t_tramp_uc, tramp_main, 0);
+        co_ctx_make(&t_tramp_uc, tramp_main);
     }
-    swapcontext(&me->uc, &t_tramp_uc);
+    co_ctx_swap(&me->uc, &t_tramp_uc);
 #endif
     // resumed (perhaps on another thread: whoever switched back copied its identity into c)
     frame_load(c, LD64(from));

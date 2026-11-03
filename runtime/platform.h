@@ -7,7 +7,7 @@
 
 #ifdef _WIN32
 #include "platform/win_compat.h"
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)  // (bionic defines __linux__ but has these already)
 #include "platform/linux_compat.h"
 #endif
 
@@ -62,6 +62,14 @@ enum { PLAT_PERF_GAME, PLAT_PERF_RENDER, PLAT_PERF_VSYNC };
 void plat_thread_perf_core(int role);
 #else
 static inline void plat_thread_perf_core(int role) { (void)role; }
+#endif
+// The share of the render scale the device's temperature allows, 1.0 = no limit; now: seconds. Android reads the
+// thermal headroom forecast and steps it down before the system throttles (runtime/platform/android.c); a desktop
+// has the fans for it, so elsewhere it is always 1. Applied by runtime/nvn/output_scale.c on top of every mode.
+#ifdef __ANDROID__
+double plat_thermal_scale(double now);
+#else
+static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
 #endif
 
 // ---- process
