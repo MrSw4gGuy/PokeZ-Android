@@ -10496,11 +10496,11 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     }
     static float cut_at = -1;  // (LARECOMP_FG_CUT=<the mean luminance difference left>, 0.06; 0: never a cut)
     if (cut_at < 0) cut_at = ENV("LARECOMP_FG_CUT") ? (float)atof(ENV("LARECOMP_FG_CUT")) : 0.06f;
-    float pw[8] = {0.5f, sc ? 1.0f : 0.0f, cut_at, 0, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
+    float pw[8] = {0.5f, sc ? 1.0f : 0.0f, cut_at, cf, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
     static const VkComponentMapping id = {0};
     VkImageView bv = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);  // (raw)
-    VkImageView wi[5] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur), post_view(cut)};
-    post_pass(cb, "fg_warp.frag", wi, 5, out, pw, false);
+    VkImageView wi[6] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur), post_view(cut), camv};
+    post_pass(cb, "fg_warp.frag", wi, 6, out, pw, false);
     if (sharp > 0) {
         TexBackend *o2 = fg_image(7, w, h, f);
         float ps[8] = {sharp};
@@ -10541,10 +10541,15 @@ static void fg_cam_now(TexBackend *b, VkCommandBuffer cb) {
     mul4(mv_vp[1], inv, pc);
     pc[16] = 1.0f / (float)lw, pc[17] = 1.0f / (float)lh, pc[18] = (float)w, pc[19] = (float)h;
     static const VkComponentMapping id = {0};
+    // (the stencil: which pixels are characters - input 0, read unfiltered; a depth without one: no camera motion)
+    if (!(zb->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) return;
     VkImageView zv = vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
-    if (!zv) return;
+    VkImageView sv = vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT);
+    if (!zv || !sv) return;
+    pc[20] = 1;  // (b.x: the stencil bound)
+    VkImageView ci[2] = {sv, zv};
     post_pc_big = pc, post_nearest_first = true;
-    post_pass(cb, "fg_cam.frag", &zv, 1, cam, pc, false);
+    post_pass(cb, "fg_cam.frag", ci, 2, cam, pc, false);
     post_pc_big = NULL, post_nearest_first = false;
     vk_full_barrier(cb);
     fg_cam_at = fg_presents;

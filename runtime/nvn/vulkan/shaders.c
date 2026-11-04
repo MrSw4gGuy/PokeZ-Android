@@ -730,13 +730,27 @@ static const char *builtin_src(const char *name, int *stage) {
                "void main() {\n"
                "  lsz = 1.0 / pc.a.xy;\n"
                "  vec2 p = gl_FragCoord.xy, va = vec2(0.0);\n"
-               "  if (pc.b.y > 0.5) { ivec2 ms = textureSize(M, 0); va = texelFetch(M, clamp(ivec2(p / lsz * vec2(ms)), ivec2(0), ms - 1), 0).xy * lsz; }\n"
+               "  bool chr = false;\n"
+               "  if (pc.b.y > 0.5) {\n"
+               "    ivec2 ms = textureSize(M, 0);\n"
+               "    vec4 m4 = texelFetch(M, clamp(ivec2(p / lsz * vec2(ms)), ivec2(0), ms - 1), 0);\n"
+               "    va = m4.xy * lsz, chr = m4.z > 0.5;\n"
+               "  }\n"
                "  ivec2 gs = textureSize(F, 0), g0 = ivec2(floor(p / pc.a.w - 0.5));\n"
                "  vec4 f[4];\n"
                "  bool any_rep = false;\n"
                "  for (int i = 0; i < 4; i++) {\n"
                "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0);\n"
                "    any_rep = any_rep || f[i].w > 0.5;\n"
+               "  }\n"
+               // (a character: whichever fits best - the camera's vector, none (the player's, following the camera) or
+               // a block's - with no lean toward the camera's)
+               "  if (chr) {\n"
+               "    vec2 best = va; float eb = err(p, va), e = err(p, vec2(0.0));\n"
+               "    if (e < eb) { eb = e; best = vec2(0.0); }\n"
+               "    for (int i = 0; i < 4; i++) { vec2 v = f[i].xy * lsz; e = err(p, v); if (e < eb) { eb = e; best = v; } }\n"
+               "    o = vec4(best / lsz, 0.0, 0.0);\n"
+               "    return;\n"
                "  }\n"
                "  if (!any_rep) { o = vec4(va / lsz, 0.0, 0.0); return; }\n"
                "  float ea = err(p, va), eb = 1e9;\n"
@@ -753,20 +767,24 @@ static const char *builtin_src(const char *name, int *stage) {
     // the CPU: one matrix leaves room for the rest). Out: xy = this frame's uv - the last one's (the flow's vectors).
     // a.xy = 1 / the output's size, a.zw = the scene's size in the depth's texels. The analytic vector of fg_match /
     // fg_refine / fg_pick (b.y = 1): what the still world does as the camera turns, which the block search alone missed
-    // in fast turns - the in-between images blurred there.
+    // in fast turns - the in-between images blurred there. z = 1: a character (stencil 0x30 - 0x3F, as fsr2_mv.frag
+    // reads it; b.x = 1: the stencil bound) - they move on their own, the camera's vector is wrong for them (the
+    // player's character follows the camera: still on screen), so fg_pick and fg_warp treat them apart.
     if (!strcmp(name, "fg_cam.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
-               "layout(set = 0, binding = 0) uniform sampler2D dep;\n"
+               "layout(set = 0, binding = 0) uniform usampler2D sten;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D dep;\n"
                "layout(push_constant) uniform P { mat4 m; vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                "void main() {\n"
                "  vec2 uv = gl_FragCoord.xy * pc.a.xy;\n"
-               "  ivec2 dz = textureSize(dep, 0);\n"
-               "  float d = max(texelFetch(dep, clamp(ivec2(uv * pc.a.zw), ivec2(0), dz - 1), 0).r, 1e-7);\n"
+               "  ivec2 dz = textureSize(dep, 0), q = clamp(ivec2(uv * pc.a.zw), ivec2(0), dz - 1);\n"
+               "  float d = max(texelFetch(dep, q, 0).r, 1e-7);\n"
                "  vec4 c = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);\n"
                "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
-               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), 0.0, 0.0);\n"
+               "  float ch = pc.b.x > 0.5 && (texelFetch(sten, q, 0).r & 0xF0u) == 0x30u ? 1.0 : 0.0;\n"
+               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), ch, 0.0);\n"
                "}\n";
     }
     // fg_cut.frag (ours): one pixel, the mean of what the coarse level's best vectors leave unexplained (fg_match's z,
@@ -823,6 +841,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(set = 0, binding = 2) uniform sampler2D fn;\n"
                "layout(set = 0, binding = 3) uniform sampler2D hud;\n"
                "layout(set = 0, binding = 4) uniform sampler2D cut;\n"  // (fg_cut's: above a.z, N as it is)
+               "layout(set = 0, binding = 5) uniform sampler2D cm;\n"   // (fg_cam's: z the characters)
                "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                // (a.y = 1: c0 / c1 are the pictures before the HUD and hud is N as shown - where they differ, the HUD:
@@ -867,7 +886,9 @@ static const char *builtin_src(const char *name, int *stage) {
                "    vec3 n1 = cr(c1, c);\n"
                // (mixed only where N-1 there agrees: where the vector is wrong the mix was a double image - the
                // in-between images looked blurred - and N's pixel moved alone stays sharp)
-               "    if (inside(r)) {\n"
+               // (a character - fg_cam's z, a.w = 1: bound - N moved alone: their hair and clothes doubled up)
+               "    bool chr = pc.a.w > 0.5 && texelFetch(cm, clamp(ivec2(c * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0).z > 0.5;\n"
+               "    if (inside(r) && !chr) {\n"
                "      vec3 p0 = cr(c0, r), d = abs(p0 - n1);\n"
                "      col = mix(mix(p0, n1, t), n1, smoothstep(0.04, 0.12, max(d.r, max(d.g, d.b))));\n"
                "    } else col = n1;\n"
