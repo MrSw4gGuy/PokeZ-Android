@@ -589,9 +589,9 @@ static const char *builtin_src(const char *name, int *stage) {
     }
     // ---- Frame generation (exec.c fg_*, F1 > Video > Frame generation): the game at 30 fps shown at 60, an image made
     // between each two real ones by optical flow. Adapted from letsgo-recomp's flow method (github.com/raulzrrs/
-    // letsgo-recomp, MIT licence, Copyright (c) 2026 raulzito12345rrs: third_party/letsgo-fg/LICENSE) to the images alone - Pokémon Z-A
-    // gives us no motion vectors or scene depth here, so the "analytic" vector is no motion (the HUD, still scenery)
-    // and the block search must beat it clearly. Vectors are N's uv - N-1's.
+    // letsgo-recomp, MIT licence, Copyright (c) 2026 raulzito12345rrs: third_party/letsgo-fg/LICENSE): the "analytic"
+    // vector is the camera's motion (fg_cam, from Pokémon Z-A's scene depth and view-projections; no motion without
+    // them), and the block search must beat it clearly. Vectors are N's uv - N-1's.
     // fg_luma.frag: the luminance of N's (r) and N-1's (g) images at the flow's size (~640 wide), 4 bilinear taps a
     // pixel. a.xy = 1 / that size.
     if (!strcmp(name, "fg_luma.frag")) {
@@ -613,18 +613,21 @@ static const char *builtin_src(const char *name, int *stage) {
                "}\n";
     }
     // fg_match.frag: one 8 x 8 block every a.w luminance pixels, its 16 samples against N-1 moved by each candidate:
-    // no motion, a search of +-a.z pixels in steps of 2 and the 3 x 3 around zero. The search wins only clearly (under
-    // 0.8 x no motion's difference, and by 0.4 % of white): flat or relit areas stay still. fg_refine.frag: again from
-    // the best of the block's and its 8 neighbours' results (a good vector spreads), then +-1 and +-0.5 pixel around it.
-    // Out: xy = the vector (uv), zw = 0 (the "analytic" one: none). a.xy = 1 / the luminance's size. fg_match's b.x = 1
-    // (ours): F is a coarse level's result (the same match at a quarter of the size), its vector a candidate and the
-    // search's centre - +-4 pixels alone missed the ground near the camera in a turn, the in-between image a blur there.
+    // the analytic vector va (the camera's at the block's centre and corners, fg_cam, b.y = 1; else no motion), a
+    // search of +-a.z pixels in steps of 2 and the 3 x 3 around zero (the HUD, still particles). The search wins only
+    // clearly (under 0.8 x va's difference, and by 0.4 % of white): flat or relit areas keep va. fg_refine.frag: again
+    // from the best of the block's and its 8 neighbours' results (a good vector spreads), then +-1 and +-0.5 pixel
+    // around it. Out: xy = the vector (uv), z = the difference left (fg_cut), w = 1: the block's own (not va). a.xy =
+    // 1 / the luminance's size. fg_match's b.x = 1 (ours): F is a coarse level's result (the same match at a quarter
+    // of the size), its vector a candidate and the search's centre - +-4 pixels alone missed the ground near the camera
+    // in a turn. M (binding 2): fg_cam's vectors, any size.
     if (!strcmp(name, "fg_match.frag") || !strcmp(name, "fg_refine.frag")) {
         *stage = STAGE_FRAGMENT;
         static const char *common =
             "#version 450\n"
             "layout(set = 0, binding = 0) uniform sampler2D L;\n"
             "layout(set = 0, binding = 1) uniform sampler2D F;\n"
+            "layout(set = 0, binding = 2) uniform sampler2D M;\n"
             "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
             "layout(location = 0) out vec4 o;\n"
             "vec2 lsz;\n"
@@ -641,18 +644,24 @@ static const char *builtin_src(const char *name, int *stage) {
             "      s += abs(na[y * 4 + x] - texture(L, (q - v) / lsz).g);\n"
             "    }\n"
             "  return s / 16.0;\n"
+            "}\n"
+            "vec2 va_at(vec2 c) {\n"  // (luminance pixels)
+            "  if (pc.b.y < 0.5) return vec2(0.0);\n"
+            "  ivec2 ms = textureSize(M, 0);\n"
+            "  return texelFetch(M, clamp(ivec2(c / lsz * vec2(ms)), ivec2(0), ms - 1), 0).xy * lsz;\n"
             "}\n";
-        static char src[2][4096];
+        static char src[2][6144];
         int k = !strcmp(name, "fg_refine.frag");
         if (!src[k][0] && !k)
             snprintf(src[k], sizeof src[k], "%s%s", common,
                      "void main() {\n"
                      "  lsz = 1.0 / pc.a.xy;\n"
-                     "  vec2 c = (floor(gl_FragCoord.xy) + 0.5) * pc.a.w, best = vec2(0.0);\n"
+                     "  vec2 c = (floor(gl_FragCoord.xy) + 0.5) * pc.a.w;\n"
                      "  prep(c);\n"
-                     "  float sa = sad(c, vec2(0.0)), sb = sa, s;\n"
+                     "  vec2 va = va_at(c), best = va;\n"
+                     "  float sa = sad(c, va), sb = sa, s;\n"
                      "  int R = int(pc.a.z);\n"
-                     "  vec2 v0 = vec2(0.0);\n"
+                     "  vec2 v0 = floor(va + 0.5);\n"
                      "  if (pc.b.x > 0.5) {\n"  // (the coarse level's vector at this block: the search around it)
                      "    ivec2 fz = textureSize(F, 0);\n"
                      "    v0 = floor(texelFetch(F, clamp(ivec2(c / lsz * vec2(fz)), ivec2(0), fz - 1), 0).xy * lsz + 0.5);\n"
@@ -662,17 +671,22 @@ static const char *builtin_src(const char *name, int *stage) {
                      "    for (int x = -R; x <= R; x += 2) { vec2 v = v0 + vec2(x, y); s = sad(c, v); if (s < sb) { sb = s; best = v; } }\n"
                      "  for (int y = -1; y <= 1; y++)\n"
                      "    for (int x = -1; x <= 1; x++) { s = sad(c, vec2(x, y)); if (s < sb) { sb = s; best = vec2(x, y); } }\n"
+                     "  for (int i = 0; i < 4; i++) {\n"  // (the camera's vector at the block's corners: an edge between depths)
+                     "    vec2 v = va_at(c + vec2((i & 1) != 0 ? 3.0 : -3.0, (i & 2) != 0 ? 3.0 : -3.0));\n"
+                     "    s = sad(c, v); if (s < sb) { sb = s; best = v; }\n"
+                     "  }\n"
                      "  bool rep = sb < sa * 0.8 - 0.004;\n"
-                     "  o = vec4(rep ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+                     "  o = vec4((rep ? best : va) / lsz, rep ? sb : sa, rep ? 1.0 : 0.0);\n"
                      "}\n");
         else if (!src[k][0])
             snprintf(src[k], sizeof src[k], "%s%s", common,
                      "void main() {\n"
                      "  lsz = 1.0 / pc.a.xy;\n"
                      "  ivec2 g = ivec2(gl_FragCoord.xy), gs = textureSize(F, 0);\n"
-                     "  vec2 c = (vec2(g) + 0.5) * pc.a.w, best = vec2(0.0);\n"
+                     "  vec2 c = (vec2(g) + 0.5) * pc.a.w;\n"
                      "  prep(c);\n"
-                     "  float sa = sad(c, vec2(0.0)), sb = sa, s;\n"
+                     "  vec2 va = va_at(c), best = va;\n"
+                     "  float sa = sad(c, va), sb = sa, s;\n"
                      "  for (int y = -1; y <= 1; y++)\n"
                      "    for (int x = -1; x <= 1; x++) {\n"
                      "      vec2 v = texelFetch(F, clamp(g + ivec2(x, y), ivec2(0), gs - 1), 0).xy * lsz;\n"
@@ -687,18 +701,20 @@ static const char *builtin_src(const char *name, int *stage) {
                      "    }\n"
                      "  }\n"
                      "  bool rep = sb < sa * 0.8 - 0.004;\n"
-                     "  o = vec4(rep ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+                     "  o = vec4((rep ? best : va) / lsz, rep ? sb : sa, rep ? 1.0 : 0.0);\n"
                      "}\n");
         return src[k];
     }
-    // fg_pick.frag: per luminance pixel, no motion against the four nearest blocks' vectors on the pixel's 3 x 3 (a
-    // block's only clearly better, as above): block edges follow the picture instead of the 4-pixel grid. Out: xy = the
-    // vector (uv). a.xy = 1 / the luminance's size, a.w = the blocks' stride.
+    // fg_pick.frag: per luminance pixel, the analytic vector (the camera's there, M; else no motion) against the four
+    // nearest blocks' own vectors on the pixel's 3 x 3 (a block's only clearly better, as above): block edges follow
+    // the picture instead of the 4-pixel grid. Out: xy = the vector (uv). a.xy = 1 / the luminance's size, a.w = the
+    // blocks' stride, b.y = 1: M bound.
     if (!strcmp(name, "fg_pick.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
                "layout(set = 0, binding = 0) uniform sampler2D L;\n"
                "layout(set = 0, binding = 1) uniform sampler2D F;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D M;\n"
                "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                "vec2 lsz;\n"
@@ -713,22 +729,61 @@ static const char *builtin_src(const char *name, int *stage) {
                "}\n"
                "void main() {\n"
                "  lsz = 1.0 / pc.a.xy;\n"
-               "  vec2 p = gl_FragCoord.xy;\n"
+               "  vec2 p = gl_FragCoord.xy, va = vec2(0.0);\n"
+               "  if (pc.b.y > 0.5) { ivec2 ms = textureSize(M, 0); va = texelFetch(M, clamp(ivec2(p / lsz * vec2(ms)), ivec2(0), ms - 1), 0).xy * lsz; }\n"
                "  ivec2 gs = textureSize(F, 0), g0 = ivec2(floor(p / pc.a.w - 0.5));\n"
-               "  vec2 f[4];\n"
+               "  vec4 f[4];\n"
                "  bool any_rep = false;\n"
                "  for (int i = 0; i < 4; i++) {\n"
-               "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0).xy;\n"
-               "    any_rep = any_rep || f[i] != vec2(0.0);\n"
+               "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0);\n"
+               "    any_rep = any_rep || f[i].w > 0.5;\n"
                "  }\n"
-               "  if (!any_rep) { o = vec4(0.0); return; }\n"
-               "  float ea = err(p, vec2(0.0)), eb = 1e9;\n"
-               "  vec2 best = vec2(0.0);\n"
+               "  if (!any_rep) { o = vec4(va / lsz, 0.0, 0.0); return; }\n"
+               "  float ea = err(p, va), eb = 1e9;\n"
+               "  vec2 best = va;\n"
                "  for (int i = 0; i < 4; i++) {\n"
-               "    if (f[i] == vec2(0.0)) continue;\n"
-               "    vec2 v = f[i] * lsz; float e = err(p, v); if (e < eb) { eb = e; best = v; }\n"
+               "    if (f[i].w < 0.5) continue;\n"
+               "    vec2 v = f[i].xy * lsz; float e = err(p, v); if (e < eb) { eb = e; best = v; }\n"
                "  }\n"
-               "  o = vec4(eb < ea * 0.8 - 0.004 ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+               "  o = vec4((eb < ea * 0.8 - 0.004 ? best : va) / lsz, 0.0, 0.0);\n"
+               "}\n";
+    }
+    // fg_cam.frag (ours, after fsr2_mv.frag): the camera's motion at the flow's size, from the scene depth (reversed,
+    // infinite far plane) and m = the last frame's view-projection x the inverse of this one's (mv_note_draw's, made on
+    // the CPU: one matrix leaves room for the rest). Out: xy = this frame's uv - the last one's (the flow's vectors).
+    // a.xy = 1 / the output's size, a.zw = the scene's size in the depth's texels. The analytic vector of fg_match /
+    // fg_refine / fg_pick (b.y = 1): what the still world does as the camera turns, which the block search alone missed
+    // in fast turns - the in-between images blurred there.
+    if (!strcmp(name, "fg_cam.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D dep;\n"
+               "layout(push_constant) uniform P { mat4 m; vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy * pc.a.xy;\n"
+               "  ivec2 dz = textureSize(dep, 0);\n"
+               "  float d = max(texelFetch(dep, clamp(ivec2(uv * pc.a.zw), ivec2(0), dz - 1), 0).r, 1e-7);\n"
+               "  vec4 c = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);\n"
+               "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
+               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), 0.0, 0.0);\n"
+               "}\n";
+    }
+    // fg_cut.frag (ours): one pixel, the mean of what the coarse level's best vectors leave unexplained (fg_match's z,
+    // the luminance's mean difference) over all its blocks. A camera cut or a fade - the intro's cutscenes, the jump to
+    // the bag - leaves most of the picture unexplained: fg_warp then shows N as it is (an in-between image of two
+    // unrelated pictures flashed).
+    if (!strcmp(name, "fg_cut.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D B;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 z = textureSize(B, 0);\n"
+               "  float s = 0.0;\n"
+               "  for (int y = 0; y < z.y; y++)\n"
+               "    for (int x = 0; x < z.x; x++) s += texelFetch(B, ivec2(x, y), 0).z;\n"
+               "  o = vec4(s / float(z.x * z.y), 0.0, 0.0, 0.0);\n"
                "}\n";
     }
     // fg_median.frag (ours, not letsgo-recomp's: they start from the renderer's motion vectors, a smooth field): the
@@ -767,6 +822,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(set = 0, binding = 1) uniform sampler2D c1;\n"
                "layout(set = 0, binding = 2) uniform sampler2D fn;\n"
                "layout(set = 0, binding = 3) uniform sampler2D hud;\n"
+               "layout(set = 0, binding = 4) uniform sampler2D cut;\n"  // (fg_cut's: above a.z, N as it is)
                "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                // (a.y = 1: c0 / c1 are the pictures before the HUD and hud is N as shown - where they differ, the HUD:
@@ -792,6 +848,10 @@ static const char *builtin_src(const char *name, int *stage) {
                "void main() {\n"
                "  vec2 q = gl_FragCoord.xy * pc.b.xy, fs = vec2(textureSize(fn, 0));\n"
                "  float t = pc.a.x;\n"
+               "  if (pc.a.z > 0.0 && texelFetch(cut, ivec2(0), 0).r > pc.a.z) {\n"
+               "    o = vec4(texelFetch(hud, ivec2(gl_FragCoord.xy), 0).rgb, 1.0);\n"
+               "    return;\n"
+               "  }\n"
                "  if (pc.a.y > 0.5 && is_hud(ivec2(gl_FragCoord.xy))) {\n"
                "    vec3 hc = texelFetch(hud, ivec2(gl_FragCoord.xy), 0).rgb;\n"
                "    o = vec4(pc.b.z > 0.5 ? mix(hc, vec3(0.0, 1.0, 0.0), 0.5) : hc, 1.0);\n"

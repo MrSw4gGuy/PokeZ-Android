@@ -125,10 +125,16 @@ int osk_keys(char *text, size_t cap, int max_chars, bool appearing, float scale,
     static const char *rows_l[] = {"abcdefghij", "klmnopqrst", "uvwxyz-.'!", "0123456789"};
     const char **rows = upper ? rows_u : rows_l;
 #ifdef __ANDROID__
-    float k = 96 * scale;  // (keys for a finger: 10 of them still fit the 1100-wide window)
+    float k = 96 * scale;  // (keys for a finger)
 #else
     float k = 70 * scale;
 #endif
+    {   // no wider than the window: a row of 10 keys, and the last row's 11 key widths, with the spacing between them
+        // (at 96 the J at the end of the first row stood half outside the window on the phone)
+        const ImGuiStyle &st = ImGui::GetStyle();
+        float avail = ImGui::GetWindowWidth() - 2 * st.WindowPadding.x, sp = st.ItemSpacing.x;
+        k = fminf(k, fminf((avail - 9 * sp) / 10, (avail - 4 * sp) / 11));
+    }
     for (int row = 0; row < 4; row++) {
         for (int i = 0; rows[row][i]; i++) {
             if (i) ImGui::SameLine();

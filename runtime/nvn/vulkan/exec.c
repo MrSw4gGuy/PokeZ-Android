@@ -3535,7 +3535,9 @@ void vk_alias_texture_destroyed(NvnTexture *t) {
 // copies that opaque - edge anti-aliased on the way, so not the same pixels - into the image it presents, and draws the
 // HUD over it with blending. After an opaque draw into an image that has been presented, that image is copied
 // (hdr_snapshot, two: the game alternates two such images): what differs from the copy when it is shown is the HUD.
-static struct { NvnTexture *shown; TexBackend img; } hdr_snaps[2];
+static struct { NvnTexture *shown; TexBackend img; uint64_t at; } hdr_snaps[2];
+static uint64_t fg_presents;  // (vk_fg_make's calls: a snapshot's .at - taken since the last one, or an old picture)
+static uint64_t fg_cam_at = ~0ull;  // (fg_cam_now: fg_presents when the camera's motion was made)
 static TexBackend *hdr_game;  // (vk_present_draw: this frame's game image, its place in the window, uv crop and flip)
 static float hdr_place[9];
 static void hdr_snapshot(NvnTexture *t);
@@ -10363,17 +10365,20 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 // ================================================================== frame generation (F1 > Video > Frame generation)
 // The game at 30 fps shown at 60: between each two real frames an image made by optical flow from the game's own
 // images (shaders.c fg_*, adapted from letsgo-recomp's flow method, MIT: third_party/letsgo-fg). device.c
-// backend_present_now shows it, then the real frame half a period later. Only the images: block matching on the
-// luminance at ~640 wide (fg_match / fg_refine, a block every 4 pixels), taken per pixel where clearly better than no
-// motion (fg_pick), smoothed (fg_median: the field speckled on flat ground), then both real frames moved to t = 0.5
-// and mixed (fg_warp) and sharpened back (fg_sharp). The HUD is part of the game's image: no motion is the default,
-// so it stays put. Its images: 0, 1 the game's last two frames (copies: the game reuses its window textures), 2 the
-// luminance, 3, 4 the blocks (matched, refined), 5 the per-pixel vectors, 6 the in-between image, 7 it sharpened, 8
-// the median's first pass, 9, 10 the coarse level (luminance, blocks). Research: LARECOMP_FG_RADIUS=<luminance pixels> (the search, 4), LARECOMP_FG_SHARP=<0..1>
+// backend_present_now shows it, then the real frame half a period later. The camera's motion (fg_cam_now, from the
+// scene depth and the view-projections) as the analytic field; block matching on the luminance at ~640 wide (fg_match
+// / fg_refine, a block every 4 pixels, from a coarse level's result) where something moves on its own, taken per pixel
+// where clearly better (fg_pick), smoothed (fg_median: the field speckled on flat ground), then both real frames moved
+// to t = 0.5 and mixed where they agree (fg_warp), sharpened back if asked (fg_sharp). The flow works on the picture
+// before the HUD (hdr_snapshot) and the HUD comes from the real frame; a cut or fade (fg_cut) shows the real frame.
+// Its images: 0, 1 the game's last two frames (copies: the game reuses its window textures), 2 the luminance, 3, 4 the
+// blocks (matched, refined), 5 the per-pixel vectors, 6 the in-between image, 7 it sharpened, 8 the median's first
+// pass, 9, 10 the coarse level (luminance, blocks), 11 a cut (fg_cut), 12 the camera's motion (fg_cam_now).
+// Research: LARECOMP_FG_RADIUS=<luminance pixels> (the search, 4), LARECOMP_FG_SHARP=<0..1>
 // (0: off), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_HUD=0 (the HUD moved with the rest), LARECOMP_FG_DEBUG=1
 // (tinted: red moved, blue uncovered, green the HUD), LARECOMP_FG_TIMING=1 (device.c: when each image is ready).
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f) {
-    static TexBackend img[11];
+    static TexBackend img[13];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -10414,6 +10419,11 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     // start screen, a picture not copied opaque) the whole image, HUD included.
     TexBackend *sc = hdr_snap_of(b);
     if (sc && (!sc->image || sc->width != w || sc->height != h || sc->format != f)) sc = NULL;
+    // (this frame's only: through fades and cutscenes the game drew no opaque picture some frames, and the copy left
+    // from frames before - the bright tower in the dark after the intro's cutscene - flashed in the in-between images)
+    for (int i = 0; sc && i < 2; i++) if (&hdr_snaps[i].img == sc && hdr_snaps[i].at != fg_presents) sc = NULL;
+    bool cam_ok = sc && fg_cam_at == fg_presents;  // (fg_cam_now: the camera's motion, made with this frame's picture)
+    fg_presents++;
     static int hud_env = -1;
     if (hud_env < 0) hud_env = !ENV("LARECOMP_FG_HUD") || atoi(ENV("LARECOMP_FG_HUD"));
     if (!hud_env) sc = NULL;
@@ -10451,23 +10461,31 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     uint32_t gw = (lw + G - 1) / G, gh = (lh + G - 1) / G;
     TexBackend *L = fg_image(2, lw, lh, hf), *b0 = fg_image(3, gw, gh, hf), *b1 = fg_image(4, gw, gh, hf);
     TexBackend *pk = fg_image(5, lw, lh, hf), *out = fg_image(6, w, h, f);
-    float pl[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G};
+    TexBackend *cam = cam_ok ? fg_image(12, lw, lh, hf) : NULL;
+    if (cam && !cam->image) cam = NULL;
+    float cf = cam ? 1.0f : 0.0f;
+    VkImageView camv = cam ? post_view(cam) : post_view(L);  // (b.y: bound)
+    float pl[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G, 0, cf};
     VkImageView li[2] = {post_view(cur), post_view(prev)};
     post_pass(cb, "fg_luma.frag", li, 2, L, pl, false);
     // the coarse level (images 9, 10): the luminance at a quarter of the size and its blocks, the fine match's start
     uint32_t cw = lw / 4 > 8 ? lw / 4 : 8, ch = lh / 4 > 8 ? lh / 4 : 8, cgw = (cw + G - 1) / G, cgh = (ch + G - 1) / G;
     TexBackend *Lc = fg_image(9, cw, ch, hf), *bc = fg_image(10, cgw, cgh, hf);
-    float plc[8] = {1.0f / (float)cw, 1.0f / (float)ch, (float)radius, (float)G};
+    float plc[8] = {1.0f / (float)cw, 1.0f / (float)ch, (float)radius, (float)G, 0, cf};
     post_pass(cb, "fg_luma.frag", li, 2, Lc, plc, false);
-    VkImageView mci[2] = {post_view(Lc), post_view(Lc)};  // (no coarser level: F unread)
-    post_pass(cb, "fg_match.frag", mci, 2, bc, plc, false);
-    float pmf[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G, 1.0f};
-    VkImageView mi[2] = {post_view(L), post_view(bc)};
-    post_pass(cb, "fg_match.frag", mi, 2, b0, pmf, false);
-    VkImageView ri_[2] = {post_view(L), post_view(b0)};
-    post_pass(cb, "fg_refine.frag", ri_, 2, b1, pl, false);
-    VkImageView pi[2] = {post_view(L), post_view(b1)};
-    post_pass(cb, "fg_pick.frag", pi, 2, pk, pl, false);
+    VkImageView mci[3] = {post_view(Lc), post_view(Lc), camv};  // (no coarser level: F unread)
+    post_pass(cb, "fg_match.frag", mci, 3, bc, plc, false);
+    TexBackend *cut = fg_image(11, 1, 1, hf);  // (fg_cut: a camera cut or a fade - image 11)
+    VkImageView cti[1] = {post_view(bc)};
+    float pz0[8] = {0};
+    post_pass(cb, "fg_cut.frag", cti, 1, cut, pz0, false);
+    float pmf[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G, 1.0f, cf};
+    VkImageView mi[3] = {post_view(L), post_view(bc), camv};
+    post_pass(cb, "fg_match.frag", mi, 3, b0, pmf, false);
+    VkImageView ri_[3] = {post_view(L), post_view(b0), camv};
+    post_pass(cb, "fg_refine.frag", ri_, 3, b1, pl, false);
+    VkImageView pi[3] = {post_view(L), post_view(b1), camv};
+    post_pass(cb, "fg_pick.frag", pi, 3, pk, pl, false);
     if (median) {  // (fg_median: spacing 1, then 2 - images 8 and back into 5)
         TexBackend *m1 = fg_image(8, lw, lh, hf);
         float pm1[8] = {0, 0, 1}, pm2[8] = {0, 0, 2};
@@ -10476,11 +10494,13 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
         VkImageView a2[1] = {post_view(m1)};
         post_pass(cb, "fg_median.frag", a2, 1, pk, pm2, false);
     }
-    float pw[8] = {0.5f, sc ? 1.0f : 0.0f, 0, 0, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
+    static float cut_at = -1;  // (LARECOMP_FG_CUT=<the mean luminance difference left>, 0.06; 0: never a cut)
+    if (cut_at < 0) cut_at = ENV("LARECOMP_FG_CUT") ? (float)atof(ENV("LARECOMP_FG_CUT")) : 0.06f;
+    float pw[8] = {0.5f, sc ? 1.0f : 0.0f, cut_at, 0, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
     static const VkComponentMapping id = {0};
     VkImageView bv = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);  // (raw)
-    VkImageView wi[4] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur)};
-    post_pass(cb, "fg_warp.frag", wi, 4, out, pw, false);
+    VkImageView wi[5] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur), post_view(cut)};
+    post_pass(cb, "fg_warp.frag", wi, 5, out, pw, false);
     if (sharp > 0) {
         TexBackend *o2 = fg_image(7, w, h, f);
         float ps[8] = {sharp};
@@ -10492,12 +10512,42 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     // (shown as b would be: its contents' part and scale)
     out->scalable = b->scalable, out->sx = b->sx, out->sy = b->sy, out->ax = b->ax, out->ay = b->ay;
     static int logged = -1;
-    if (logged != (sc != NULL)) {
-        logged = sc != NULL;
-        LOG("[fg] frame generation: %ux%u, flow %ux%u, blocks %ux%u, %s\n", w, h, lw, lh, gw, gh,
-            sc ? "the HUD from the real frame" : "the whole image (no picture before the HUD)");
+    if (logged != (sc != NULL) + 2 * (cam != NULL)) {
+        logged = (sc != NULL) + 2 * (cam != NULL);
+        LOG("[fg] frame generation: %ux%u, flow %ux%u, blocks %ux%u, %s%s\n", w, h, lw, lh, gw, gh,
+            sc ? "the HUD from the real frame" : "the whole image (no picture before the HUD)", cam ? ", the camera's motion" : "");
     }
     return out;
+}
+
+// Frame generation: the camera's motion (shaders.c fg_cam.frag, image 12 at the flow's size) when the picture before
+// the HUD is copied - the scene depth is still the scene's then - from mv_note_draw's view-projections of this frame
+// and the last. None after a cut (another view) or when the depth isn't the picture's size.
+static void fg_cam_now(TexBackend *b, VkCommandBuffer cb) {
+    extern uint64_t vk_frame_counter(void);
+    uint64_t fr = vk_frame_counter();
+    if (!mv_depth || !mv_depth->backend || mv_frame[0] != fr || mv_frame[1] + 1 != fr) return;
+    TexBackend *zb = mv_depth->backend;
+    if (!zb->image || !(zb->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || zb->samples > 1 || zb->width != b->width || zb->height != b->height)
+        return;
+    const float *va = mv_vp[0], *vb = mv_vp[1];  // (the view axis as in fsr2_frame: a cut turns it)
+    float la = sqrtf(va[3] * va[3] + va[7] * va[7] + va[11] * va[11]), lb = sqrtf(vb[3] * vb[3] + vb[7] * vb[7] + vb[11] * vb[11]);
+    if (!(la > 0 && lb > 0) || (va[3] * vb[3] + va[7] * vb[7] + va[11] * vb[11]) / (la * lb) < 0.95f) return;
+    uint32_t w = b->width, h = b->height, lw = w < 640 ? w : 640, lh = (uint32_t)lround((double)h * lw / w);
+    if (lh < 8) lh = 8;
+    TexBackend *cam = fg_image(12, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    float inv[16], pc[32] = {0};
+    inv4(mv_vp[0], inv);
+    mul4(mv_vp[1], inv, pc);
+    pc[16] = 1.0f / (float)lw, pc[17] = 1.0f / (float)lh, pc[18] = (float)w, pc[19] = (float)h;
+    static const VkComponentMapping id = {0};
+    VkImageView zv = vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!zv) return;
+    post_pc_big = pc, post_nearest_first = true;
+    post_pass(cb, "fg_cam.frag", &zv, 1, cam, pc, false);
+    post_pc_big = NULL, post_nearest_first = false;
+    vk_full_barrier(cb);
+    fg_cam_at = fg_presents;
 }
 
 // (hdr_snaps above) t's image now -> its copy: the copy keeps t's format, read raw like t (raw_view)
@@ -10507,6 +10557,7 @@ static void hdr_snapshot(NvnTexture *t) {
     static int next;
     int k = hdr_snaps[0].shown == t ? 0 : hdr_snaps[1].shown == t ? 1 : !hdr_snaps[0].shown ? 0 : !hdr_snaps[1].shown ? 1 : (next ^= 1);
     hdr_snaps[k].shown = t;
+    hdr_snaps[k].at = fg_presents;
     TexBackend *d = &hdr_snaps[k].img;
     VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : b->format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : b->format;
     if (d->image && (d->width != b->width || d->height != b->height || d->format != f)) {
@@ -10533,6 +10584,7 @@ static void hdr_snapshot(NvnTexture *t) {
                      .extent = {b->width, b->height, 1}};
     rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     vk_full_barrier(cb);
+    if (g_settings.frame_gen && fg_cam_at != fg_presents) fg_cam_now(b, cb);  // (once a frame: the first, the picture's copy)
 }
 
 // HDR output (F1 > Video > HDR; device.c vk_frame_end): the window's SDR image (sdr; base: its copy from before the
