@@ -799,7 +799,12 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
                "  float ch = pc.b.x > 0.5 && (texelFetch(sten, q, 0).r & 0xF0u) == 0x30u ? 1.0 : 0.0;\n"
                "  float chp = pc.b.y > 0.5 ? texelFetch(prv, ivec2(gl_FragCoord.xy), 0).z : 0.0;\n"
-               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), ch, chp);\n"
+               // (a point barely in front of the last frame's camera - w near 0 - gave a vector of thousands of pixels:
+               // infinite in half floats, and the warp read black there - figures of people in black. A quarter of the
+               // picture at most, more is no motion this flow can follow)
+               "  vec2 mv = c.w > 1e-4 ? uv - puv : vec2(0.0);\n"
+               "  if (any(isnan(mv)) || any(greaterThan(abs(mv), vec2(0.25)))) mv = vec2(0.0);\n"
+               "  o = vec4(mv, ch, chp);\n"
                "}\n";
     }
     // fg_lk.frag (ours): the characters' own motion - they move on their own, and no motion vectors come with them -
@@ -849,6 +854,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "    vec2 dv = -vec2(a22 * b1 - a12 * b2, a11 * b2 - a12 * b1) / det;\n"
                "    v += clamp(dv, vec2(-2.0), vec2(2.0));\n"
                "  }\n"
+               "  if (any(isnan(v)) || any(greaterThan(abs(v - v0), vec2(12.0)))) v = v0;\n"  // (a fit that ran off: the start)
                "  o = vec4((err(p, v) < err(p, v0) ? v : v0) / lsz, 0.0, 0.0);\n"
                "}\n";
     }
@@ -927,7 +933,13 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
                "  return clamp(r / ws, 0.0, 1.0);\n"
                "}\n"
-               "vec2 at(vec2 uv) { ivec2 z = textureSize(fn, 0); return texelFetch(fn, clamp(ivec2(uv * vec2(z)), ivec2(0), z - 1), 0).xy; }\n"
+               // (a vector that is not one - not a number, infinite, past a quarter of the picture - none: read past the
+               // images, it showed black)
+               "vec2 at(vec2 uv) {\n"
+               "  ivec2 z = textureSize(fn, 0);\n"
+               "  vec2 v = texelFetch(fn, clamp(ivec2(uv * vec2(z)), ivec2(0), z - 1), 0).xy;\n"
+               "  return any(isnan(v)) || any(greaterThan(abs(v), vec2(0.25))) ? vec2(0.0) : v;\n"
+               "}\n"
                "bool inside(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0))); }\n"
                "void main() {\n"
                "  vec2 q = gl_FragCoord.xy * pc.b.xy, fs = vec2(textureSize(fn, 0));\n"
