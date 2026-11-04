@@ -8068,11 +8068,28 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
-    if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
+    if (st.rt.depth) {
+        LOG(" d%#x %p %ux%u", st.rt.depth->format, (void *)st.rt.depth, st.rt.depth->width, st.rt.depth->height);
+        if (st.rt.has_dview && (st.rt.dview.setmask & 2)) LOG(" layer %u+%u", st.rt.dview.min_layer, st.rt.dview.num_layers);
+    }
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x offset %x %g %g %g\n",
         st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0],
         st.ds[1], st.ds[2], st.poly[0], st.poly[1], st.channel_mask, st.poly[3], st.poly_offset[0], st.poly_offset[1],
         st.poly_offset[2]);
+    // the vertex stage's constant buffers (cb<k> is binding k - 3: cbuf_info) - address, size and its first floats: which
+    // camera a draw uses (the shadow cascades are the same meshes drawn once per cascade, gl_Layer from a constant)
+    LOG("[draw]   vs cbufs:");
+    for (int k = 3; k < 21; k++) {
+        if (!((pr->vi->cbuf_mask >> k) & 1) || k - 3 >= 18) continue;
+        const Range *u = &st.ubuf[0][k - 3];
+        if (!u->addr) continue;
+        LOG(" cb%d@%llx+%llx", k, (unsigned long long)u->addr, (unsigned long long)u->size);
+        if (u->size >= 16 && u->size <= 4096) {
+            const float *fv = (const float *)(uintptr_t)u->addr;
+            LOG("[%g %g %g %g]", fv[0], fv[1], fv[2], fv[3]);
+        }
+    }
+    LOG("\n");
     // the vertex layout - stretched geometry is a mesh read with another layout: attribute <i>:f<format>/s<stream>+<offset>
     // (those the shader reads), stream <s>:<address>+<size>/<stride>
     LOG("[draw]   layout %d attribs:", st.nattrib);
