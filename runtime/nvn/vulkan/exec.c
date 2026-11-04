@@ -7088,7 +7088,7 @@ static void draw(CmdRec *r, bool indexed) {
                 (unsigned long long)xfb_addr[2], (unsigned long long)xfb_size[2]);
     }
     draw_(r, indexed);
-    if (g_vk.hdr && st.rt.color[0] && !st.color_state[0] && st.rt.color[0]->backend &&
+    if ((g_vk.hdr || g_settings.frame_gen) && st.rt.color[0] && !st.color_state[0] && st.rt.color[0]->backend &&
         ((TexBackend *)st.rt.color[0]->backend)->presented)
         hdr_snapshot(st.rt.color[0]);  // (the game's picture in the image it shows, before the HUD over it)
     PROF_ADD(prof_draw);
@@ -10369,10 +10369,11 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 // and mixed (fg_warp) and sharpened back (fg_sharp). The HUD is part of the game's image: no motion is the default,
 // so it stays put. Its images: 0, 1 the game's last two frames (copies: the game reuses its window textures), 2 the
 // luminance, 3, 4 the blocks (matched, refined), 5 the per-pixel vectors, 6 the in-between image, 7 it sharpened, 8
-// the median's first pass. Research: LARECOMP_FG_RADIUS=<luminance pixels> (the search, 4), LARECOMP_FG_SHARP=<0..1>
-// (0.2), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_DEBUG=1 (tinted: red moved, blue uncovered).
+// the median's first pass, 9, 10 the coarse level (luminance, blocks). Research: LARECOMP_FG_RADIUS=<luminance pixels> (the search, 4), LARECOMP_FG_SHARP=<0..1>
+// (0: off), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_HUD=0 (the HUD moved with the rest), LARECOMP_FG_DEBUG=1
+// (tinted: red moved, blue uncovered, green the HUD), LARECOMP_FG_TIMING=1 (device.c: when each image is ready).
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f) {
-    static TexBackend img[9];
+    static TexBackend img[11];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -10407,6 +10408,17 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
                : b->format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : b->format;
     uint32_t w = b->width, h = b->height;
+    // The game's picture before its HUD (hdr_snapshot, taken for this too): the flow and the warp then work on the 3D
+    // world alone, and the HUD - what differs between it and the shown image - comes from the real frame as it is (no
+    // smear on menus, text and icons; it changes at the game's 30 fps, the world moves at 60). Without one (the
+    // start screen, a picture not copied opaque) the whole image, HUD included.
+    TexBackend *sc = hdr_snap_of(b);
+    if (sc && (!sc->image || sc->width != w || sc->height != h || sc->format != f)) sc = NULL;
+    static int hud_env = -1;
+    if (hud_env < 0) hud_env = !ENV("LARECOMP_FG_HUD") || atoi(ENV("LARECOMP_FG_HUD"));
+    if (!hud_env) sc = NULL;
+    static bool was_sc;
+    if ((sc != NULL) != was_sc) fg.have[0] = fg.have[1] = false, was_sc = sc != NULL;  // (the two kinds don't mix)
     int s = fg.s;
     TexBackend *cur = fg_image(s, w, h, f);
     TexBackend *prev = fg.have[!s] ? fg_image(!s, w, h, f) : NULL;  // (a size change remakes it: have false below)
@@ -10417,7 +10429,7 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     vk_full_barrier(cb);
     VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                      .extent = {w, h, 1}};
-    rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, cur->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    rec_CmdCopyImage(cb, sc ? sc->image : b->image, VK_IMAGE_LAYOUT_GENERAL, cur->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     vk_full_barrier(cb);
     static uint32_t kw, kh;  // (the size the other copy was made at)
     if (kw != w || kh != h) ok = false, fg.have[!s] = false;
@@ -10428,7 +10440,7 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     static float sharp;
     if (radius < 0) {
         radius = ENV("LARECOMP_FG_RADIUS") ? atoi(ENV("LARECOMP_FG_RADIUS")) : 4;
-        sharp = ENV("LARECOMP_FG_SHARP") ? (float)atof(ENV("LARECOMP_FG_SHARP")) : 0.2f;
+        sharp = ENV("LARECOMP_FG_SHARP") ? (float)atof(ENV("LARECOMP_FG_SHARP")) : 0;  // (off: a full-size pass a busy phone GPU cannot spare; the warp's Catmull-Rom keeps it sharp)
         dbg = ENV("LARECOMP_FG_DEBUG") != NULL;
         median = !ENV("LARECOMP_FG_MEDIAN") || atoi(ENV("LARECOMP_FG_MEDIAN"));
     }
@@ -10442,8 +10454,16 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     float pl[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G};
     VkImageView li[2] = {post_view(cur), post_view(prev)};
     post_pass(cb, "fg_luma.frag", li, 2, L, pl, false);
-    VkImageView mi[2] = {post_view(L), post_view(L)};  // (fg_match reads no blocks: any view)
-    post_pass(cb, "fg_match.frag", mi, 2, b0, pl, false);
+    // the coarse level (images 9, 10): the luminance at a quarter of the size and its blocks, the fine match's start
+    uint32_t cw = lw / 4 > 8 ? lw / 4 : 8, ch = lh / 4 > 8 ? lh / 4 : 8, cgw = (cw + G - 1) / G, cgh = (ch + G - 1) / G;
+    TexBackend *Lc = fg_image(9, cw, ch, hf), *bc = fg_image(10, cgw, cgh, hf);
+    float plc[8] = {1.0f / (float)cw, 1.0f / (float)ch, (float)radius, (float)G};
+    post_pass(cb, "fg_luma.frag", li, 2, Lc, plc, false);
+    VkImageView mci[2] = {post_view(Lc), post_view(Lc)};  // (no coarser level: F unread)
+    post_pass(cb, "fg_match.frag", mci, 2, bc, plc, false);
+    float pmf[8] = {1.0f / (float)lw, 1.0f / (float)lh, (float)radius, (float)G, 1.0f};
+    VkImageView mi[2] = {post_view(L), post_view(bc)};
+    post_pass(cb, "fg_match.frag", mi, 2, b0, pmf, false);
     VkImageView ri_[2] = {post_view(L), post_view(b0)};
     post_pass(cb, "fg_refine.frag", ri_, 2, b1, pl, false);
     VkImageView pi[2] = {post_view(L), post_view(b1)};
@@ -10456,9 +10476,11 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
         VkImageView a2[1] = {post_view(m1)};
         post_pass(cb, "fg_median.frag", a2, 1, pk, pm2, false);
     }
-    float pw[8] = {0.5f, 0, 0, 0, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
-    VkImageView wi[3] = {post_view(prev), post_view(cur), post_view(pk)};
-    post_pass(cb, "fg_warp.frag", wi, 3, out, pw, false);
+    float pw[8] = {0.5f, sc ? 1.0f : 0.0f, 0, 0, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
+    static const VkComponentMapping id = {0};
+    VkImageView bv = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);  // (raw)
+    VkImageView wi[4] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur)};
+    post_pass(cb, "fg_warp.frag", wi, 4, out, pw, false);
     if (sharp > 0) {
         TexBackend *o2 = fg_image(7, w, h, f);
         float ps[8] = {sharp};
@@ -10469,8 +10491,12 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     vk_full_barrier(cb);
     // (shown as b would be: its contents' part and scale)
     out->scalable = b->scalable, out->sx = b->sx, out->sy = b->sy, out->ax = b->ax, out->ay = b->ay;
-    static bool logged;
-    if (!logged) { logged = true; LOG("[fg] frame generation: %ux%u, flow %ux%u, blocks %ux%u\n", w, h, lw, lh, gw, gh); }
+    static int logged = -1;
+    if (logged != (sc != NULL)) {
+        logged = sc != NULL;
+        LOG("[fg] frame generation: %ux%u, flow %ux%u, blocks %ux%u, %s\n", w, h, lw, lh, gw, gh,
+            sc ? "the HUD from the real frame" : "the whole image (no picture before the HUD)");
+    }
     return out;
 }
 

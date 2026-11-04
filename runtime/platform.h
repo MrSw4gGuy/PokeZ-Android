@@ -76,8 +76,12 @@ double plat_thermal_scale(double now);
 // The presenting thread's frame: what it took and what it may take (Android's performance hints, ADPF: the CPU clocks
 // it keeps follow the real frame budget, not a guess)
 void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
+// The rate the window's content is made at (an SDL_Window; fps 0: no preference): the display's adaptive refresh
+// follows it instead of guessing from the presents
+void plat_frame_rate_hint(void *sdl_window, float fps);
 #else
 static inline void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) { (void)work_ns, (void)target_ns; }
+static inline void plat_frame_rate_hint(void *sdl_window, float fps) { (void)sdl_window, (void)fps; }
 static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
 #endif
 

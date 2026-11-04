@@ -714,6 +714,10 @@ static void create_device(void) {
         ext[n_ext++] = "VK_EXT_queue_family_foreign";
     }
 #endif
+    // a present's "not before" time and when each was shown (frame generation: the real frame half a period after the
+    // in-between one, without holding the render thread; Android's swapchain has it on every device)
+    g_vk.display_timing = has_ext(ep, ne, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && !ENV("LARECOMP_NO_DISPLAY_TIMING");
+    if (g_vk.display_timing) ext[n_ext++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
@@ -1261,6 +1265,7 @@ static void create_swapchain(void) {
 
 static void recreate_swapchain(void) {
     rec_drain();  // (every queued present and submission made: the queue is idle for the wait)
+    rec_wait_late();  // (and the pacer's, frame generation)
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
 }
@@ -1343,11 +1348,15 @@ bool vk_frame_begin(const float clear[4]) {
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     WAITING_AT(0, vk_wait_seq(slot_seq[slot]));
     VkResult r;
+    rec_swapchain_lock();  // (the pacer's present may be in flight: record.c late_main)
     WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image));
+    rec_swapchain_unlock();
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
+        rec_swapchain_lock();
         WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE,
                                           &cur_frame.image));
+        rec_swapchain_unlock();
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
@@ -1733,6 +1742,10 @@ static void hdr_shot_report(const void *px) {
 
 // End rendering into the window image and present it. shot_path: also save the window image as PNG.
 uint64_t renderer_present_count(void);
+// The next vk_frame_end's present: frame_after > 0, made by the recorder's pacer delay_ns after that submission is done
+// (frame generation, record.c late_main). (g_vk.display_timing) each named frame_gid, +1 per present.
+static uint64_t frame_after, frame_delay;
+static uint32_t frame_gid;
 void vk_frame_end(const char *shot_path) {
     if (!cur_frame.ok) return;
     if (ab_on && ENV("LARECOMP_VK_ADDR_TEST") && renderer_present_count() == 600) {  // (test: the report without a fault)
@@ -1788,7 +1801,14 @@ void vk_frame_end(const char *shot_path) {
     // g_vk_frame_waits[2]; an out-of-date result makes the next vk_frame_begin recreate the swapchain). The present
     // watch runs there too, after it (vk_present_watch); what it finds is acted on here.
     static uint64_t present_id;  // (VK_KHR_present_id: increasing over all swapchains)
-    rec_QueuePresentKHR(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0);
+    if (frame_after) {
+        rec_QueuePresentKHR_late(done_sem[img], g_vk.swapchain, img, g_vk.display_timing ? ++frame_gid : 0, frame_after, frame_delay);
+        frame_after = 0;
+    } else if (g_vk.display_timing) {  // (named: LARECOMP_FG_TIMING reads when each was shown)
+        rec_QueuePresentKHR_at(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0, ++frame_gid, 0);
+    } else {
+        rec_QueuePresentKHR(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0);
+    }
     atomic_fetch_add(&g_window_frames, 1);
     ui_watch();
     static bool hw_started;
@@ -2012,26 +2032,45 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     extern void vk_hd_switch_frame(void);
     vk_hd_switch_frame();
     black_probe(b, t, frame);
-    // the frame's work goes to the GPU now, in a submission of its own: it starts while we wait for the window's image.
-    // Its GPU time is counted, and the window image's submission's from after its wait (exec.c gpu_timer_add)
     // F1 > Video > Frame generation (exec.c vk_fg_make): while the game runs at 30 fps, an image made between the last
-    // frame and this one is shown first and this one half a period later (half a frame more latency). Its flow passes
-    // go with the frame's submission. At 30 fps = the game's presents 25 - 45 ms apart (an average: the game paces
-    // itself, objects.c present_pace); not after a hitch (the in-between image would be a time no frame stood for).
+    // frame and this one is shown first and this one half a period later (about half a frame more latency). Its flow
+    // passes go with the frame's submission. At 30 fps = the game's presents 25 - 45 ms apart (an average: the game
+    // paces itself, objects.c present_pace); not after a hitch (the in-between image would be a time no frame stood for).
+    // Both are on screen only once the GPU is done with the frame - 10 - 45 ms after it arrives on the phone, where the
+    // GPU at 30 fps is clocked down to just keep up. Half a period after the frame arrived put the two 7 and 27 ms
+    // apart, waiting for the GPU on this thread made every third frame late, and both presented at once the compositor
+    // dropped the in-between one (ready for the same refresh: the newer wins). So the real one's present goes to the
+    // recorder's pacer (record.c late_main): made once the in-between image's submission is done, shown half a period
+    // after that.
     TexBackend *fg_mid = NULL;
-    uint64_t fg_due = 0;
+    uint64_t fg_half = 0, fg_arrived = plat_now_ns();
     {
         static uint64_t fg_last;
         static double fg_period;
-        uint64_t now = SDL_GetTicksNS();
+        uint64_t now = fg_arrived;
         double d = fg_last ? (now - fg_last) / 1e6 : 0;
         fg_last = now;
         if (d > 0 && d < 200) fg_period = fg_period > 0 ? fg_period * 0.9 + d * 0.1 : d;
         bool at30 = fg_period > 25 && fg_period < 45 && d < fg_period * 1.6;
         extern TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make);
         if (g_settings.frame_gen) fg_mid = vk_fg_make(b, frame, at30);
-        if (fg_mid) fg_due = now + (uint64_t)(fg_period * 0.5e6);
+        // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game)
+        plat_frame_rate_hint(window, g_settings.frame_gen || g_settings.fps60 ? 60.0f : 0.0f);
+        static int tm = -1;
+        if (tm < 0) tm = ENV("LARECOMP_FG_TIMING") != NULL;
+        if (tm && g_settings.frame_gen) {  // (how many frames had an in-between image, and why not)
+            static unsigned n, made, slow, none;
+            n++, made += fg_mid != NULL, slow += !at30, none += at30 && !fg_mid;
+            if (n == 60) {
+                LOG("[fg] of 60 frames: %u with an in-between image, %u not at 30 fps (every %.1f ms), %u without one\n",
+                    made, slow, fg_period, none);
+                n = made = slow = none = 0;
+            }
+        }
+        if (fg_mid) fg_half = (uint64_t)(fg_period * 0.5e6);
     }
+    // the frame's work goes to the GPU now, in a submission of its own: it starts while we wait for the window's image.
+    // Its GPU time is counted, and the window image's submission's from after its wait (exec.c gpu_timer_add)
     renderer_submit();
     pp_mark(PP_SUBMIT);
     static const float black[4] = {0, 0, 0, 1};
@@ -2103,14 +2142,14 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
         fg_vx = (float)vx, fg_vy = (float)vy, fg_vw = (float)vw, fg_vh = (float)vh;
-        if (fg_mid) {  // the in-between image, with the overlay, now; this frame at fg_due
+        if (fg_mid) {  // the in-between image, with the overlay, first
             vk_present_draw(cb, fg_mid, (float)vx, (float)vy, (float)vw, (float)vh, pv);
             vk_hdr_mark_base();
             menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
-            vk_frame_end(NULL);
-            uint64_t now = SDL_GetTicksNS();
-            if (fg_due > now && fg_due - now < 40000000) SDL_DelayPrecise(fg_due - now);
+            uint64_t mseq = vk_pending_seq();
+            vk_frame_end(NULL);  // (shown as soon as the GPU is done)
             have = vk_frame_begin(black);
+            if (have) frame_after = mseq, frame_delay = fg_half;  // (the real one's present below: the pacer's)
         }
     }
     if (have) {

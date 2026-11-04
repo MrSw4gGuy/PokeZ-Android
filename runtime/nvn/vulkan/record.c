@@ -89,6 +89,8 @@ bool rec_wait_pipes(void) {
 void rec_set_pipe_resolver(RecPipeResolve f) { pipe_resolve = f; }
 
 #define NOW() plat_now_ns()
+// vkQueueSubmit2 / vkQueuePresentKHR / the swapchain's timing query: the recorder's and the pacer's (late_main)
+static pthread_mutex_t queue_mu = PTHREAD_MUTEX_INITIALIZER;
 #define ADD(v, x) atomic_fetch_add_explicit(&(v), (x), memory_order_relaxed)
 
 static void timed_wait(pthread_cond_t *cv, uint64_t ns) {  // (mu held)
@@ -566,7 +568,9 @@ static void submit_run(const void *p) {
                         .waitSemaphoreInfoCount = a->nwait, .pWaitSemaphoreInfos = &a->wait};
     uint64_t t0 = NOW();
     rq_watch("vkQueueSubmit2", a->seq);  // (a hang dump names it)
+    pthread_mutex_lock(&queue_mu);
     VkResult r = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    pthread_mutex_unlock(&queue_mu);
     rq_watch(NULL, 0);
     uint64_t dt = NOW() - t0;
     if (prof) ADD(r_submit_ns, dt);
@@ -596,18 +600,201 @@ void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq) {
     ENQ_END();
 }
 
-typedef struct { VkSemaphore wait; VkSwapchainKHR swapchain; uint32_t image; uint64_t id; } PresentArgs;
+// after / delay (rec_QueuePresentKHR_late): handed to the pacer thread, shown delay ns after submission `after` is done
+typedef struct {
+    VkSemaphore wait;
+    VkSwapchainKHR swapchain;
+    uint32_t image;
+    uint64_t id;
+    uint32_t gid;
+    uint64_t desired, after, delay;
+} PresentArgs;
 void vk_present_watch(uint64_t id);  // (device.c)
+// (VK_GOOGLE_display_timing) when the last presents were shown, by gid: read here after each present - the swapchain
+// is this thread's - and by the render thread (rec_present_shown)
+static struct { uint32_t gid; uint64_t at; } shown_ring[32];
+static pthread_mutex_t shown_mu = PTHREAD_MUTEX_INITIALIZER;
+uint64_t rec_present_shown(uint32_t gid) {
+    uint64_t at = 0;
+    pthread_mutex_lock(&shown_mu);
+    for (int i = 0; i < 32; i++) if (shown_ring[i].gid == gid) at = shown_ring[i].at;
+    pthread_mutex_unlock(&shown_mu);
+    return at;
+}
+static void present_now(const PresentArgs *a);
+static void present_count(void) {  // (rec_wait_presents)
+    atomic_fetch_add_explicit(&presents_done, 1, memory_order_release);
+    if (on > 0) {
+        pthread_mutex_lock(&mu);
+        pthread_cond_broadcast(&cv_done);
+        pthread_mutex_unlock(&mu);
+    }
+}
+// The swapchain's own lock: its presents (the recorder's and the pacer's) and the render thread's acquire
+// (rec_swapchain_lock), which no longer waits for the pacer's present (rec_wait_presents counts it when handed over:
+// waiting there held the next frame back until the GPU was done with this one - 25 fps instead of 30)
+static pthread_mutex_t sc_mu = PTHREAD_MUTEX_INITIALIZER;
+void rec_swapchain_lock(void) { pthread_mutex_lock(&sc_mu); }
+void rec_swapchain_unlock(void) { pthread_mutex_unlock(&sc_mu); }
+// ---- the pacer (frame generation, device.c): the real frame's present after an in-between image. Both are on screen
+// only once the GPU is done with the frame, and when two images are ready for the same refresh the compositor shows
+// the newer and drops the other: presented one after the other, most in-between images were never seen (under 30 a
+// second reached the screen, LARECOMP_FG_TIMING). So the real one waits here - not on the recorder, whose next
+// submissions keep the GPU fed - until the in-between image's submission is done, and goes then with a "not before"
+// half a period later (VK_GOOGLE_display_timing; without it, after a sleep).
+static pthread_mutex_t late_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t late_cv = PTHREAD_COND_INITIALIZER;
+static PresentArgs late_a;
+static _Atomic uint64_t refresh_ns, grid_at;  // (present_now, display timing: the refresh period and a refresh's time)
+static bool late_have;
+void rec_wait_late(void) {  // (a new swapchain: the pacer's present made first)
+    pthread_mutex_lock(&late_mu);
+    while (late_have) pthread_cond_wait(&late_cv, &late_mu);
+    pthread_mutex_unlock(&late_mu);
+}
+static void *late_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&late_mu);
+        while (!late_have) pthread_cond_wait(&late_cv, &late_mu);
+        PresentArgs a = late_a;
+        pthread_mutex_unlock(&late_mu);
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                                  .pValues = &a.after};
+        vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);  // (a device loss shows up in the next present)
+        uint64_t t = NOW();
+        if (a.gid) {
+            // On the display's refresh grid: the compositor shows the in-between image (present gid - 1) on the first
+            // refresh at least fg_lmin after its submission is done, so the real one goes delay later on that grid
+            // (a little before the refresh: "not before" is compared with the refresh's time). From t + delay alone the
+            // two were one refresh (8 ms at 120 Hz) apart as often as three.
+            static struct { uint32_t gid; uint64_t t; } h[8];
+            static int hi;
+            static double lmin = -1;
+            for (int i = 0; i < 8; i++) {
+                uint64_t at = h[i].gid ? rec_present_shown(h[i].gid) : 0;
+                if (!at) continue;
+                double s = at > h[i].t ? (double)(at - h[i].t) : 0;
+                lmin = lmin < 0 || s < lmin ? s : lmin + (s - lmin) * 0.02;  // (the least it takes, drifting up slowly)
+                h[i].gid = 0;
+            }
+            h[hi].gid = a.gid - 1, h[hi].t = t, hi = (hi + 1) % 8;
+            uint64_t p = refresh_ns, g = grid_at;
+            if (lmin >= 0 && p && g) {
+                uint64_t from = t + (uint64_t)lmin;
+                uint64_t m = from > g ? g + (from - g + p - 1) / p * p : g;  // (the in-between image's refresh)
+                uint64_t k = (a.delay + p / 2) / p;                           // (refreshes between the two)
+                a.desired = m + k * p - p / 4;
+            } else {
+                a.desired = t + a.delay + p;
+            }
+        } else {
+            plat_sleep_until_ns(t + a.delay);
+        }
+        present_now(&a);
+        pthread_mutex_lock(&late_mu);
+        late_have = false;
+        pthread_cond_broadcast(&late_cv);
+        pthread_mutex_unlock(&late_mu);
+    }
+    return NULL;
+}
 static void present_run(const void *p) {
     const PresentArgs *a = p;
+    if (!a->after || on <= 0) {
+        if (a->after) {  // (no recorder: this thread waits)
+            VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                      .pSemaphores = &g_vk.timeline, .pValues = &a->after};
+            vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);
+            PresentArgs b = *a;
+            b.after = 0;  // (counted by present_now)
+            if (b.gid) b.desired = NOW() + b.delay;
+            else plat_sleep_until_ns(NOW() + b.delay);
+            present_now(&b);
+            return;
+        }
+        rec_wait_late();  // (in order: a GPU more than a frame behind had the next in-between image queued before this real one)
+        present_now(a);
+        return;
+    }
+    static bool started;
+    if (!started) {
+        pthread_t th;
+        started = pthread_create(&th, NULL, late_main, NULL) == 0;
+        if (started) pthread_detach(th);
+        else { PresentArgs b = *a; b.after = 0; present_now(&b); return; }
+    }
+    pthread_mutex_lock(&late_mu);
+    while (late_have) pthread_cond_wait(&late_cv, &late_mu);  // (the last one still waiting: rare, a frame's GPU that slow)
+    late_a = *a;
+    late_a.id = 0;  // (no present watch: vkWaitForPresentKHR wants the swapchain on the recorder's thread)
+    late_have = true;
+    pthread_cond_broadcast(&late_cv);
+    pthread_mutex_unlock(&late_mu);
+    present_count();
+}
+static void present_now(const PresentArgs *a) {
+    pthread_mutex_lock(&sc_mu);
+    pthread_mutex_lock(&queue_mu);
     VkPresentIdKHR pid = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &a->id};
-    VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = a->id ? &pid : NULL,
+    VkPresentTimeGOOGLE pt = {a->gid, a->desired};
+    VkPresentTimesInfoGOOGLE pts = {.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .pNext = a->id ? &pid : NULL,
+                                    .swapchainCount = 1, .pTimes = &pt};
+    VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = a->gid ? (void *)&pts : a->id ? (void *)&pid : NULL,
                            .waitSemaphoreCount = 1, .pWaitSemaphores = &a->wait,
                            .swapchainCount = 1, .pSwapchains = &a->swapchain, .pImageIndices = &a->image};
     uint64_t t0 = NOW();
     rq_watch("vkQueuePresentKHR", a->image);
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
     rq_watch(NULL, 0);
+    if (a->gid) {
+        static PFN_vkGetPastPresentationTimingGOOGLE past;
+        if (!past) past = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(g_vk.dev, "vkGetPastPresentationTimingGOOGLE");
+        VkPastPresentationTimingGOOGLE t[16];
+        uint32_t n = 16;
+        if (past && past(g_vk.dev, a->swapchain, &n, t) >= 0 && n) {
+            static int next;
+            pthread_mutex_lock(&shown_mu);
+            for (uint32_t i = 0; i < n; i++) shown_ring[next].gid = t[i].presentID, shown_ring[next].at = t[i].actualPresentTime, next = (next + 1) % 32;
+            pthread_mutex_unlock(&shown_mu);
+            grid_at = t[n - 1].actualPresentTime;
+            {   // (the phone's display changes its rate by itself: asked on every present)
+                static PFN_vkGetRefreshCycleDurationGOOGLE rc;
+                if (!rc) rc = (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(g_vk.dev, "vkGetRefreshCycleDurationGOOGLE");
+                VkRefreshCycleDurationGOOGLE d = {0};
+                if (rc && rc(g_vk.dev, a->swapchain, &d) == VK_SUCCESS && d.refreshDuration &&
+                    (d.refreshDuration > refresh_ns + 200000 || d.refreshDuration + 200000 < refresh_ns)) {  // (not its jitter)
+                    refresh_ns = d.refreshDuration;
+                    LOG("[fg] display refresh %.2f ms\n", d.refreshDuration / 1e6);
+                }
+            }
+            // (LARECOMP_FG_TIMING=1) the time between images on screen, every 2 s: how even the frame generation is, and
+            // how many presents never reached the screen (their ids missing from the compositor's reports)
+            static int tm = -1;
+            if (tm < 0) tm = getenv("LARECOMP_FG_TIMING") != NULL;
+            static uint64_t last_at, t_log;
+            static uint32_t last_id;
+            static unsigned hist[5], nh, dropped;
+            static double sum;
+            for (uint32_t i = 0; tm && i < n; i++) {
+                uint64_t at = t[i].actualPresentTime;
+                if (last_id && t[i].presentID > last_id + 1) dropped += t[i].presentID - last_id - 1;
+                if (t[i].presentID > last_id) last_id = t[i].presentID;
+                if (last_at && at > last_at) {
+                    double d = (at - last_at) / 1e6;
+                    hist[d < 12 ? 0 : d < 21 ? 1 : d < 29 ? 2 : d < 38 ? 3 : 4]++, nh++, sum += d;
+                }
+                last_at = at;
+            }
+            if (tm && nh && NOW() - t_log > 2000000000ull) {
+                LOG("[fg] on screen: %u images, %.1f ms apart on average; under 12 ms %u, 12-21 %u, 21-29 %u, 29-38 %u, "
+                    "more %u; %u never shown\n", nh, sum / nh, hist[0], hist[1], hist[2], hist[3], hist[4], dropped);
+                memset(hist, 0, sizeof hist), nh = 0, sum = 0, dropped = 0, t_log = NOW();
+            }
+        }
+    }
+    pthread_mutex_unlock(&queue_mu);
+    pthread_mutex_unlock(&sc_mu);
     uint64_t dt = NOW() - t0;
     __atomic_fetch_add(&g_vk_frame_waits[2], dt, __ATOMIC_RELAXED);
     if (dt > 250000000) {  // (FIFO waits for the display, a few ms; this long is a stall in the driver or the compositor)
@@ -631,15 +818,24 @@ static void present_run(const void *p) {
         if (n++ < 10) LOG("[vk] present failed: %d\n", r);
         if (r == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); FATAL("vkQueuePresentKHR: device lost\n"); }
     }
-    atomic_fetch_add_explicit(&presents_done, 1, memory_order_release);
-    if (on > 0) {
-        pthread_mutex_lock(&mu);
-        pthread_cond_broadcast(&cv_done);
-        pthread_mutex_unlock(&mu);
-    }
+    if (!a->after) present_count();  // (the pacer's was counted when it was handed over)
 }
+static void rec_present_enqueue(const PresentArgs *ap);
 void rec_QueuePresentKHR(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint64_t present_id) {
-    PresentArgs a = {wait, swapchain, image, present_id};
+    rec_QueuePresentKHR_at(wait, swapchain, image, present_id, 0, 0);
+}
+void rec_QueuePresentKHR_at(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint64_t present_id, uint32_t gid,
+                            uint64_t desired) {
+    PresentArgs a = {wait, swapchain, image, present_id, gid, desired, 0, 0};
+    rec_present_enqueue(&a);
+}
+void rec_QueuePresentKHR_late(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint32_t gid, uint64_t after,
+                              uint64_t delay) {
+    PresentArgs a = {wait, swapchain, image, 0, gid, 0, after, delay};
+    rec_present_enqueue(&a);
+}
+static void rec_present_enqueue(const PresentArgs *ap) {
+    PresentArgs a = *ap;
     presents_queued++;
     if (on <= 0) {  // (the wait is this thread's: idle for the pacer, as before)
         uint64_t t0 = NOW();

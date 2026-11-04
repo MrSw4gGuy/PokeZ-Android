@@ -616,7 +616,9 @@ static const char *builtin_src(const char *name, int *stage) {
     // no motion, a search of +-a.z pixels in steps of 2 and the 3 x 3 around zero. The search wins only clearly (under
     // 0.8 x no motion's difference, and by 0.4 % of white): flat or relit areas stay still. fg_refine.frag: again from
     // the best of the block's and its 8 neighbours' results (a good vector spreads), then +-1 and +-0.5 pixel around it.
-    // Out: xy = the vector (uv), zw = 0 (the "analytic" one: none). a.xy = 1 / the luminance's size.
+    // Out: xy = the vector (uv), zw = 0 (the "analytic" one: none). a.xy = 1 / the luminance's size. fg_match's b.x = 1
+    // (ours): F is a coarse level's result (the same match at a quarter of the size), its vector a candidate and the
+    // search's centre - +-4 pixels alone missed the ground near the camera in a turn, the in-between image a blur there.
     if (!strcmp(name, "fg_match.frag") || !strcmp(name, "fg_refine.frag")) {
         *stage = STAGE_FRAGMENT;
         static const char *common =
@@ -650,8 +652,14 @@ static const char *builtin_src(const char *name, int *stage) {
                      "  prep(c);\n"
                      "  float sa = sad(c, vec2(0.0)), sb = sa, s;\n"
                      "  int R = int(pc.a.z);\n"
+                     "  vec2 v0 = vec2(0.0);\n"
+                     "  if (pc.b.x > 0.5) {\n"  // (the coarse level's vector at this block: the search around it)
+                     "    ivec2 fz = textureSize(F, 0);\n"
+                     "    v0 = floor(texelFetch(F, clamp(ivec2(c / lsz * vec2(fz)), ivec2(0), fz - 1), 0).xy * lsz + 0.5);\n"
+                     "    s = sad(c, v0); if (s < sb) { sb = s; best = v0; }\n"
+                     "  }\n"
                      "  for (int y = -R; y <= R; y += 2)\n"
-                     "    for (int x = -R; x <= R; x += 2) { vec2 v = vec2(x, y); s = sad(c, v); if (s < sb) { sb = s; best = v; } }\n"
+                     "    for (int x = -R; x <= R; x += 2) { vec2 v = v0 + vec2(x, y); s = sad(c, v); if (s < sb) { sb = s; best = v; } }\n"
                      "  for (int y = -1; y <= 1; y++)\n"
                      "    for (int x = -1; x <= 1; x++) { s = sad(c, vec2(x, y)); if (s < sb) { sb = s; best = vec2(x, y); } }\n"
                      "  bool rep = sb < sa * 0.8 - 0.004;\n"
@@ -758,8 +766,16 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(set = 0, binding = 0) uniform sampler2D c0;\n"
                "layout(set = 0, binding = 1) uniform sampler2D c1;\n"
                "layout(set = 0, binding = 2) uniform sampler2D fn;\n"
+               "layout(set = 0, binding = 3) uniform sampler2D hud;\n"
                "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
+               // (a.y = 1: c0 / c1 are the pictures before the HUD and hud is N as shown - where they differ, the HUD:
+               // N's shown pixel as it is, alpha 1 so fg_sharp leaves it. The pixel alone: its 3 x 3 was 18 reads a
+               // pixel, too dear for a phone's GPU already busy at 30 fps)
+               "bool is_hud(ivec2 p) {\n"
+               "  vec3 d = abs(texelFetch(hud, p, 0).rgb - texelFetch(c1, p, 0).rgb);\n"
+               "  return max(d.r, max(d.g, d.b)) > 0.012;\n"
+               "}\n"
                "vec3 cr(sampler2D h, vec2 uv) {\n"
                "  vec2 sz = vec2(textureSize(h, 0)), p = uv * sz, c1 = floor(p - 0.5) + 0.5, f = p - c1;\n"
                "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
@@ -776,6 +792,11 @@ static const char *builtin_src(const char *name, int *stage) {
                "void main() {\n"
                "  vec2 q = gl_FragCoord.xy * pc.b.xy, fs = vec2(textureSize(fn, 0));\n"
                "  float t = pc.a.x;\n"
+               "  if (pc.a.y > 0.5 && is_hud(ivec2(gl_FragCoord.xy))) {\n"
+               "    vec3 hc = texelFetch(hud, ivec2(gl_FragCoord.xy), 0).rgb;\n"
+               "    o = vec4(pc.b.z > 0.5 ? mix(hc, vec3(0.0, 1.0, 0.0), 0.5) : hc, 1.0);\n"
+               "    return;\n"
+               "  }\n"
                "  vec2 v0 = at(q);\n"
                "  vec2 c = q + (1.0 - t) * v0;\n"
                "  for (int i = 0; i < 3; i++) c = q + (1.0 - t) * at(c);\n"
@@ -784,7 +805,12 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (dot(e, e) < 2.25 && inside(c)) {\n"
                "    vec2 r = c - g;\n"
                "    vec3 n1 = cr(c1, c);\n"
-               "    col = inside(r) ? mix(cr(c0, r), n1, t) : n1;\n"
+               // (mixed only where N-1 there agrees: where the vector is wrong the mix was a double image - the
+               // in-between images looked blurred - and N's pixel moved alone stays sharp)
+               "    if (inside(r)) {\n"
+               "      vec3 p0 = cr(c0, r), d = abs(p0 - n1);\n"
+               "      col = mix(mix(p0, n1, t), n1, smoothstep(0.04, 0.12, max(d.r, max(d.g, d.b))));\n"
+               "    } else col = n1;\n"
                "    if (g != vec2(0.0)) dbg.r = 1.0;\n"
                "  } else {\n"
                "    vec2 r = q - t * v0;\n"
@@ -805,7 +831,9 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(location = 0) out vec4 o;\n"
                "void main() {\n"
                "  ivec2 p = ivec2(gl_FragCoord.xy), z = textureSize(t, 0) - 1;\n"
-               "  vec3 c = texelFetch(t, p, 0).rgb, mn = c, mx = c, s = vec3(0.0);\n"
+               "  vec4 c4 = texelFetch(t, p, 0);\n"
+               "  if (c4.a > 0.5) { o = vec4(c4.rgb, 1.0); return; }\n"  // (the HUD, fg_warp's: as it is)
+               "  vec3 c = c4.rgb, mn = c, mx = c, s = vec3(0.0);\n"
                "  for (int y = -1; y <= 1; y++)\n"
                "    for (int x = -1; x <= 1; x++) {\n"
                "      if (x == 0 && y == 0) continue;\n"

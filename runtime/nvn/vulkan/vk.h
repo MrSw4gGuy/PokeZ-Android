@@ -137,6 +137,7 @@ typedef struct {
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, dmabuf;
     bool ahb_import;  // (Android) AHardwareBuffer import: the guest memory the GPU shares (exec.c gmem_import)
+    bool display_timing;  // VK_GOOGLE_display_timing: presents with a time (record.c present_run; frame generation)
     // VK_EXT_vertex_input_dynamic_state (exec.c): the vertex layout is set per draw (vkCmdSetVertexInputEXT), not
     // baked into each pipeline - fewer pipelines. Off: no extension / feature, or LARECOMP_VK_DYN_VERTEX=0.
     bool vids;

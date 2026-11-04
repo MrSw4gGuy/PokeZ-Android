@@ -31,6 +31,15 @@ void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq);
 // none): after a successful present, the recorder runs vk_present_watch(present_id) - vkWaitForPresentKHR needs the
 // swapchain synchronised with the presents (device.c).
 void rec_QueuePresentKHR(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint64_t present_id);
+// (g_vk.display_timing) the same with VK_GOOGLE_display_timing: gid (> 0) names it, shown not before desired
+// (CLOCK_MONOTONIC ns, 0: at once). When each was shown: rec_present_shown(gid) - 0 until the compositor tells.
+void rec_QueuePresentKHR_at(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint64_t present_id, uint32_t gid,
+                            uint64_t desired);
+uint64_t rec_present_shown(uint32_t gid);
+// (frame generation) a present the pacer thread makes once submission `after` is done, shown delay ns after that (with
+// display timing a "not before"; without, a sleep) - the recorder goes on meanwhile. gid as above (0: none).
+void rec_QueuePresentKHR_late(VkSemaphore wait, VkSwapchainKHR swapchain, uint32_t image, uint32_t gid, uint64_t after,
+                              uint64_t delay);
 bool rec_present_recreate(void);  // (and clears it) the last present asked for a new swapchain (OUT_OF_DATE / SUBOPTIMAL)
 
 // ---- descriptor sets (the translating thread only)
@@ -49,6 +58,9 @@ uint64_t rec_submitted(void);          // the latest submission handed to the dr
 void rec_wait_submitted(uint64_t seq); // until the driver has submission seq (seq must have been passed to rec_QueueSubmit2)
 void rec_wait_presents(uint64_t n);    // until the recorder made n presents (rec_presents_queued() counts them)
 uint64_t rec_presents_queued(void);
+void rec_swapchain_lock(void);    // (vkAcquireNextImageKHR against the presents: device.c vk_frame_begin)
+void rec_swapchain_unlock(void);
+void rec_wait_late(void);         // until the pacer's present (rec_QueuePresentKHR_late) is made
 // Everything queued so far is recorded and submitted (the translating thread): before vkDeviceWaitIdle, before
 // recording into a command buffer directly (ImGui), before using the queue outside the ring.
 void rec_drain(void);

@@ -254,6 +254,28 @@ void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) {
     report(s, (int64_t)work_ns);
 }
 
+// ---- the display's rate (platform.h plat_frame_rate_hint): ANativeWindow_setFrameRate (API 30, looked up at run time)
+// on the window SDL made. The phone's adaptive refresh follows what an app presents and took the S25+'s display from
+// 120 Hz down to 30 while the game ran at 30 - with frame generation's 60 images a second shown at 30 Hz, half of them
+// never reached the screen and it looked like 30 fps (LARECOMP_FG_TIMING: "display refresh 33.33 ms"). 0: no preference.
+void plat_frame_rate_hint(void *sdl_window, float fps) {
+    static int (*set)(void *, float, int8_t);
+    static int tried;
+    static float cur = -1;
+    if (fps == cur || !sdl_window) return;
+    if (!tried) {
+        tried = 1;
+        void *h = dlopen("libandroid.so", RTLD_NOW);
+        set = h ? (int (*)(void *, float, int8_t))dlsym(h, "ANativeWindow_setFrameRate") : NULL;
+    }
+    void *nw = SDL_GetPointerProperty(SDL_GetWindowProperties((SDL_Window *)sdl_window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    if (!set || !nw) return;
+    // (compatibility 1, FIXED_SOURCE: content made at that rate - the display goes to it or a multiple of it)
+    int r = set(nw, fps, fps > 0 ? 1 : 0);
+    fprintf(stderr, "[display] frame rate asked: %.0f%s (%d)\n", fps, fps > 0 ? " fps" : " (no preference)", r);
+    cur = fps;
+}
+
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
 // next forecast seconds, to its severe throttling point - 1.0 is that point. Measured on an SM-S936B after ~35 min of
