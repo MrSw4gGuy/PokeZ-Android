@@ -786,6 +786,7 @@ static const char *builtin_src(const char *name, int *stage) {
         return "#version 450\n"
                "layout(set = 0, binding = 0) uniform usampler2D sten;\n"
                "layout(set = 0, binding = 1) uniform sampler2D dep;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D prv;\n"  // (b.y = 1: the frame before's - its z into w)
                "layout(push_constant) uniform P { mat4 m; vec4 a; vec4 b; } pc;\n"
                "layout(location = 0) out vec4 o;\n"
                "void main() {\n"
@@ -795,7 +796,8 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec4 c = pc.m * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);\n"
                "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
                "  float ch = pc.b.x > 0.5 && (texelFetch(sten, q, 0).r & 0xF0u) == 0x30u ? 1.0 : 0.0;\n"
-               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), ch, 0.0);\n"
+               "  float chp = pc.b.y > 0.5 ? texelFetch(prv, ivec2(gl_FragCoord.xy), 0).z : 0.0;\n"
+               "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), ch, chp);\n"
                "}\n";
     }
     // fg_cut.frag (ours): one pixel, the mean of what the coarse level's best vectors leave unexplained (fg_match's z,
@@ -887,6 +889,20 @@ static const char *builtin_src(const char *name, int *stage) {
                "    o = vec4(pc.b.z > 0.5 ? mix(hc, vec3(0.0, 1.0, 0.0), 0.5) : hc, 1.0);\n"
                "    return;\n"
                "  }\n"
+               // (a character in N here, or next to one - fg_cam's z on its 3 x 3: N's pixel as it is, like the HUD. Moved
+               // whole or in blocks, the player's hair and shirt still came apart in patches; as in N they're sharp, at
+               // the game's own 30 fps - the player, which the camera follows, hardly moves on screen)
+               "  if (pc.a.w > 0.5) {\n"
+               "    ivec2 cz = textureSize(cm, 0), cp = ivec2(q * vec2(cz));\n"
+               "    bool near_chr = false;\n"
+               "    for (int y = -1; y <= 1; y++)\n"
+               "      for (int x = -1; x <= 1; x++) near_chr = near_chr || texelFetch(cm, clamp(cp + ivec2(x, y), ivec2(0), cz - 1), 0).z > 0.5;\n"
+               "    if (near_chr) {\n"
+               "      vec3 nc = texelFetch(c1, ivec2(gl_FragCoord.xy), 0).rgb;\n"
+               "      o = vec4(pc.b.z > 0.5 ? mix(nc, vec3(1.0, 1.0, 0.0), 0.5) : nc, 1.0);\n"
+               "      return;\n"
+               "    }\n"
+               "  }\n"
                "  vec2 v0 = at(q);\n"
                "  vec2 c = q + (1.0 - t) * v0;\n"
                "  for (int i = 0; i < 3; i++) c = q + (1.0 - t) * at(c);\n"
@@ -897,9 +913,11 @@ static const char *builtin_src(const char *name, int *stage) {
                "    vec3 n1 = cr(c1, c);\n"
                // (mixed only where N-1 there agrees: where the vector is wrong the mix was a double image - the
                // in-between images looked blurred - and N's pixel moved alone stays sharp)
-               // (a character - fg_cam's z, a.w = 1: bound - N moved alone: their hair and clothes doubled up)
+               // (the point of N is a character - fg_cam's z, a.w = 1: bound: characters stay where N has them (above),
+               // so not a second one here - N's own pixel; moved, a person standing in a camera turn showed twice)
                "    bool chr = pc.a.w > 0.5 && texelFetch(cm, clamp(ivec2(c * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0).z > 0.5;\n"
-               "    if (inside(r) && !chr) {\n"
+               "    if (chr) col = cr(c1, q);\n"
+               "    else if (inside(r)) {\n"
                "      vec3 p0 = cr(c0, r), d = abs(p0 - n1);\n"
                "      col = mix(mix(p0, n1, t), n1, smoothstep(0.04, 0.12, max(d.r, max(d.g, d.b))));\n"
                "    } else col = n1;\n"
@@ -914,7 +932,10 @@ static const char *builtin_src(const char *name, int *stage) {
                "    if (cq.z > 0.5) col = cr(c1, q);\n"
                "    else {\n"
                "      vec2 vb = pc.a.w > 0.5 ? cq.xy : v0, r = q - t * vb;\n"
-               "      col = inside(r) ? cr(c0, r) : cr(c1, q + (1.0 - t) * vb);\n"
+               // (N-1 there a character - the camera image's w, b.w = 1: kept from the frame before - N's pixel instead:
+               // that was the person where they stood in N-1, a ghost of their legs and shoes)
+               "      bool chp = pc.b.w > 0.5 && inside(r) && texelFetch(cm, clamp(ivec2(r * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0).w > 0.5;\n"
+               "      col = chp ? cr(c1, q) : inside(r) ? cr(c0, r) : cr(c1, q + (1.0 - t) * vb);\n"
                "    }\n"
                "    dbg.b = 1.0;\n"
                "  }\n"

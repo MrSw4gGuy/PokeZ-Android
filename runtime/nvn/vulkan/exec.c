@@ -3538,6 +3538,8 @@ void vk_alias_texture_destroyed(NvnTexture *t) {
 static struct { NvnTexture *shown; TexBackend img; uint64_t at; } hdr_snaps[2];
 static uint64_t fg_presents;  // (vk_fg_make's calls: a snapshot's .at - taken since the last one, or an old picture)
 static uint64_t fg_cam_at = ~0ull;  // (fg_cam_now: fg_presents when the camera's motion was made)
+static int fg_cam_slot;               // (its image: 12 + slot - the other is the frame before's, for N-1's characters)
+static uint64_t fg_cam_prev_at = ~0ull;
 static TexBackend *hdr_game;  // (vk_present_draw: this frame's game image, its place in the window, uv crop and flip)
 static float hdr_place[9];
 static void hdr_snapshot(NvnTexture *t);
@@ -10378,7 +10380,7 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 // (0: off), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_HUD=0 (the HUD moved with the rest), LARECOMP_FG_DEBUG=1
 // (tinted: red moved, blue uncovered, green the HUD), LARECOMP_FG_TIMING=1 (device.c: when each image is ready).
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f) {
-    static TexBackend img[13];
+    static TexBackend img[14];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -10423,6 +10425,7 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     // from frames before - the bright tower in the dark after the intro's cutscene - flashed in the in-between images)
     for (int i = 0; sc && i < 2; i++) if (&hdr_snaps[i].img == sc && hdr_snaps[i].at != fg_presents) sc = NULL;
     bool cam_ok = sc && fg_cam_at == fg_presents;  // (fg_cam_now: the camera's motion, made with this frame's picture)
+    bool camp_ok = cam_ok && fg_cam_prev_at + 1 == fg_presents;  // (and the frame before's: N-1's characters)
     fg_presents++;
     static int hud_env = -1;
     if (hud_env < 0) hud_env = !ENV("LARECOMP_FG_HUD") || atoi(ENV("LARECOMP_FG_HUD"));
@@ -10461,7 +10464,9 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     uint32_t gw = (lw + G - 1) / G, gh = (lh + G - 1) / G;
     TexBackend *L = fg_image(2, lw, lh, hf), *b0 = fg_image(3, gw, gh, hf), *b1 = fg_image(4, gw, gh, hf);
     TexBackend *pk = fg_image(5, lw, lh, hf), *out = fg_image(6, w, h, f);
-    TexBackend *cam = cam_ok ? fg_image(12, lw, lh, hf) : NULL;
+    TexBackend *cam = cam_ok ? fg_image(12 + fg_cam_slot, lw, lh, hf) : NULL;
+    TexBackend *camp = cam && camp_ok ? fg_image(13 - fg_cam_slot, lw, lh, hf) : NULL;
+    if (camp && !camp->image) camp = NULL;
     if (cam && !cam->image) cam = NULL;
     float cf = cam ? 1.0f : 0.0f;
     VkImageView camv = cam ? post_view(cam) : post_view(L);  // (b.y: bound)
@@ -10499,6 +10504,7 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     float pw[8] = {0.5f, sc ? 1.0f : 0.0f, cut_at, cf, 1.0f / (float)w, 1.0f / (float)h, dbg ? 1.0f : 0.0f};
     static const VkComponentMapping id = {0};
     VkImageView bv = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);  // (raw)
+    pw[7] = camp ? 1.0f : 0.0f;  // (b.w: the camera image's w is N-1's characters)
     VkImageView wi[6] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur), post_view(cut), camv};
     post_pass(cb, "fg_warp.frag", wi, 6, out, pw, false);
     if (sharp > 0) {
@@ -10535,7 +10541,9 @@ static void fg_cam_now(TexBackend *b, VkCommandBuffer cb) {
     if (!(la > 0 && lb > 0) || (va[3] * vb[3] + va[7] * vb[7] + va[11] * vb[11]) / (la * lb) < 0.95f) return;
     uint32_t w = b->width, h = b->height, lw = w < 640 ? w : 640, lh = (uint32_t)lround((double)h * lw / w);
     if (lh < 8) lh = 8;
-    TexBackend *cam = fg_image(12, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (fg_cam_at + 1 == fg_presents) fg_cam_prev_at = fg_cam_at, fg_cam_slot ^= 1;  // (the last frame's kept as N-1's)
+    else fg_cam_prev_at = ~0ull;
+    TexBackend *cam = fg_image(12 + fg_cam_slot, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT);
     float inv[16], pc[32] = {0};
     inv4(mv_vp[0], inv);
     mul4(mv_vp[1], inv, pc);
@@ -10547,9 +10555,13 @@ static void fg_cam_now(TexBackend *b, VkCommandBuffer cb) {
     VkImageView sv = vk_image_view(zb, VK_IMAGE_VIEW_TYPE_2D, zb->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_STENCIL_BIT);
     if (!zv || !sv) return;
     pc[20] = 1;  // (b.x: the stencil bound)
-    VkImageView ci[2] = {sv, zv};
+    // (input 2: the frame before's camera image, its characters kept in w - b.y = 1 - for the warp's uncovered ground)
+    TexBackend *prevcam = fg_cam_prev_at != ~0ull ? fg_image(13 - fg_cam_slot, lw, lh, VK_FORMAT_R16G16B16A16_SFLOAT) : NULL;
+    if (prevcam && !prevcam->image) prevcam = NULL;
+    pc[21] = prevcam ? 1.0f : 0.0f;
+    VkImageView ci[3] = {sv, zv, prevcam ? post_view(prevcam) : zv};
     post_pc_big = pc, post_nearest_first = true;
-    post_pass(cb, "fg_cam.frag", ci, 2, cam, pc, false);
+    post_pass(cb, "fg_cam.frag", ci, 3, cam, pc, false);
     post_pc_big = NULL, post_nearest_first = false;
     vk_full_barrier(cb);
     fg_cam_at = fg_presents;
@@ -10559,6 +10571,12 @@ static void fg_cam_now(TexBackend *b, VkCommandBuffer cb) {
 static void hdr_snapshot(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (!b->image || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT || b->levels != 1 || b->layers != 1 || b->samples > 1) return;
+    // Frame generation alone (no HDR): the first opaque draw of a frame only - the picture's copy in the game's scenes.
+    // The character creator draws its figure opaque straight into the shown image, part by part: a copy after each
+    // ended the rendering between them, and the body below the chin was lost (in the real frames too)
+    if (!g_vk.hdr)
+        for (int i = 0; i < 2; i++)
+            if (hdr_snaps[i].shown == t && hdr_snaps[i].at == fg_presents && hdr_snaps[i].img.image) return;
     static int next;
     int k = hdr_snaps[0].shown == t ? 0 : hdr_snaps[1].shown == t ? 1 : !hdr_snaps[0].shown ? 0 : !hdr_snaps[1].shown ? 1 : (next ^= 1);
     hdr_snaps[k].shown = t;
@@ -10589,7 +10607,9 @@ static void hdr_snapshot(NvnTexture *t) {
                      .extent = {b->width, b->height, 1}};
     rec_CmdCopyImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     vk_full_barrier(cb);
-    if (g_settings.frame_gen && fg_cam_at != fg_presents) fg_cam_now(b, cb);  // (once a frame: the first, the picture's copy)
+    static int cam_env = -1;  // (LARECOMP_FG_CAM=0: no camera motion - the block search alone)
+    if (cam_env < 0) cam_env = !ENV("LARECOMP_FG_CAM") || atoi(ENV("LARECOMP_FG_CAM"));
+    if (g_settings.frame_gen && cam_env && fg_cam_at != fg_presents) fg_cam_now(b, cb);  // (once a frame: the picture's copy)
 }
 
 // HDR output (F1 > Video > HDR; device.c vk_frame_end): the window's SDR image (sdr; base: its copy from before the
