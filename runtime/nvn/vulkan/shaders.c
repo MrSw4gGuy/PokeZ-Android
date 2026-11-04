@@ -993,7 +993,9 @@ static const char *builtin_src(const char *name, int *stage) {
                // walking: N-1 along the still world's motion (the camera's, fg_cam), not the character's vector next
                // to it that spread there (a halo round the player))
                "    vec4 cq = pc.a.w > 0.5 ? texelFetch(cm, clamp(ivec2(q * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0) : vec4(v0, 0.0, 0.0);\n"
-               "    if (cq.z > 0.5) col = cr(c1, q);\n"
+               // (a character in N at q and the fixed point not found: N moved by q's own vector - fg_lk's field is
+               // smooth there. N's pixel unmoved instead, next to moved ones, left seams across the player's body)
+               "    if (cq.z > 0.5) col = pc.a.w > 1.5 ? cr(c1, q) : cr(c1, q + (1.0 - t) * v0);\n"
                "    else {\n"
                "      vec2 vb = pc.a.w > 0.5 ? cq.xy : v0, r = q - t * vb;\n"
                // (N-1 there a character - the camera image's w, b.w = 1: kept from the frame before - N's pixel instead:
