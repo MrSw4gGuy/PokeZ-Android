@@ -727,6 +727,15 @@ static const char *builtin_src(const char *name, int *stage) {
                "    }\n"
                "  return s / 9.0;\n"
                "}\n"
+               "float err_wide(vec2 p, vec2 v) {\n"  // (5 x 5 luminance pixels, every other one)
+               "  float s = 0.0;\n"
+               "  for (int y = -2; y <= 2; y += 2)\n"
+               "    for (int x = -2; x <= 2; x += 2) {\n"
+               "      vec2 q = p + vec2(x, y);\n"
+               "      s += abs(texture(L, q / lsz).r - texture(L, (q - v) / lsz).g);\n"
+               "    }\n"
+               "  return s / 9.0;\n"
+               "}\n"
                "void main() {\n"
                "  lsz = 1.0 / pc.a.xy;\n"
                "  vec2 p = gl_FragCoord.xy, va = vec2(0.0);\n"
@@ -743,23 +752,25 @@ static const char *builtin_src(const char *name, int *stage) {
                "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0);\n"
                "    any_rep = any_rep || f[i].w > 0.5;\n"
                "  }\n"
-               // (a character: whichever fits best - the camera's vector, none (the player's, following the camera) or
-               // a block's - with no lean toward the camera's)
+               // (a character, moved whole: the camera's vector (someone standing in the world) or none (the player's,
+               // which the camera follows), whichever fits a wider patch better. The blocks' own vectors tore them -
+               // a block every 4 pixels found its own vector on hair, arms and bags, pieces of them strewn round the
+               // player and round people close by, the more the larger they stood on screen)
                "  if (chr) {\n"
-               "    vec2 best = va; float eb = err(p, va), e = err(p, vec2(0.0));\n"
-               "    if (e < eb) { eb = e; best = vec2(0.0); }\n"
-               "    for (int i = 0; i < 4; i++) { vec2 v = f[i].xy * lsz; e = err(p, v); if (e < eb) { eb = e; best = v; } }\n"
-               "    o = vec4(best / lsz, 0.0, 0.0);\n"
+               "    o = vec4((err_wide(p, vec2(0.0)) < err_wide(p, va) ? vec2(0.0) : va) / lsz, 0.0, 0.0);\n"
                "    return;\n"
                "  }\n"
-               "  if (!any_rep) { o = vec4(va / lsz, 0.0, 0.0); return; }\n"
                "  float ea = err(p, va), eb = 1e9;\n"
                "  vec2 best = va;\n"
-               "  for (int i = 0; i < 4; i++) {\n"
+               "  for (int i = 0; any_rep && i < 4; i++) {\n"
                "    if (f[i].w < 0.5) continue;\n"
                "    vec2 v = f[i].xy * lsz; float e = err(p, v); if (e < eb) { eb = e; best = v; }\n"
                "  }\n"
-               "  o = vec4((eb < ea * 0.8 - 0.004 ? best : va) / lsz, 0.0, 0.0);\n"
+               "  if (!(eb < ea * 0.8 - 0.004)) best = va, eb = ea;\n"
+               // (and no motion, where it fits clearly better: the camera's vector is the scene camera's, and what
+               // another camera draws - the character creator's figure - went off with it: the body vanished)
+               "  if (va != vec2(0.0)) { float e0 = err(p, vec2(0.0)); if (e0 < eb * 0.8 - 0.004) best = vec2(0.0); }\n"
+               "  o = vec4(best / lsz, 0.0, 0.0);\n"
                "}\n";
     }
     // fg_cam.frag (ours, after fsr2_mv.frag): the camera's motion at the flow's size, from the scene depth (reversed,
@@ -893,12 +904,21 @@ static const char *builtin_src(const char *name, int *stage) {
                "      col = mix(mix(p0, n1, t), n1, smoothstep(0.04, 0.12, max(d.r, max(d.g, d.b))));\n"
                "    } else col = n1;\n"
                "    if (g != vec2(0.0)) dbg.r = 1.0;\n"
+               "    if (chr) dbg = vec3(1.0, 1.0, 0.0);\n"  // (debug: a character, yellow)
                "  } else {\n"
-               "    vec2 r = q - t * v0;\n"
-               "    col = inside(r) ? cr(c0, r) : cr(c1, q + (1.0 - t) * v0);\n"
+               // (not found. On a character in N: N's pixel there - the player's, which the camera follows, broke up in
+               // patches of N-1 along its own vector. Elsewhere it was uncovered since t - the ground behind someone
+               // walking: N-1 along the still world's motion (the camera's, fg_cam), not the character's vector next
+               // to it that spread there (a halo round the player))
+               "    vec4 cq = pc.a.w > 0.5 ? texelFetch(cm, clamp(ivec2(q * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0) : vec4(v0, 0.0, 0.0);\n"
+               "    if (cq.z > 0.5) col = cr(c1, q);\n"
+               "    else {\n"
+               "      vec2 vb = pc.a.w > 0.5 ? cq.xy : v0, r = q - t * vb;\n"
+               "      col = inside(r) ? cr(c0, r) : cr(c1, q + (1.0 - t) * vb);\n"
+               "    }\n"
                "    dbg.b = 1.0;\n"
                "  }\n"
-               "  if (pc.b.z > 0.5) col = mix(col, dbg, 0.5 * max(dbg.r, dbg.b));\n"
+               "  if (pc.b.z > 0.5) col = mix(col, dbg, 0.5 * max(dbg.r, max(dbg.g, dbg.b)));\n"
                "  o = vec4(col, 0.0);\n"
                "}\n";
     }
