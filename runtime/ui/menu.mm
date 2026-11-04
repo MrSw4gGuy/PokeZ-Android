@@ -518,6 +518,16 @@ static void tab_display(bool in_game) {
                                    TR("Running at 30 fps for now: 60 wasn't held (back to 60 when there is room).",
                                       "Rodando a 30 fps por enquanto: 60 não segurou (volta para 60 quando houver folga)."));
         }
+        // (vulkan/exec.c vk_fg_make, device.c backend_present_now: only while the game presents at 30 fps)
+        opt_toggle(TR("Frame generation", "Geração de quadros"), &g_settings.frame_gen, false,
+                   TR("While the game runs at 30 fps, an image is made between each two frames from their motion and "
+                      "shown in between: 60 images a second on screen, with the game's work still at 30 (cheap on the "
+                      "GPU, about half a frame more input delay). Fast motion and edges of moving things can smear a "
+                      "little. Does nothing while the game itself runs at 60.",
+                      "Enquanto o jogo roda a 30 fps, uma imagem é criada entre cada dois quadros a partir do movimento "
+                      "deles e mostrada no meio: 60 imagens por segundo na tela, com o trabalho do jogo ainda a 30 "
+                      "(barato para a GPU, cerca de meio quadro a mais de atraso nos comandos). Movimentos rápidos e "
+                      "bordas de coisas em movimento podem borrar um pouco. Não faz nada quando o próprio jogo roda a 60."));
     }
     {   // (runtime/nvn/vulkan/textures.c vk_sampler_settings: every sampler made again, at once)
         int tf = g_settings.aniso16 ? 1 : 0;

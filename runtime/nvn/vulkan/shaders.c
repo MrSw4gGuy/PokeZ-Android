@@ -587,6 +587,235 @@ static const char *builtin_src(const char *name, int *stage) {
                "  out_Target0 = color;\n"
                "}\n";
     }
+    // ---- Frame generation (exec.c fg_*, F1 > Video > Frame generation): the game at 30 fps shown at 60, an image made
+    // between each two real ones by optical flow. Adapted from letsgo-recomp's flow method (github.com/raulzrrs/
+    // letsgo-recomp, MIT licence, Copyright (c) 2026 raulzito12345rrs: third_party/letsgo-fg/LICENSE) to the images alone - Pokémon Z-A
+    // gives us no motion vectors or scene depth here, so the "analytic" vector is no motion (the HUD, still scenery)
+    // and the block search must beat it clearly. Vectors are N's uv - N-1's.
+    // fg_luma.frag: the luminance of N's (r) and N-1's (g) images at the flow's size (~640 wide), 4 bilinear taps a
+    // pixel. a.xy = 1 / that size.
+    if (!strcmp(name, "fg_luma.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t1;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t0;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy * pc.a.xy, d = pc.a.xy * 0.25;\n"
+               "  vec3 a = vec3(0.0), b = vec3(0.0);\n"
+               "  for (int i = 0; i < 4; i++) {\n"
+               "    vec2 q = uv + vec2((i & 1) != 0 ? d.x : -d.x, (i & 2) != 0 ? d.y : -d.y);\n"
+               "    a += texture(t1, q).rgb; b += texture(t0, q).rgb;\n"
+               "  }\n"
+               "  o = vec4(lum(a * 0.25), lum(b * 0.25), 0.0, 0.0);\n"
+               "}\n";
+    }
+    // fg_match.frag: one 8 x 8 block every a.w luminance pixels, its 16 samples against N-1 moved by each candidate:
+    // no motion, a search of +-a.z pixels in steps of 2 and the 3 x 3 around zero. The search wins only clearly (under
+    // 0.8 x no motion's difference, and by 0.4 % of white): flat or relit areas stay still. fg_refine.frag: again from
+    // the best of the block's and its 8 neighbours' results (a good vector spreads), then +-1 and +-0.5 pixel around it.
+    // Out: xy = the vector (uv), zw = 0 (the "analytic" one: none). a.xy = 1 / the luminance's size.
+    if (!strcmp(name, "fg_match.frag") || !strcmp(name, "fg_refine.frag")) {
+        *stage = STAGE_FRAGMENT;
+        static const char *common =
+            "#version 450\n"
+            "layout(set = 0, binding = 0) uniform sampler2D L;\n"
+            "layout(set = 0, binding = 1) uniform sampler2D F;\n"
+            "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+            "layout(location = 0) out vec4 o;\n"
+            "vec2 lsz;\n"
+            "float na[16];\n"
+            "void prep(vec2 c) {\n"
+            "  for (int y = 0; y < 4; y++)\n"
+            "    for (int x = 0; x < 4; x++) na[y * 4 + x] = texture(L, (c + vec2(float(x * 2 - 3), float(y * 2 - 3))) / lsz).r;\n"
+            "}\n"
+            "float sad(vec2 c, vec2 v) {\n"
+            "  float s = 0.0;\n"
+            "  for (int y = 0; y < 4; y++)\n"
+            "    for (int x = 0; x < 4; x++) {\n"
+            "      vec2 q = c + vec2(float(x * 2 - 3), float(y * 2 - 3));\n"
+            "      s += abs(na[y * 4 + x] - texture(L, (q - v) / lsz).g);\n"
+            "    }\n"
+            "  return s / 16.0;\n"
+            "}\n";
+        static char src[2][4096];
+        int k = !strcmp(name, "fg_refine.frag");
+        if (!src[k][0] && !k)
+            snprintf(src[k], sizeof src[k], "%s%s", common,
+                     "void main() {\n"
+                     "  lsz = 1.0 / pc.a.xy;\n"
+                     "  vec2 c = (floor(gl_FragCoord.xy) + 0.5) * pc.a.w, best = vec2(0.0);\n"
+                     "  prep(c);\n"
+                     "  float sa = sad(c, vec2(0.0)), sb = sa, s;\n"
+                     "  int R = int(pc.a.z);\n"
+                     "  for (int y = -R; y <= R; y += 2)\n"
+                     "    for (int x = -R; x <= R; x += 2) { vec2 v = vec2(x, y); s = sad(c, v); if (s < sb) { sb = s; best = v; } }\n"
+                     "  for (int y = -1; y <= 1; y++)\n"
+                     "    for (int x = -1; x <= 1; x++) { s = sad(c, vec2(x, y)); if (s < sb) { sb = s; best = vec2(x, y); } }\n"
+                     "  bool rep = sb < sa * 0.8 - 0.004;\n"
+                     "  o = vec4(rep ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+                     "}\n");
+        else if (!src[k][0])
+            snprintf(src[k], sizeof src[k], "%s%s", common,
+                     "void main() {\n"
+                     "  lsz = 1.0 / pc.a.xy;\n"
+                     "  ivec2 g = ivec2(gl_FragCoord.xy), gs = textureSize(F, 0);\n"
+                     "  vec2 c = (vec2(g) + 0.5) * pc.a.w, best = vec2(0.0);\n"
+                     "  prep(c);\n"
+                     "  float sa = sad(c, vec2(0.0)), sb = sa, s;\n"
+                     "  for (int y = -1; y <= 1; y++)\n"
+                     "    for (int x = -1; x <= 1; x++) {\n"
+                     "      vec2 v = texelFetch(F, clamp(g + ivec2(x, y), ivec2(0), gs - 1), 0).xy * lsz;\n"
+                     "      s = sad(c, v); if (s < sb) { sb = s; best = v; }\n"
+                     "    }\n"
+                     "  for (int k = 0; k < 2; k++) {\n"
+                     "    float h = k == 0 ? 1.0 : 0.5;\n"
+                     "    vec2 b0 = best;\n"
+                     "    for (int i = 0; i < 4; i++) {\n"
+                     "      vec2 w = b0 + h * (i == 0 ? vec2(1.0, 0.0) : i == 1 ? vec2(-1.0, 0.0) : i == 2 ? vec2(0.0, 1.0) : vec2(0.0, -1.0));\n"
+                     "      s = sad(c, w); if (s < sb) { sb = s; best = w; }\n"
+                     "    }\n"
+                     "  }\n"
+                     "  bool rep = sb < sa * 0.8 - 0.004;\n"
+                     "  o = vec4(rep ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+                     "}\n");
+        return src[k];
+    }
+    // fg_pick.frag: per luminance pixel, no motion against the four nearest blocks' vectors on the pixel's 3 x 3 (a
+    // block's only clearly better, as above): block edges follow the picture instead of the 4-pixel grid. Out: xy = the
+    // vector (uv). a.xy = 1 / the luminance's size, a.w = the blocks' stride.
+    if (!strcmp(name, "fg_pick.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D L;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D F;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec2 lsz;\n"
+               "float err(vec2 p, vec2 v) {\n"
+               "  float s = 0.0;\n"
+               "  for (int y = -1; y <= 1; y++)\n"
+               "    for (int x = -1; x <= 1; x++) {\n"
+               "      vec2 q = p + vec2(x, y);\n"
+               "      s += abs(texture(L, q / lsz).r - texture(L, (q - v) / lsz).g);\n"
+               "    }\n"
+               "  return s / 9.0;\n"
+               "}\n"
+               "void main() {\n"
+               "  lsz = 1.0 / pc.a.xy;\n"
+               "  vec2 p = gl_FragCoord.xy;\n"
+               "  ivec2 gs = textureSize(F, 0), g0 = ivec2(floor(p / pc.a.w - 0.5));\n"
+               "  vec2 f[4];\n"
+               "  bool any_rep = false;\n"
+               "  for (int i = 0; i < 4; i++) {\n"
+               "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0).xy;\n"
+               "    any_rep = any_rep || f[i] != vec2(0.0);\n"
+               "  }\n"
+               "  if (!any_rep) { o = vec4(0.0); return; }\n"
+               "  float ea = err(p, vec2(0.0)), eb = 1e9;\n"
+               "  vec2 best = vec2(0.0);\n"
+               "  for (int i = 0; i < 4; i++) {\n"
+               "    if (f[i] == vec2(0.0)) continue;\n"
+               "    vec2 v = f[i] * lsz; float e = err(p, v); if (e < eb) { eb = e; best = v; }\n"
+               "  }\n"
+               "  o = vec4(eb < ea * 0.8 - 0.004 ? best / lsz : vec2(0.0), 0.0, 0.0);\n"
+               "}\n";
+    }
+    // fg_median.frag (ours, not letsgo-recomp's: they start from the renderer's motion vectors, a smooth field): the
+    // vector median of each pixel's 3 x 3 at a spacing of a.z pixels (the one of the nine nearest the other eight).
+    // The pick alone left flat ground and edges speckled - a pixel without a clear match stays still between moving
+    // neighbours, and the warp then tears there; run at spacing 1 and 2.
+    if (!strcmp(name, "fg_median.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D F;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), z = textureSize(F, 0) - 1, d = ivec2(int(pc.a.z));\n"
+               "  vec2 v[9];\n"
+               "  for (int i = 0; i < 9; i++) v[i] = texelFetch(F, clamp(p + (ivec2(i % 3, i / 3) - 1) * d, ivec2(0), z), 0).xy;\n"
+               "  float bs = 1e30; vec2 best = v[4];\n"
+               "  for (int i = 0; i < 9; i++) {\n"
+               "    float s = 0.0;\n"
+               "    for (int j = 0; j < 9; j++) { vec2 e = abs(v[i] - v[j]); s += e.x + e.y; }\n"
+               "    if (s < bs) { bs = s; best = v[i]; }\n"
+               "  }\n"
+               "  o = vec4(best, 0.0, 0.0);\n"
+               "}\n";
+    }
+    // fg_warp.frag: the in-between image at t (a.x, 0..1 from N-1 to N) at the game image's size: c0 = N-1, c1 = N,
+    // fn = the vectors. Each pixel q: the point p of N that is at q at t (q + (1 - t) v(p) = p, three fixed-point
+    // steps), checked with its own vector (within 1.5 of the field's pixels: found) - then N there mixed by t with N-1
+    // where the point was (p - v). Not found (uncovered since t): N-1 along q's own vector. Both images Catmull-Rom (5
+    // bilinear taps): bilinear, the moved image was softer than the real ones. b.xy = 1 / the output's size, b.z = 1:
+    // tinted (LARECOMP_FG_DEBUG: red where moved, blue not found).
+    if (!strcmp(name, "fg_warp.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D c0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D c1;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D fn;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 cr(sampler2D h, vec2 uv) {\n"
+               "  vec2 sz = vec2(textureSize(h, 0)), p = uv * sz, c1 = floor(p - 0.5) + 0.5, f = p - c1;\n"
+               "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+               "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);\n"
+               "  vec2 w12 = w1 + w2, t0 = (c1 - 1.0) / sz, t3 = (c1 + 2.0) / sz, t12 = (c1 + w2 / w12) / sz;\n"
+               "  vec3 r = texture(h, vec2(t12.x, t0.y)).rgb * w12.x * w0.y + texture(h, vec2(t0.x, t12.y)).rgb * w0.x * w12.y\n"
+               "         + texture(h, t12).rgb * w12.x * w12.y + texture(h, vec2(t3.x, t12.y)).rgb * w3.x * w12.y\n"
+               "         + texture(h, vec2(t12.x, t3.y)).rgb * w12.x * w3.y;\n"
+               "  float ws = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;\n"
+               "  return clamp(r / ws, 0.0, 1.0);\n"
+               "}\n"
+               "vec2 at(vec2 uv) { ivec2 z = textureSize(fn, 0); return texelFetch(fn, clamp(ivec2(uv * vec2(z)), ivec2(0), z - 1), 0).xy; }\n"
+               "bool inside(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0))); }\n"
+               "void main() {\n"
+               "  vec2 q = gl_FragCoord.xy * pc.b.xy, fs = vec2(textureSize(fn, 0));\n"
+               "  float t = pc.a.x;\n"
+               "  vec2 v0 = at(q);\n"
+               "  vec2 c = q + (1.0 - t) * v0;\n"
+               "  for (int i = 0; i < 3; i++) c = q + (1.0 - t) * at(c);\n"
+               "  vec2 g = at(c), e = (q + (1.0 - t) * g - c) * fs;\n"
+               "  vec3 col, dbg = vec3(0.0);\n"
+               "  if (dot(e, e) < 2.25 && inside(c)) {\n"
+               "    vec2 r = c - g;\n"
+               "    vec3 n1 = cr(c1, c);\n"
+               "    col = inside(r) ? mix(cr(c0, r), n1, t) : n1;\n"
+               "    if (g != vec2(0.0)) dbg.r = 1.0;\n"
+               "  } else {\n"
+               "    vec2 r = q - t * v0;\n"
+               "    col = inside(r) ? cr(c0, r) : cr(c1, q + (1.0 - t) * v0);\n"
+               "    dbg.b = 1.0;\n"
+               "  }\n"
+               "  if (pc.b.z > 0.5) col = mix(col, dbg, 0.5 * max(dbg.r, dbg.b));\n"
+               "  o = vec4(col, 0.0);\n"
+               "}\n";
+    }
+    // fg_sharp.frag: the in-between image sharpened back (a.x: the strength; mixing N-1 and N a fraction of a pixel
+    // apart softens what both show): unsharp on the 4 neighbours, clamped to the 3 x 3's range (no halos).
+    if (!strcmp(name, "fg_sharp.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), z = textureSize(t, 0) - 1;\n"
+               "  vec3 c = texelFetch(t, p, 0).rgb, mn = c, mx = c, s = vec3(0.0);\n"
+               "  for (int y = -1; y <= 1; y++)\n"
+               "    for (int x = -1; x <= 1; x++) {\n"
+               "      if (x == 0 && y == 0) continue;\n"
+               "      vec3 n = texelFetch(t, clamp(p + ivec2(x, y), ivec2(0), z), 0).rgb;\n"
+               "      mn = min(mn, n); mx = max(mx, n);\n"
+               "      if (x == 0 || y == 0) s += n;\n"
+               "    }\n"
+               "  o = vec4(clamp(c + pc.a.x * (c - s * 0.25), mn, mx), 1.0);\n"
+               "}\n";
+    }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
     // b.xy = image size. The lobe is limited so the result stays inside the neighbours' range; noise is damped.
     // Box downscale (exec.c post_process): the image is larger than its place in the window (internal resolution

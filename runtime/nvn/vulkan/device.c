@@ -2014,6 +2014,24 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     black_probe(b, t, frame);
     // the frame's work goes to the GPU now, in a submission of its own: it starts while we wait for the window's image.
     // Its GPU time is counted, and the window image's submission's from after its wait (exec.c gpu_timer_add)
+    // F1 > Video > Frame generation (exec.c vk_fg_make): while the game runs at 30 fps, an image made between the last
+    // frame and this one is shown first and this one half a period later (half a frame more latency). Its flow passes
+    // go with the frame's submission. At 30 fps = the game's presents 25 - 45 ms apart (an average: the game paces
+    // itself, objects.c present_pace); not after a hitch (the in-between image would be a time no frame stood for).
+    TexBackend *fg_mid = NULL;
+    uint64_t fg_due = 0;
+    {
+        static uint64_t fg_last;
+        static double fg_period;
+        uint64_t now = SDL_GetTicksNS();
+        double d = fg_last ? (now - fg_last) / 1e6 : 0;
+        fg_last = now;
+        if (d > 0 && d < 200) fg_period = fg_period > 0 ? fg_period * 0.9 + d * 0.1 : d;
+        bool at30 = fg_period > 25 && fg_period < 45 && d < fg_period * 1.6;
+        extern TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make);
+        if (g_settings.frame_gen) fg_mid = vk_fg_make(b, frame, at30);
+        if (fg_mid) fg_due = now + (uint64_t)(fg_period * 0.5e6);
+    }
     renderer_submit();
     pp_mark(PP_SUBMIT);
     static const float black[4] = {0, 0, 0, 1};
@@ -2025,6 +2043,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         static int warned;
         if (warned++ < 20) LOG("[vk] acquire blocked %llums\n", (unsigned long long)(nd / 1000000));
     }
+    float fg_vx = 0, fg_vy = 0, fg_vw = 0, fg_vh = 0;  // (the game image's place in the window: both presents')
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
         extern void widescreen_frame_end(uint64_t frame);
@@ -2083,7 +2102,21 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
-        vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+        fg_vx = (float)vx, fg_vy = (float)vy, fg_vw = (float)vw, fg_vh = (float)vh;
+        if (fg_mid) {  // the in-between image, with the overlay, now; this frame at fg_due
+            vk_present_draw(cb, fg_mid, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+            vk_hdr_mark_base();
+            menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+            vk_frame_end(NULL);
+            uint64_t now = SDL_GetTicksNS();
+            if (fg_due > now && fg_due - now < 40000000) SDL_DelayPrecise(fg_due - now);
+            have = vk_frame_begin(black);
+        }
+    }
+    if (have) {
+        VkCommandBuffer cb = vk_cmd();
+        float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, g_shot_crop[0], g_shot_crop[1], g_shot_crop[2], g_shot_crop[3]};
+        vk_present_draw(cb, b, (float)fg_vx, (float)fg_vy, (float)fg_vw, (float)fg_vh, pv);
         pp_mark(PP_BLIT);
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
