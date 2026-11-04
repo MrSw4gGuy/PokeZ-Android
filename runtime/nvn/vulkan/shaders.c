@@ -752,12 +752,14 @@ static const char *builtin_src(const char *name, int *stage) {
                "    f[i] = texelFetch(F, clamp(g0 + ivec2(i & 1, i >> 1), ivec2(0), gs - 1), 0);\n"
                "    any_rep = any_rep || f[i].w > 0.5;\n"
                "  }\n"
-               // (a character, moved whole: the camera's vector (someone standing in the world) or none (the player's,
-               // which the camera follows), whichever fits a wider patch better. The blocks' own vectors tore them -
-               // a block every 4 pixels found its own vector on hair, arms and bags, pieces of them strewn round the
-               // player and round people close by, the more the larger they stood on screen)
+               // (a character: the best fit over a wider patch of the camera's vector (someone standing in the world),
+               // none (the player's, which the camera follows) and the blocks' - only a start: chosen alone, the blocks'
+               // vectors tore hair, arms and bags into patches; fg_lk refines it into a smooth field)
                "  if (chr) {\n"
-               "    o = vec4((err_wide(p, vec2(0.0)) < err_wide(p, va) ? vec2(0.0) : va) / lsz, 0.0, 0.0);\n"
+               "    vec2 best = va; float eb = err_wide(p, va), e = err_wide(p, vec2(0.0));\n"
+               "    if (e < eb) eb = e, best = vec2(0.0);\n"
+               "    for (int i = 0; i < 4; i++) { vec2 v = f[i].xy * lsz; e = err_wide(p, v); if (e < eb) eb = e, best = v; }\n"
+               "    o = vec4(best / lsz, 0.0, 0.0);\n"
                "    return;\n"
                "  }\n"
                "  float ea = err(p, va), eb = 1e9;\n"
@@ -798,6 +800,56 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float ch = pc.b.x > 0.5 && (texelFetch(sten, q, 0).r & 0xF0u) == 0x30u ? 1.0 : 0.0;\n"
                "  float chp = pc.b.y > 0.5 ? texelFetch(prv, ivec2(gl_FragCoord.xy), 0).z : 0.0;\n"
                "  o = vec4(c.w > 0.0 ? uv - puv : vec2(0.0), ch, chp);\n"
+               "}\n";
+    }
+    // fg_lk.frag (ours): the characters' own motion - they move on their own, and no motion vectors come with them -
+    // refined per pixel by Lucas-Kanade on the luminance (N's r against N-1's g): from fg_pick's vector, four steps of
+    // the 2 x 2 least-squares fit over the pixel's 5 x 5, kept only where they fit better than the start. A window's
+    // fit moves neighbouring pixels alike: the blocks' own vectors alone tore hair and clothes into patches, this
+    // stretches at worst. Other pixels as fg_pick left them. F = fg_pick's, M = fg_cam's (z: a character); a.xy = 1 /
+    // the luminance's size.
+    if (!strcmp(name, "fg_lk.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D L;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D F;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D M;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec2 lsz;\n"
+               "float err(vec2 p, vec2 v) {\n"
+               "  float s = 0.0;\n"
+               "  for (int y = -1; y <= 1; y++)\n"
+               "    for (int x = -1; x <= 1; x++) {\n"
+               "      vec2 q = p + vec2(x, y);\n"
+               "      s += abs(texture(L, q / lsz).r - texture(L, (q - v) / lsz).g);\n"
+               "    }\n"
+               "  return s;\n"
+               "}\n"
+               "void main() {\n"
+               "  lsz = 1.0 / pc.a.xy;\n"
+               "  vec2 p = gl_FragCoord.xy;\n"
+               "  vec4 f = texelFetch(F, ivec2(p), 0);\n"
+               "  ivec2 ms = textureSize(M, 0);\n"
+               "  if (texelFetch(M, clamp(ivec2(p / lsz * vec2(ms)), ivec2(0), ms - 1), 0).z < 0.5) { o = f; return; }\n"
+               "  vec2 v0 = f.xy * lsz, v = v0, dx = vec2(1.0, 0.0) / lsz, dy = vec2(0.0, 1.0) / lsz;\n"
+               "  for (int it = 0; it < 4; it++) {\n"
+               "    float a11 = 0.0, a12 = 0.0, a22 = 0.0, b1 = 0.0, b2 = 0.0;\n"
+               "    for (int y = -2; y <= 2; y++)\n"
+               "      for (int x = -2; x <= 2; x++) {\n"
+               "        vec2 q = p + vec2(x, y), s = (q - v) / lsz;\n"
+               "        float gx = (texture(L, s + dx).g - texture(L, s - dx).g) * 0.5;\n"
+               "        float gy = (texture(L, s + dy).g - texture(L, s - dy).g) * 0.5;\n"
+               "        float e = texture(L, q / lsz).r - texture(L, s).g;\n"
+               "        a11 += gx * gx, a12 += gx * gy, a22 += gy * gy, b1 += gx * e, b2 += gy * e;\n"
+               "      }\n"
+               "    float det = a11 * a22 - a12 * a12;\n"
+               "    if (det < 1e-7) break;\n"
+               // (N-1 at q - v - dv ~ N-1 at q - v - grad . dv = N at q: grad . dv = -e, dv = -A^-1 b)
+               "    vec2 dv = -vec2(a22 * b1 - a12 * b2, a11 * b2 - a12 * b1) / det;\n"
+               "    v += clamp(dv, vec2(-2.0), vec2(2.0));\n"
+               "  }\n"
+               "  o = vec4((err(p, v) < err(p, v0) ? v : v0) / lsz, 0.0, 0.0);\n"
                "}\n";
     }
     // fg_cut.frag (ours): one pixel, the mean of what the coarse level's best vectors leave unexplained (fg_match's z,
@@ -889,10 +941,9 @@ static const char *builtin_src(const char *name, int *stage) {
                "    o = vec4(pc.b.z > 0.5 ? mix(hc, vec3(0.0, 1.0, 0.0), 0.5) : hc, 1.0);\n"
                "    return;\n"
                "  }\n"
-               // (a character in N here, or next to one - fg_cam's z on its 3 x 3: N's pixel as it is, like the HUD. Moved
-               // whole or in blocks, the player's hair and shirt still came apart in patches; as in N they're sharp, at
-               // the game's own 30 fps - the player, which the camera follows, hardly moves on screen)
-               "  if (pc.a.w > 0.5) {\n"
+               // (a.w = 2, LARECOMP_FG_CHARS=0: characters not moved - a character in N here, or next to one, fg_cam's z
+               // on its 3 x 3: N's pixel as it is, like the HUD; sharp, at the game's own 30 fps)
+               "  if (pc.a.w > 1.5) {\n"
                "    ivec2 cz = textureSize(cm, 0), cp = ivec2(q * vec2(cz));\n"
                "    bool near_chr = false;\n"
                "    for (int y = -1; y <= 1; y++)\n"
@@ -913,10 +964,11 @@ static const char *builtin_src(const char *name, int *stage) {
                "    vec3 n1 = cr(c1, c);\n"
                // (mixed only where N-1 there agrees: where the vector is wrong the mix was a double image - the
                // in-between images looked blurred - and N's pixel moved alone stays sharp)
-               // (the point of N is a character - fg_cam's z, a.w = 1: bound: characters stay where N has them (above),
-               // so not a second one here - N's own pixel; moved, a person standing in a camera turn showed twice)
+               // (the point of N is a character - fg_cam's z, a.w >= 1: bound. Moved (fg_lk's field): N's pixel moved
+               // alone, no N-1 mixed in - a double image on hair and clothes. Not moved (a.w = 2): they stay where N has
+               // them (above), so not a second one here - N's own pixel at q; a person in a camera turn showed twice)
                "    bool chr = pc.a.w > 0.5 && texelFetch(cm, clamp(ivec2(c * vec2(textureSize(cm, 0))), ivec2(0), textureSize(cm, 0) - 1), 0).z > 0.5;\n"
-               "    if (chr) col = cr(c1, q);\n"
+               "    if (chr) col = pc.a.w > 1.5 ? cr(c1, q) : n1;\n"
                "    else if (inside(r)) {\n"
                "      vec3 p0 = cr(c0, r), d = abs(p0 - n1);\n"
                "      col = mix(mix(p0, n1, t), n1, smoothstep(0.04, 0.12, max(d.r, max(d.g, d.b))));\n"

@@ -10375,12 +10375,12 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 // before the HUD (hdr_snapshot) and the HUD comes from the real frame; a cut or fade (fg_cut) shows the real frame.
 // Its images: 0, 1 the game's last two frames (copies: the game reuses its window textures), 2 the luminance, 3, 4 the
 // blocks (matched, refined), 5 the per-pixel vectors, 6 the in-between image, 7 it sharpened, 8 the median's first
-// pass, 9, 10 the coarse level (luminance, blocks), 11 a cut (fg_cut), 12 the camera's motion (fg_cam_now).
+// pass, 9, 10 the coarse level (luminance, blocks), 11 a cut (fg_cut), 12, 13 the camera's motion (fg_cam_now: this frame's and the last), 14 the characters' (fg_lk).
 // Research: LARECOMP_FG_RADIUS=<luminance pixels> (the search, 4), LARECOMP_FG_SHARP=<0..1>
-// (0: off), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_HUD=0 (the HUD moved with the rest), LARECOMP_FG_DEBUG=1
+// (0: off), LARECOMP_FG_CHARS=0 (characters not moved: as in N), LARECOMP_FG_MEDIAN=0 (no smoothing), LARECOMP_FG_HUD=0 (the HUD moved with the rest), LARECOMP_FG_DEBUG=1
 // (tinted: red moved, blue uncovered, green the HUD), LARECOMP_FG_TIMING=1 (device.c: when each image is ready).
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f) {
-    static TexBackend img[14];
+    static TexBackend img[15];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -10491,10 +10491,21 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     post_pass(cb, "fg_refine.frag", ri_, 3, b1, pl, false);
     VkImageView pi[3] = {post_view(L), post_view(b1), camv};
     post_pass(cb, "fg_pick.frag", pi, 3, pk, pl, false);
+    // the characters' own motion refined (fg_lk, into image 14), or (LARECOMP_FG_CHARS=0) not moved at all:
+    // shown as in N, at 30 fps (the warp's a.w = 2)
+    static int chars = -1;
+    if (chars < 0) chars = !ENV("LARECOMP_FG_CHARS") || atoi(ENV("LARECOMP_FG_CHARS"));
+    TexBackend *fld = pk;
+    if (cam && chars) {
+        fld = fg_image(14, lw, lh, hf);
+        VkImageView ki[3] = {post_view(L), post_view(pk), camv};
+        post_pass(cb, "fg_lk.frag", ki, 3, fld, pl, false);
+    }
+    if (cam && !chars) cf = 2.0f;
     if (median) {  // (fg_median: spacing 1, then 2 - images 8 and back into 5)
         TexBackend *m1 = fg_image(8, lw, lh, hf);
         float pm1[8] = {0, 0, 1}, pm2[8] = {0, 0, 2};
-        VkImageView a1[1] = {post_view(pk)};
+        VkImageView a1[1] = {post_view(fld)};
         post_pass(cb, "fg_median.frag", a1, 1, m1, pm1, false);
         VkImageView a2[1] = {post_view(m1)};
         post_pass(cb, "fg_median.frag", a2, 1, pk, pm2, false);
@@ -10505,7 +10516,7 @@ TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make) {
     static const VkComponentMapping id = {0};
     VkImageView bv = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);  // (raw)
     pw[7] = camp ? 1.0f : 0.0f;  // (b.w: the camera image's w is N-1's characters)
-    VkImageView wi[6] = {post_view(prev), post_view(cur), post_view(pk), sc ? bv : post_view(cur), post_view(cut), camv};
+    VkImageView wi[6] = {post_view(prev), post_view(cur), post_view(median ? pk : fld), sc ? bv : post_view(cur), post_view(cut), camv};
     post_pass(cb, "fg_warp.frag", wi, 6, out, pw, false);
     if (sharp > 0) {
         TexBackend *o2 = fg_image(7, w, h, f);
