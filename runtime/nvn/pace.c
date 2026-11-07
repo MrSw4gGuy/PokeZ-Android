@@ -251,7 +251,8 @@ void pace_frame(void) {
         }
         hold_cadence(g_game_is_la ? hold_30((pace_slow && on) || g_fps45_hold) : g_fps45_hold);
         return;
-    }    double busy = (p > wt ? p - wt : 0) / 1e6;
+    }
+    double busy = (p > wt ? p - wt : 0) / 1e6;
     // (Android's performance hints: this thread's CPU time for the frame against its budget - 33.3 ms in the game's
     // 30 fps mode, its period over 25 ms, else 16.7. CPU time, not busy time: Pokémon Z-A's wait for its next frame
     // counts as busy, and a frame reported as filling its budget kept the clocks up. platform.h plat_perf_hint, a no-op

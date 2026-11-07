@@ -319,8 +319,11 @@ double plat_thermal_scale(double now) {
     float h = AThermal_getThermalHeadroom(mgr, 10);
     if (isnan(h)) return thermal_scale_cache = scale;
     int last = nsteps - 1, was = step;
-    float down_at = profile == THERMAL_PROFILE_NO_COOLER ? 0.70f : 0.80f;
-    float up_below = profile == THERMAL_PROFILE_NO_COOLER ? 0.45f : 0.60f;
+    // (with a cooler: the thresholds measured on the phone before the profiles, 0.90 down / 0.70 up - 0.80 / 0.60 stepped
+    // down earlier than without any profile, and a scale below 100% also stops framepace.c's 60 fps tries; without a
+    // cooler a little earlier, with the extra 50% step and a slower climb back)
+    float down_at = profile == THERMAL_PROFILE_NO_COOLER ? 0.85f : 0.90f;
+    float up_below = profile == THERMAL_PROFILE_NO_COOLER ? 0.65f : 0.70f;
     double down_wait = profile == THERMAL_PROFILE_NO_COOLER ? 8.0 : 10.0;
     double up_wait = profile == THERMAL_PROFILE_NO_COOLER ? 45.0 : 30.0;
     if (h >= down_at && step < last && now - last_change >= down_wait) step++;

@@ -265,6 +265,29 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = texelFetch(t0, clamp(sc, ivec2(0), ivec2(pc.a.zw) - 1), 0);\n"
                "}\n";
     }
+    // (the integer object-ID maps - Z-A's is R8_UINT: an integer fetch and write, or the copy is undefined)
+    if (!strcmp(name, "shadow_far_idu.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(set = 0, binding = 0) uniform usampler2D t0;\n"
+               "layout(location = 0) out uvec4 o;\n"
+               "void main() {\n"
+               "  ivec2 sc = ivec2(vec2(gl_FragCoord.xy) * pc.a.xy);\n"
+               "  o = texelFetch(t0, clamp(sc, ivec2(0), ivec2(pc.a.zw) - 1), 0);\n"
+               "}\n";
+    }
+    if (!strcmp(name, "shadow_far_idi.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(set = 0, binding = 0) uniform isampler2D t0;\n"
+               "layout(location = 0) out ivec4 o;\n"
+               "void main() {\n"
+               "  ivec2 sc = ivec2(vec2(gl_FragCoord.xy) * pc.a.xy);\n"
+               "  o = texelFetch(t0, clamp(sc, ivec2(0), ivec2(pc.a.zw) - 1), 0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "present.vert")) {
         *stage = STAGE_VERTEX;
         // pv[0].x: flip (lower-left origin), pv[1]: uv crop (origin, size). Fullscreen triangle; Vulkan NDC y points down.

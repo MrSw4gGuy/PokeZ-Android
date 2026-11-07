@@ -1900,6 +1900,7 @@ static VkPipeline post_pipeline_kind(const char *fs, int kind, VkFormat dsfmt, V
 static void fullscreen_vertex_bind(VkCommandBuffer cb);  // (za_red_copy's fullscreen triangle)
 static VkPipelineLayout post_layout;  // (defined with the post passes, below; the Reduzida's copies use it)
 static VkDescriptorSetLayout post_set_layout;
+static int attr_kind(uint32_t fmt);  // (below, with the vertex formats: 0 float, 1 signed, 2 unsigned integer)
 // Z-A's sun-shadow depth array is 1024x1024 with three layers; layers 0 and 1 are its sun-shadow cascades (perto /
 // distante; layer 2 goes unused). Keep this narrowly identified (and ZA-only) so unrelated array render targets and
 // Link's Awakening are untouched. *layer: which single-layer view the pass draws into.
@@ -1921,7 +1922,9 @@ static bool za_shadow_layer(int *layer) {
 static TexBackend za_red_b[2];      // 0: our depth, 1: our colour (the object-ID map)
 static VkImageView za_red_v[2];     // their 2D views
 static NvnTexture *za_red_game[2];  // the game's arrays the pass's results are blitted into
-static uint32_t za_red_w = 512;     // our attachments' size
+static uint32_t za_red_w = 512;     // our attachments' size: half the game's array as it really is (begin_pass: F1's shadow
+                                    // resolution scales that array first - at 50%, the Android default, it is 512 and
+                                    // ours 256; a fixed 512 there saved nothing and drew a quarter of the cascade)
 static bool pass_reduced;           // the pass being recorded draws into ours (begin_pass sets, its end blits and clears)
 static bool za_red_usable = true;   // (cleared if the formats cannot be blitted)
 
@@ -1962,16 +1965,20 @@ static bool za_red_make(int i, uint32_t w, VkFormat vf, VkImageAspectFlags aspec
     return za_red_v[i] != VK_NULL_HANDLE;
 }
 // The copy's pipeline: the post passes' vertex, a fetch-and-write fragment, and (depth) a depth write of the fetched
-// value. Cached per format; the depth one differs from the colour one by the depth attachment state.
-static VkPipeline za_red_pipe(VkFormat df, bool depth) {
+// value. Cached per format; the depth one differs from the colour one by the depth attachment state. kind: the colour
+// target's class (attr_kind: 0 float, 1 signed, 2 unsigned integer) - Z-A's object-ID map is R8_UINT (NVN 0x03), which
+// a float fetch and a vec4 write leave undefined, so it gets the integer copies.
+static VkPipeline za_red_pipe(VkFormat df, bool depth, int kind) {
     static struct { VkFormat f; bool d; VkPipeline p; } cache[8];
     for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].f == df && cache[i].d == depth) return cache[i].p;
+    const char *fs = depth ? "shadow_far_depth.frag" : kind == 2 ? "shadow_far_idu.frag" : kind == 1 ? "shadow_far_idi.frag"
+                                                                                                    : "shadow_far_id.frag";
     if (!post_layout) post_pipeline_kind("shadow_far_id.frag", 0, VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM);  // (makes the layout; this fragment is tiny)
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vk_builtin_shader("post.vert"), .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = vk_builtin_shader(depth ? "shadow_far_depth.frag" : "shadow_far_id.frag"), .pName = "main"}};
+         .module = vk_builtin_shader(fs), .pName = "main"}};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -2002,7 +2009,7 @@ static VkPipeline za_red_pipe(VkFormat df, bool depth) {
 }
 // One fullscreen copy: our cascade's texels up onto the game's layer (a render pass - the driver need not report a
 // blit feature for these formats, which Adreno's does not).
-static void za_red_copy(VkCommandBuffer cb, VkImageView src, uint32_t src_w, TexBackend *dst, uint32_t layer, bool depth) {
+static void za_red_copy(VkCommandBuffer cb, VkImageView src, uint32_t src_w, TexBackend *dst, uint32_t layer, bool depth, int kind) {
     static const VkComponentMapping id = {0};
     VkImageView dv = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, dst->format, 0, 1, layer, 1, id,
                                   depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2010,7 +2017,7 @@ static void za_red_copy(VkCommandBuffer cb, VkImageView src, uint32_t src_w, Tex
     VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-    VkPipeline pipe = za_red_pipe(dst->format, depth);
+    VkPipeline pipe = za_red_pipe(dst->format, depth, kind);
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dst->width, dst->height}},
                           .layerCount = 1, .colorAttachmentCount = depth ? 0u : 1u, .pDepthAttachment = depth ? &a : NULL,
                           .pColorAttachments = depth ? NULL : &a};
@@ -2043,11 +2050,12 @@ static void za_red_blit(void) {
     VkCommandBuffer cb = vk_cmd();
     static const VkComponentMapping id = {0};
     VkImageView sv = vk_image_view(&za_red_b[0], VK_IMAGE_VIEW_TYPE_2D, za_red_b[0].format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
-    if (sv) za_red_copy(cb, sv, za_red_w, gd, 1, true);
+    if (sv) za_red_copy(cb, sv, za_red_w, gd, 1, true, 0);
     if (gc && za_red_b[1].image && za_red_v[1]) {
         VkImageView sc = vk_image_view(&za_red_b[1], VK_IMAGE_VIEW_TYPE_2D, za_red_b[1].format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
-        if (sc) za_red_copy(cb, sc, za_red_w, gc, 1, false);
+        if (sc) za_red_copy(cb, sc, za_red_w, gc, 1, false, attr_kind(za_red_game[1]->format));
     }
+    vk_full_barrier(cb);  // (the pass after this one - the lighting, as a rule - samples layer 1: the copies' writes first)
     static bool logged;
     if (!logged) { logged = true; LOG("[vk] sun-shadow reduced: the distant cascade drawn at %ux%u, copied into the game's layer 1\n", za_red_w, za_red_w); }
 }
@@ -2123,6 +2131,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(st.rt.depth);  // (the game's bound arrays: their backends exist from the bind)
         if (idmap) renderer_mark_gpu_owned(idmap);
         TexBackend *db = st.rt.depth->backend, *cbk = idmap ? idmap->backend : NULL;
+        if (db && db->width >= 256) za_red_w = db->width / 2;  // (half the array as F1's shadow resolution made it)
         reduced = db && cbk && db->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
                   za_red_make(0, za_red_w, db->format, VK_IMAGE_ASPECT_DEPTH_BIT) &&
                   za_red_make(1, za_red_w, cbk->format, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2260,8 +2269,10 @@ static void begin_pass(void) {
     pass_w = minw; pass_h = minh;
     if (reduced) {  // the game's viewport (its cascade map's size) lands on our half-size attachments - the whole
                     // projection in a quarter of the pixels, the same way the game's own shadow_resolution scales
-        TexBackend *gb = za_red_game[0] ? za_red_game[0]->backend : NULL;
-        if (gb && gb->width) { pass_sx = (float)za_red_w / (float)gb->width; pass_sy = (float)za_red_w / (float)gb->height; }
+        // (against the game's own size - its viewport's units - not the backend's: at 50% shadow resolution that is
+        // already 512, and 512 / 512 drew the 1024 viewport over a quarter of the cascade)
+        NvnTexture *gt = za_red_game[0];
+        if (gt && gt->width) { pass_sx = (float)za_red_w / (float)gt->width; pass_sy = (float)za_red_w / (float)gt->height; }
         pass_reduced = true;
     }
     pass_layers = layers == UINT32_MAX ? 1 : layers;
