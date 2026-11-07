@@ -2053,9 +2053,11 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         if (d > 0 && d < 200) fg_period = fg_period > 0 ? fg_period * 0.9 + d * 0.1 : d;
         bool at30 = fg_period > 25 && fg_period < 45 && d < fg_period * 1.6;
         extern TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make);
-        if (g_settings.frame_gen) fg_mid = vk_fg_make(b, frame, at30);
-        // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game)
-        plat_frame_rate_hint(window, g_settings.fps45 ? 90.0f : g_settings.frame_gen || g_settings.fps60 ? 60.0f : 0.0f);
+        extern bool g_fps40_on;  // (runtime/hle/framepace.c: 16.7 / 33.3 ms in turn - 25 on average, no 30 fps to fill)
+        if (g_settings.frame_gen && !g_fps40_on) fg_mid = vk_fg_make(b, frame, at30);
+        // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game;
+        // the 40 fps mode's one-vsync frames need 60 Hz too)
+        plat_frame_rate_hint(window, g_settings.frame_gen || g_settings.fps60 || g_fps40_on ? 60.0f : 0.0f);
         static int tm = -1;
         if (tm < 0) tm = ENV("LARECOMP_FG_TIMING") != NULL;
         if (tm && g_settings.frame_gen) {  // (how many frames had an in-between image, and why not)

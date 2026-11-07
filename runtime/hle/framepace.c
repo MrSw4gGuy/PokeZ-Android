@@ -76,6 +76,8 @@ uint32_t rt_frame_steps(uint32_t interval) {
 #define FPS60_FLICKER_S 20
 bool g_za_frame_hook;    // (the game is Pokémon Z-A: exec.c leaves its GPU timing counters alone)
 bool g_fps60_fell_back;  // (60 fps chosen, but the game is at 30 now: runtime/ui/menu.mm says so)
+bool g_fps40_on;         // (the 40 fps mode is running, rt_za_frame_cfg: nvn/objects.c present_pace, nvn/pace.c's frame
+                         // budget, vulkan/device.c's display hint and frame generation)
 static bool fps60_holds(void) {
     extern uint64_t renderer_present_count(void);
     extern void menu_notice(const char *text, int seconds);
@@ -83,7 +85,7 @@ static bool fps60_holds(void) {
     static bool retry;  // (60 again after a fall back: the shorter test)
     static uint64_t t0, p0, back_at, seen_hitch;
     if (dyn < 0) dyn = !ENV("LARECOMP_FPS60_DYNAMIC") || atoi(ENV("LARECOMP_FPS60_DYNAMIC")) != 0;
-    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps45 << 2;  // (the 45 mode: 60's state fresh)
+    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps40 << 2;  // (the 40 mode: 60's state fresh)
     if (last_setting != setting) {  // (chosen again in F1: a new try)
         last_setting = setting;
         g_fps60_fell_back = retry = false, warm = slow = held_s = 0, backoff = 1, t0 = back_at = 0;
@@ -148,34 +150,36 @@ static bool fps60_holds(void) {
 int32_t rt_za_frame_cfg(int32_t cfg) {
     g_za_frame_hook = true;
     const char *e = ENV("LARECOMP_FPS");
-    // The 45 fps mode (the user's fps45): the game's own 30 fps machinery - two world steps and a present interval of
-    // 2, forced by pace.c's hold - over a 90 Hz vsync: each frame is 2/90 s of world and shown 22.2 ms apart, the same
-    // speed and smoothness as a real 45 fps. A frame the GPU misses (over 22.2 ms) still steps 2: the world slows a
-    // little instead of the 60 fps mode's cliff - and nothing retries, so it never oscillates. LARECOMP_FPS wins (tests).
-    extern volatile uint64_t g_vsync_period_ns;  // runtime/hle/vi.c
-    bool f45 = !e && g_settings.fps45;    static bool was45;
-    if (f45 != was45) {
-        was45 = f45;
-        g_vsync_period_ns = f45 ? 11111111 : 16666667;
-        LOG("[pace] 45 fps mode %s: a 90 Hz vsync, two world steps and a present every two\n", f45 ? "on" : "off");
+    // The 40 fps mode (the user's fps40): the game's world steps whole vsyncs only - its frame clock (2.0.2
+    // f_7001b29660) turns the mode into 1 / 60 s steps and hands each subsystem that integer, no fraction (a 45 or 40
+    // fps from its 30 fps mode over a faster vsync ran the world 1.5x / 1.33x fast). So the mode alternates frame by
+    // frame: 0 (one step, shown one vsync after the frame before) and 1 (two steps, shown two after) - 40 frames a second
+    // on the 60 Hz display, each shown exactly as long as the world time it stepped (nvn/objects.c present_pace waits
+    // the frame's own interval before it, g_fps40_on), at the right speed, and a frame every 25 ms on average for the
+    // GPU instead of 16.7. Not even (16.7 / 33.3 ms) like a 120 Hz display could be, but the game has no 25 ms step.
+    // LARECOMP_FPS wins (tests).
+    bool f40 = !e && g_settings.fps40;
+    static bool was40;
+    if (f40 != was40) {
+        was40 = f40;
+        LOG("[pace] 40 fps mode %s: one and two world steps in turn, each shown that long\n", f40 ? "on" : "off");
     }
-    extern bool g_fps45_hold;  // runtime/nvn/pace.c hold_30: forced on while in the mode
-    g_fps45_hold = f45;
-    bool on = e ? atoi(e) >= 60 : f45 ? false : fps60_holds();
+    g_fps40_on = f40;
+    static int phase;
+    bool on = e ? atoi(e) >= 60 : f40 ? (phase ^= 1) != 0 : fps60_holds();
     static int logged = -1;
-    if (logged != (int)on) { logged = on; LOG("[pace] game frame mode %d -> %d (%s)\n", cfg, on ? 0 : cfg, on ? "60 fps" : "as is"); }
+    if (!f40 && logged != (int)on) { logged = on; LOG("[pace] game frame mode %d -> %d (%s)\n", cfg, on ? 0 : cfg, on ? "60 fps" : "as is"); }
+    if (f40) logged = -1;
     {   // the game's own time, in vsyncs: each frame it steps max(mode + 1, the vsyncs that really passed) - a replay
         // keyed by this lands its inputs on the same moment of the game on a faster or slower PC (runtime/hle/input.c)
         extern uint64_t g_game_vsyncs;
         static uint64_t last;
         uint64_t now = __atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED), passed = last ? now - last : 0;
-        uint64_t step = (uint64_t)(on ? 0 : cfg) + 1;
+        uint64_t step = (uint64_t)(on ? 0 : f40 ? 1 : cfg) + 1;
         if (passed > step) step = passed > 8 ? 8 : passed;  // (a long stall: the game caps its step too)
         last = now;
         g_game_vsyncs += step;
     }
-    return on ? 0 : cfg;
+    return on ? 0 : f40 ? 1 : cfg;
 }
 uint64_t g_game_vsyncs;  // (see rt_za_frame_cfg)
-bool g_fps45_hold;  // (see rt_za_frame_cfg: the 45 fps mode forces pace.c's hold - only once the game's frame hook has
-                    // run: pace.c reaches here on frames before the game manager exists, and its pointer isn't mapped yet)

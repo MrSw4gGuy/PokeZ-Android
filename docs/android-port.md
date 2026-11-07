@@ -29,7 +29,7 @@ wsl.exe -d Ubuntu-22.04 -u root -- bash -lc "bash '/mnt/d/Claude/Recomp/Pokemon 
 
 # Logs e configuração no celular
 adb pull /storage/emulated/0/Android/data/org.recomp.za/files/lasrecomp.log .
-adb shell "grep -E '^(fps60|fps45|frame_gen|shadow_distance|thermal_profile|za_lod) *=' \
+adb shell "grep -E '^(fps60|fps40|frame_gen|shadow_distance|thermal_profile|za_lod) *=' \
   /storage/emulated/0/Android/data/org.recomp.za/files/larecomp.ini"
 ```
 
@@ -76,11 +76,12 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
 - **LOD (F1 > Vídeo > Nível de detalhe)**: Do jogo / Alto (bias -1.0) / Desempenho (bias +1.0, via za_tweaks).
 - **Pré-compilação de pipelines**: já existia (shader_prep); log mostra cache de 6,4 MB e 0 falhas.
 - **ADPF**: já existia (plat_perf_hint + térmico); não duplicar.
-- **Modo 45 fps** (`fps45`): implementado (vsync emulado 90 Hz + hold 2 em 2), mas **não funciona no S25+**: a
-  tela não tem 90 Hz (`dumpsys display`: 120, 80, 60, 48, 40, 30, 24, 10 Hz). O `ANativeWindow_setFrameRate(90)`
-  devolve 0 mas nada muda, e o hold espaça a 33 ms = 30 fps. Alternativa: 40 fps sobre 120 Hz (3 vsyncs por
-  quadro). Antes, confirmar a velocidade do mundo: se o jogo avança um tempo fixo por quadro no modo 30, 45 ou 40 fps
-  aceleram o mundo (1,5x / 1,33x).
+- **Modo 40 fps** (`fps40`, F1 > Taxa de quadros), no lugar do antigo 45 (que precisava de 90 Hz: o S25+ só tem
+  120, 80, 60, 48, 40, 30, 24 e 10 Hz). O relógio do jogo (2.0.2 `f_7001b29660`) só avança o mundo em vsyncs
+  inteiros de 1/60 s: não existe passo de 25 ms, e 45/40 fps feitos com o modo 30 sobre um vsync mais rápido
+  aceleravam o mundo (1,5x / 1,33x). Por isso o modo alterna quadros de 1 e 2 passos (`rt_za_frame_cfg`), e cada um
+  fica na tela exatamente o tempo do seu passo (`present_pace` espera o intervalo *antes* do quadro nesse modo). Tela
+  a 60 Hz, velocidade certa, 25 ms de GPU por quadro em média; a cadência é 16,7 / 33,3 ms (não perfeitamente regular).
 - **Glitch nos olhos** (íris com faixa branca): NÃO é o LOD (persiste com za_lod=0). Aberto: investigar shader/
   textura do olho no backend Vulkan.
 - **Throttling**: com Turbo + cena pesada, o telefone entra em status 2/3 mesmo com cooler; o retry do 60 fps agora
@@ -99,12 +100,12 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
    térmica multiplica a do DRS; ver também `[post] WxH sgsr -> 1920x1080`.
 5. `llvm-addr2line -e <libmain.so merged_native_libs> -f -C <pc>` para backtrace do log de crash; os .o em
    `/root/lasrecomp/build/android/rt/**` dão linha exata (pace.c etc.).
-6. O INI do celular é a fonte da verdade do teste (`fps60`, `fps45`, `fps60_lock`, `frame_gen`,
+6. O INI do celular é a fonte da verdade do teste (`fps60`, `fps40`, `fps60_lock`, `frame_gen`,
    `shadow_distance`, `za_lod`, `thermal_profile`); conferir antes de qualquer medição.
 
 ## Pendências abertas
 
-- 45 fps: display a 90 Hz (ver acima) OU patch do relógio; medir de novo com gpuprof.
+- 40 fps: testar no celular (sensação, velocidade do mundo, a cadência 16,7 / 33,3 ms com `LARECOMP_FG_TIMING`).
 - Glitch nos olhos: shader/textura do olho no backend.
 - Na pasta de testes: limpar `files/save` e `env.txt` do celular e restaurar `shadow_resolution = 0.5` no ini
   (o usuário aprovou copiar/apagar saves de teste).

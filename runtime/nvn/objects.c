@@ -1012,9 +1012,15 @@ static void present_pace(int interval) {
     if (interval <= 0) return;
     if (interval > 4) interval = 1;  // (not a sane interval: the console's default)
     uint64_t period = 16666667ull * (uint64_t)interval, now = plat_now_ns();
-    if (next > now && next - now <= period) plat_sleep_until_ns(next);
-    else next = now;  // (first frame, or more than a period late: no catching up)
-    next += period;
+    // (the 40 fps mode, runtime/hle/framepace.c: a frame's interval is the gap before it - the time its world stepped -
+    // not after it, or its one- and two-step frames would each be shown the other's time: the worst judder)
+    extern bool g_fps40_on;
+    static uint64_t last;  // when the frame before was let go
+    uint64_t at = g_fps40_on && last ? last + period : next;
+    if (at > now && at - now <= period) plat_sleep_until_ns(at);
+    else at = now;  // (first frame, or more than a period late: no catching up)
+    last = at;
+    next = at + period;
 }
 
 NVN(nvnQueuePresentTexture) {
