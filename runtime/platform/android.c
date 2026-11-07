@@ -31,6 +31,7 @@
 
 #include "../paths.h"
 #include "../platform.h"
+#include "../settings.h"
 #include "posix_log.h"
 
 void rt_crash_explain(char *out, size_t n, const char *log_path);  // runtime/crash_explain.c
@@ -278,39 +279,61 @@ void plat_frame_rate_hint(void *sdl_window, float fps) {
 
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
-// next forecast seconds, to its severe throttling point - 1.0 is that point. Measured on an SM-S936B after ~35 min of
-// Link's Awakening on a USB cable: skin 41.8 C, thermal status moderate, the battery discharging all the same. Rather
-// than wait for the system to clamp the clocks (frames then drop unevenly), the render scale steps down early and
-// climbs back slowly: a step down at >= 0.90, at most every 10 s (a step takes a while to show in the temperature); a
-// step up below 0.70, at most every 30 s. Steps of each axis: 100, 85, 70, 60 % (60 %: about a third of the pixels).
-// The API wants a call a second at most (more often it answers NaN). A "[thermal]" line every 30 s and on each step.
+// next forecast seconds, to its severe throttling point - 1.0 is that point. The thermal profile selects the render
+// scale curve: the cooler profile uses the tested 100/85/70/60% steps; the no-cooler profile reacts earlier and adds
+// 50%. The API wants a call a second at most (more often it answers NaN). A "[thermal]" line every 30 s and on each step.
 // LARECOMP_THERMAL=0: off.
-static const double thermal_steps[] = {1.0, 0.85, 0.7, 0.6};
+static const double thermal_steps_cooler[] = {1.0, 0.85, 0.7, 0.6};
+static const double thermal_steps_no_cooler[] = {1.0, 0.85, 0.7, 0.6, 0.5};
+
+static double thermal_scale_cache = 1.0;  // (the scale above, for plat_thermal_throttled)
+
+int plat_thermal_throttled(void) { return thermal_scale_cache < 1.0; }
 
 double plat_thermal_scale(double now) {
     static AThermalManager *mgr;
-    static int off = -1, step;
-    static double next_read, last_change = -1e9, last_line = -1e9;
+    static int off = -1, step, last_profile = -1;
+    static double next_read, last_change = -1e9, last_line = -1e9, scale = 1.0;
+    int profile = g_settings.thermal_profile == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
+    const double *steps = profile == THERMAL_PROFILE_NO_COOLER ? thermal_steps_no_cooler : thermal_steps_cooler;
+    int nsteps = profile == THERMAL_PROFILE_NO_COOLER ?
+                 (int)(sizeof thermal_steps_no_cooler / sizeof *thermal_steps_no_cooler) :
+                 (int)(sizeof thermal_steps_cooler / sizeof *thermal_steps_cooler);
+    if (last_profile != profile) {
+        int nearest = 0;
+        for (int i = 1; i < nsteps; i++) if (fabs(steps[i] - scale) < fabs(steps[nearest] - scale)) nearest = i;
+        step = nearest;
+        scale = steps[step];
+        last_profile = profile;
+        last_change = -1e9;
+        fprintf(stderr, "[thermal] profile: %s\n", profile == THERMAL_PROFILE_NO_COOLER ? "without cooler" : "with cooler");
+    }
     if (off < 0) {
         const char *e = getenv("LARECOMP_THERMAL");
         off = e && !strcmp(e, "0");
         if (!off && !(mgr = AThermal_acquireManager())) off = 1;
         fprintf(stderr, "[thermal] render scale by thermal headroom: %s\n", off ? "off" : "on");
     }
-    if (off || now < next_read) return thermal_steps[step];
+    if (off || now < next_read) return thermal_scale_cache = scale;
     next_read = now + 1.0;
     float h = AThermal_getThermalHeadroom(mgr, 10);
-    if (isnan(h)) return thermal_steps[step];
-    int last = (int)(sizeof thermal_steps / sizeof *thermal_steps) - 1, was = step;
-    if (h >= 0.90f && step < last && now - last_change >= 10) step++;
-    else if (h < 0.70f && step > 0 && now - last_change >= 30) step--;
+    if (isnan(h)) return thermal_scale_cache = scale;
+    int last = nsteps - 1, was = step;
+    float down_at = profile == THERMAL_PROFILE_NO_COOLER ? 0.70f : 0.80f;
+    float up_below = profile == THERMAL_PROFILE_NO_COOLER ? 0.45f : 0.60f;
+    double down_wait = profile == THERMAL_PROFILE_NO_COOLER ? 8.0 : 10.0;
+    double up_wait = profile == THERMAL_PROFILE_NO_COOLER ? 45.0 : 30.0;
+    if (h >= down_at && step < last && now - last_change >= down_wait) step++;
+    else if (h < up_below && step > 0 && now - last_change >= up_wait) step--;
     if (step != was) last_change = now;
+    scale = steps[step];
+    thermal_scale_cache = scale;
     if (step != was || now - last_line >= 30) {
         last_line = now;
-        fprintf(stderr, "[thermal] headroom %.2f (10 s forecast): render scale %.0f%%%s\n", h, thermal_steps[step] * 100,
+        fprintf(stderr, "[thermal] headroom %.2f (10 s forecast): render scale %.0f%%%s\n", h, scale * 100,
                 step > was ? " - stepped down" : step < was ? " - stepped up" : "");
     }
-    return thermal_steps[step];
+    return scale;
 }
 
 // ---- time (identical to Linux: bionic has all of these)

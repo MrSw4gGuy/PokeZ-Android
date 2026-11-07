@@ -241,6 +241,30 @@ VkDescriptorSetLayout vk_set_layout(const VkBindingInfo *b, int n, uint32_t set,
 
 // ================================================================== built-in shaders
 static const char *builtin_src(const char *name, int *stage) {
+    // Reduzida's copies (exec.c za_red_copy): a fullscreen draw fetches our half-size cascade and writes it into the
+    // game's layer 1 - a render pass instead of vkCmdBlitImage, whose format feature this driver need not report.
+    // pc.a.xy: source texel per destination texel (0.5, 0.5); pc.a.zw: the source's size, for the fetch clamp.
+    if (!strcmp(name, "shadow_far_depth.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "void main() {\n"
+               "  ivec2 sc = ivec2(vec2(gl_FragCoord.xy) * pc.a.xy);\n"
+               "  gl_FragDepth = texelFetch(t0, clamp(sc, ivec2(0), ivec2(pc.a.zw) - 1), 0).r;\n"
+               "}\n";
+    }
+    if (!strcmp(name, "shadow_far_id.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 sc = ivec2(vec2(gl_FragCoord.xy) * pc.a.xy);\n"
+               "  o = texelFetch(t0, clamp(sc, ivec2(0), ivec2(pc.a.zw) - 1), 0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "present.vert")) {
         *stage = STAGE_VERTEX;
         // pv[0].x: flip (lower-left origin), pv[1]: uv crop (origin, size). Fullscreen triangle; Vulkan NDC y points down.

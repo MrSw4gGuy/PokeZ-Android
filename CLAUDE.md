@@ -1,114 +1,108 @@
-# ZA Recomp: notes for Claude
+# CLAUDE.md — PokeZ-Android (ZA Recomp para Android)
 
-A static-recompilation PC port of Pokémon Legends: Z-A, forked from LAS Recomp (Zelda: Link's Awakening, by
-Peiikai). The game's ARM64 code is turned into C ahead of time; the runtime re-implements the Switch's OS and its GPU
-(NVN -> Vulkan). Supported game versions: 1.0.0, 2.0.0, 2.0.2. Development branch: `pokemon-za`.
+Instruções para assistentes de IA (e humanos) trabalhando neste clone. O projeto porting é o branch `android-port`
+de [ZA Recomp](https://github.com/Hexveil404/PokeZ-ARecomp) (LAS Recomp de Peiikai), publicado em
+https://github.com/MrSw4gGuy/PokeZ-Android.
 
-Machine-specific paths (game files, install folder) are in `CLAUDE.local.md` when present.
+## Visão geral
 
-## Where things are
+Port Android (arm64) de Pokémon Legends: Z-A (Switch 1) por recompilação estática: o código do jogo vira C, o SO e a
+GPU (NVN) são reimplementados sobre Vulkan. O runtime é em C; o build Android roda no WSL (Ubuntu 22.04) e gera
+`ZARecomp-za-debug.apk`.
 
-- `tools/gen.py`, `lifter.py`, `analyze.py`, `patches.py`, `simd_c.py`, `flagfuse.py`, `za_patches.py`: the generator,
-  which turns ARM64 into C. Players' machines run it from the start screen (`runtime/gamebuild.c`). `flagfuse.py`
-  fuses a compare with its branch when nothing else reads the flags (a flag-liveness pass; Z-A's battle-loading freeze
-  1.36 s -> 0.6 s); `regpromote.py` keeps x19..x28 in C locals (callee-saved: written back only at exits). (`tools/passes.py`
-  is a log summarizer, not part of the generator.)
-- Dev rebuild of the game code: `cd tools && PYTHONUTF8=1 ../build/gen-venv/Scripts/python.exe gen.py main
-  ../testroot/extracted/exefs/main 0x7000000000 ../generated/main --simd c` (and `sdk ... 0x7008000000 ../generated/sdk
-  --hle ../runtime/hle/hle_symbols.txt`), then `make ... build/za-dist/lasgame.dll` (~20 min).
-- `runtime/kernel.c`: threads, mutexes and condvars, the address arbiter, the memory map, SVCs.
-- `runtime/services/fs.c`: the RomFS, the mod layers (`mods/<name>/romfs`, with `arc/data.trpfd` unlisting) and the
-  save files (`save/save_0/`).
-- `runtime/nvn/rqueue.c`: the render thread. `nvnQueueSubmitCommands` queues the call's lists (one item:
-  `rq_submit_lists`) and returns; the render thread translates them. Fences are item numbers.
-- `runtime/nvn/vulkan/exec.c`: command-list translation, per draw: pipeline key (with a memo), descriptor sets (reused
-  while their contents repeat), uniforms. Also GMEM_FAST (compute-buffer copies with a merge copy-back,
-  `gfast_merge.comp`), the vertex cache, page-write tracking, and Z-A's guest window (`gwin`: Z-A has no heap).
-- `runtime/nvn/vulkan/record.c`: the recorder thread. Every `vkCmd*` / descriptor / queue call goes through a `rec_*`
-  wrapper - never call `vkCmd*` directly from translation code (a race with the recorder).
-- `runtime/nvn/vulkan/textures.c`: texture upload and change checks. Unpacking (deswizzle) is queued and done on a
-  few threads just before the submission (`vk_tex_unpack_finish`, `LARECOMP_TEX_UNPACK_THREADS`). Textures are
-  uploaded when the game registers them (`backend_prefetch_texture`, a render-queue item from
-  `nvnTexturePoolRegisterTexture`; `LARECOMP_TEX_PREFETCH=0` off): a battle's textures load during its loading
-  freeze, not on its first frame. Costs ~350 MB more GPU memory.
-- `runtime/nvn/shader_prep.c` / `shader_seen.c`: shader preparation. Z-A records every variant it builds
-  (`cache/shader_seen.txt`) and its shader code (`cache/shader_code.bin`, the player's own data, never shipped), and
-  prepares them at its GPU device setup (`shader_prep_boot`, ~0.2 s warm; `LARECOMP_SHADER_PREP=0` off). Not from the
-  start screen: before boot the guest memory window is Zelda's and the translations would bake the wrong one in.
-- `runtime/crash_explain.c`: the crash dialog's plain-language explanation.
-- `runtime/nvn/vulkan/device.c`: present, `[mem]` and `[scale]` log lines, screenshots.
-- `runtime/nvn/maxwell/translate.c`: Maxwell shader -> GLSL/MSL.
-- `runtime/ui/launcher.mm`: the start screen (game-file setup, save import, update check).
-- `runtime/ui/menu.mm`: the F1 settings menu.
-- `runtime/hle/*`: host-side function hooks. The Zelda-only ones (warp, souls, digs, rando, cheats...) read Zelda
-  addresses through `GA()` (`runtime/game_addresses.h`); for Z-A that table is Zelda 1.0.0's and the hooks are gated
-  off by `g_game_is_la`. Any new per-frame or per-draw code that reads or writes `GA()` must check it.
-- Merged from upstream LAS Recomp (`peiikai` remote) on 2026-10-26: Z-A-specific decisions are marked "Pokémon Z-A"
-  in comments (saves written in place, no heap chunks, pacer off, `tools/za_patches.py`).
-- Issue numbers in comments that came from upstream (`issue #205`, `#19`, ...) are LAS Recomp's
-  (github.com/peiikai/LASRecomp/issues), not this repository's: kept as they are so upstream merges stay clean.
-  Link's Awakening-only code (randomizer, cosmetics, hint sheet, LiveSplit, `runtime/nvn/shader_variants.txt`...) is
-  kept for the same reason; it is gated off for Pokémon Z-A (`g_game_is_la`, and the menus' `menu_la_rows()`).
-- `runtime/ui/launcher.mm` is ZA Recomp's own start screen (not upstream's): upstream launcher changes are ported by
-  hand. Never delete `romfs.bin` there - for Pokémon Z-A it is the game's only data (zaimport writes no romfs/).
-- `tools/za/`: Z-A scripts (perf runs, log watcher, stack symbolizer, texture and font tools).
-- `tools/devtools/`, `tools/za/replay-*.sh`, `runtime/ui/devtools.mm`: ZA DevTools, record and replay, frame capture
-  analysis (`docs/dev-tools.md`). Off unless `LARECOMP_DEVTOOLS=1` or their own variables are set.
+## Comandos essenciais
 
-## Building (Windows, Git Bash)
+```bash
+# Runtime Android (rápido; confere erros de compilação)
+wsl.exe -d Ubuntu-22.04 -u root -- bash -lc "bash '/mnt/d/Claude/Recomp/Pokemon Legends ZA/PokeZ-ARecomp/tools/linux/android-port/build_android.sh'"
 
-One-time setup: `tools/setup_windows.ps1` (MSYS2 UCRT64 toolchain). Fast exe rebuild:
+# APK completo (sincroniza clone Windows→WSL e empacota; ~100 s)
+wsl.exe -d Ubuntu-22.04 -u root -- bash -lc "bash '/mnt/d/Claude/Recomp/Pokemon Legends ZA/PokeZ-ARecomp/tools/linux/android-port/za_apk.sh'"
+# Saída: D:/Claude/Recomp/Pokemon Legends ZA/ZARecomp-za-debug.apk — procurar 'ZA APK OK' no fim.
 
-    (export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"; make -j"$(nproc)" B=build/za-dist \
-      DEPS="$PWD/build/deps-win" RELEASE=1 GENARCH=-march=x86-64-v3 GENOPT="-O1 -DGUEST_VOLATILE" \
-      build/za-dist/lasrecomp.exe)
+# Instalar no celular (ADB Wi-Fi; a porta muda a cada sessão)
+./platform-tools/adb.exe mdns services          # descobrir a porta
+./platform-tools/adb.exe connect 192.168.0.99:<porta>
+./platform-tools/adb.exe install -r ZARecomp-za-debug.apk
+./platform-tools/adb.exe shell am start -n org.recomp.za/.ZARecompActivity   # NÃO é MainActivity
 
-- Keep the PATH change in a subshell: an exported MSYS PATH breaks `cmd` in later commands.
-- `build/za-dist/lasrecomp.exe` has no DLLs next to it, so it can't start from there. Copy `lasrecomp.exe` and
-  `lasrecomp.dll.a` into `build/dist-za/ZA Recomp/` (the test copy) and run that.
-- **`GAMELIB_ID`** (Makefile) hashes the generator sources, `cpu.h`, `simd*.h`, `gamelib.h`, `hle_symbols.txt` and the
-  flags. Changing any of them makes every player recompile the game (10-30 min). Runtime, Vulkan and UI changes
-  don't, so prefer them.
-- LF line endings everywhere (`core.autocrlf=false`, set by the setup script).
+# Logs e configuração no celular
+adb pull /storage/emulated/0/Android/data/org.recomp.za/files/lasrecomp.log .
+adb shell "grep -E '^(fps60|fps45|frame_gen|shadow_distance|thermal_profile|za_lod) *=' \
+  /storage/emulated/0/Android/data/org.recomp.za/files/larecomp.ini"
+```
 
-## Testing and debugging
+Teste de GPU: `LARECOMP_VK_PROF=1` e `LARECOMP_GPUPROF_AT=<frame>[,<frame>...]` no `env.txt` do celular; exige
+force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tema térmico:
+`dumpsys thermalservice` (Status 0 none … 4 critical; SKIN é o sensor da pele).
 
-- Test windows ignore keyboard and controller. Warn the user before starting one, and never kill or replace their
-  running game.
-- `tools/za/perf-win.sh`: a scripted run on a scratch copy (never touches the player's save, settings or caches).
-  Takes `GAME=`, `EXE=`, `IN=@<recorded input>`, `SAVE=`, `INI=`, `T=`. Settings and data paths must be absolute
-  Windows paths, or the run silently uses defaults.
-- Record input: `LARECOMP_RECORD_INPUT=<file>`. Replay: `LARECOMP_INPUT=@<file>`.
-- `GAME=<install> tools/za/watch-log.sh`: follows `logs/play.log` live (hitches, errors, crashes, `[shot]`).
-- Profiling:
-  - `LARECOMP_VK_PROF=1`: ms per second by category in the fps line (recorder, set reuse, key memo stats too).
-  - `[slow]` lines: every frame over `LARECOMP_SLOW_FRAME_MS` (default 50) with what it did.
-  - `LARECOMP_SAMPLE=<delay>,<dur>` with `LARECOMP_SAMPLE_EXEC=1`: stack sampling of the command-list thread into
-    `build/stacks.txt`; symbolize it with `tools/za/stacks.py`. Without `_EXEC`: every thread's instruction pointer
-    (~30 Hz each) into `<data root>/build/samples.txt`, for `tools/za/samples.py`. Run with `LARECOMP_RENDER_THREAD=0`
-    to stack-sample the game thread.
-  - `LARECOMP_PROF_SVC=1`: kernel calls over 10 ms, and per-thread call counts (`[svcprof]`).
-  - `LARECOMP_LOG_READS=<file>`: every RomFS read with its time and duration.
-- Windows: never `VirtualQuery` inside the guest window on a hot path. It measures the run of like pages, GBs here,
-  ~15 ms a call (it made every file read 3 ms and every first touch of guest memory slow until 2026-10-27).
-- Test runs read an ini with `fps60 = 0`: pass `LARECOMP_FPS=60`, or the fps line shows 30.
-- In game: F1 opens the menu, F9 dumps the next frame's passes, F10 saves a screenshot to `screenshots/`.
-- Kill switches for recent changes, to bisect visual bugs:
-  - `LARECOMP_VK_GMEM_FAST=0`, `LARECOMP_VK_GFAST_MERGE=0`, `LARECOMP_IB_GUARD=0`, `LARECOMP_VK_CLAMP_COLOR=1`,
-    `LARECOMP_WARP_EMU=0`
-  - `LARECOMP_VK_SUBMIT_EACH=1`, `LARECOMP_VK_BATCH_DRAWS=<n>`
-  - `LARECOMP_RENDER_THREAD=0` (translate on the game thread), `LARECOMP_VK_RECORDER=0`, `LARECOMP_VK_NO_SET_REUSE=1`,
-    `LARECOMP_VK_NO_KEY_MEMO=1`, `LARECOMP_VK_NO_CBUF_LEAN=1`
-  - `LARECOMP_VK_PAGES_OUTSIDE=0`, `LARECOMP_VK_NO_SLOT_MEMO=1`
-  - `LARECOMP_WATER_MODE=0` screen search, `1` SSPR, `2` planar (F1 > Reflection method)
-- Unit and fuzz tests exist (`tools/test_translate.sh`, `test_vk_pipelines.sh`, `test_lift.py`, `test_simd.py`,
-  `test_flagfuse.py`, `test_regpromote.py`) but there is no CI. Most checks are real game runs.
+## Arquitetura do runtime (o que morre onde)
 
-## Rules
+- `runtime/main.c` — boot; `runtime/kernel.c` — threads/fibers do jogo.
+- `runtime/hle/` — serviços do Switch refeitos. `framepace.c` é o coração do frame pacing do Z-A:
+  `rt_za_frame_cfg()` intercepta o relógio do jogo (patch `tools/za_patches.py`, f_70019e3730): o jogo conta
+  vsyncs inteiros por quadro (`max(modo+1, passados)`); modo 60 = cfg 0; modo 45 = jogo em modo 30 (2 passos)
+  sobre vsync emulado de 90 Hz (`g_vsync_period_ns`, vi.c) + hold de present a cada 2 vsyncs.
+- `runtime/nvn/` — a GPU do Switch. `vulkan/exec.c` grava comandos; `vulkan/device.c` cria swapchain
+  (pre-rotation no Android) e chama `pace_frame()`; `pace.c` segura o cadência (`hold_cadence`/`hold_30`);
+  `output_scale.c` aplica a escala dinâmica; `shaders.c` tem os built-ins (GLSL → SPIR-V na hora).
+- `runtime/platform/android.c` — térmico (`plat_thermal_scale`: perfil com/sem cooler em `settings.thermal_profile`;
+  `plat_thermal_throttled()`: 1 enquanto a escala térmica < 100%), ADPF perf hints, frame rate hint
+  (`ANativeWindow_setFrameRate`).
+- `runtime/ui/menu.mm` — menu F1 (opções de vídeo, sombras, Turbo, térmico). `runtime/settings.{c,h}` — INI
+  (`larecomp.ini` no celular) e defaults.
+- Patches no jogo: `tools/za_patches.py` (endereços da versão 2.0.2; `runtime/game_addresses/`). Tweaks de gráficos
+  do jogo: `runtime/hle/za_tweaks.c` (LOD bias, DOF, FXAA, bloom).
 
-- Never commit or attach Nintendo files: game files, `extracted/`, `generated/`, fonts, textures, saves.
-- Mods from GameBanana etc. are not ours to bundle. They go in the player's `mods/` folder only.
-- Comments follow the existing style: dense, explaining *why*, with parenthetical asides and the env var that
-  changes the behaviour. Match it.
-- Guest threads are real host threads, around 150 in Z-A. Any shared kernel state needs a lock (`g_klock`, or
-  `g_mlock` for the memory map).
+## Convenções
+
+- Comentários longos em inglês, explicando o PORQUÊ (histórico e medidas); logs em inglês via `LOG(...)`.
+- Opções de menu bilíngues: `TR("English", "Português")`.
+- Env vars `LARECOMP_*` lidas com `ENV()` (hle.h); config do usuário: `larecomp.ini`.
+- TODO: nunca commitar sem pedir; nunca subir APN/chaves do jogo; o APK é sempre local.
+
+## Estado do projeto (atualizado em 2026-11-07)
+
+- **Sombras (F1 > Vídeo > Distância das sombras)**: Completa / Reduzida / Só próximas / Só personagens / Sem sombras.
+  Reduzida = cascata distante a 512×512 copiada para o layer 1 do mapa do jogo (passe de cópia em render, porque a
+  Adreno não faz blit no D32 do jogo). Economia medida: ~0,25 ms (~9%) no trecho das cascatas.
+- **Perfil térmico (F1 > Vídeo)**: Com cooler / Sem cooler — muda os degraus e a recuperação de
+  `plat_thermal_scale` (com cooler 100/85/70/60; sem cooler até 50%, recupera mais devagar).
+- **Perfil Turbo (F1 > Vídeo, botão)**: aplica 60 fps com fallback dinâmico, resolução dinâmica do jogo, sombras
+  Reduzidas, LOD Desempenho, FG off — e salva o INI.
+- **LOD (F1 > Vídeo > Nível de detalhe)**: Do jogo / Alto (bias -1.0) / Desempenho (bias +1.0, via za_tweaks).
+- **Pré-compilação de pipelines**: já existia (shader_prep); log mostra cache de 6,4 MB e 0 falhas.
+- **ADPF**: já existia (plat_perf_hint + térmico); não duplicar.
+- **Modo 45 fps** (`fps45`): implementado (vsync emulado 90 Hz + hold 2 em 2), mas **ainda não funciona no
+  aparelho**: o display fica a 60 Hz (o `plat_frame_rate_hint(90)` é chamado — ver device.c:2058 — mas o Android
+  não subiu a taxa; investigar `dumpsys display` antes/depois). Sem o display a 90, o hold espaça a 33 ms = 30 fps.
+  PENDENTE: confirmar o frame rate hint no lado Android e testar de novo; a alternativa é patch no relógio do jogo
+  (passos fracionários — trabalho maior, a mesma pesquisa do "FPS dinâmico").
+- **Glitch nos olhos** (íris com faixa branca): NÃO é o LOD (persiste com za_lod=0). Aberto: investigar shader/
+  textura do olho no backend Vulkan.
+- **Throttling**: com Turbo + cena pesada, o telefone entra em status 2/3 mesmo com cooler; o retry do 60 fps agora
+  espera a escala térmica recuperar (plat_thermal_throttled). Para cenas pesadas, 30 fps segue sendo o modo seguro.
+
+## Lições de debugging (todas vividas aqui)
+
+1. `dlopen` aceita símbolo indefinido em .so — o crash aparece SÓ ao abrir o app
+   (`cannot locate symbol "g_fps45_hold"`). Toda variável `extern` usada por pace.c tem de ser DEFINIDA em
+   framepace.c.
+2. `GA(GAME_MGR)` antes do jogo montar o manager = ponteiro com lixo não-nulo → SIGSEGV dentro de `hold_30`.
+   Qualquer novo acesso à memória do jogo precisa de guard baseado no hook do jogo (`g_za_frame_hook`) ou em
+   `g_ga`/`fw` válidos.
+3. `LARECOMP_FPS=60` no env.txt FORÇA 60 e DESLIGA o fallback — nunca usar em teste de desempenho do modo dinâmico.
+4. Diagnóstico de "resolução baixa": olhar `[thermal] headroom ... render scale X%` + `[scale]` no log — a escala
+   térmica multiplica a do DRS; ver também `[post] WxH sgsr -> 1920x1080`.
+5. `llvm-addr2line -e <libmain.so merged_native_libs> -f -C <pc>` para backtrace do log de crash; os .o em
+   `/root/lasrecomp/build/android/rt/**` dão linha exata (pace.c etc.).
+6. O INI do celular é a fonte da verdade do teste (`fps60`, `fps45`, `fps60_lock`, `frame_gen`,
+   `shadow_distance`, `za_lod`, `thermal_profile`); conferir antes de qualquer medição.
+
+## Pendências abertas
+
+- 45 fps: display a 90 Hz (ver acima) OU patch do relógio; medir de novo com gpuprof.
+- Glitch nos olhos: shader/textura do olho no backend.
+- Na pasta de testes: limpar `files/save` e `env.txt` do celular e restaurar `shadow_resolution = 0.5` no ini
+  (o usuário aprovou copiar/apagar saves de teste).
+- Do BytArch GTA V (GPL-3.0): usar só IDEIAS, não código (licenças: este projeto MIT, aquele GPL-3.0).

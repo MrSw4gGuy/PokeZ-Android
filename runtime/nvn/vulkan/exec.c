@@ -1896,6 +1896,161 @@ static void water_apply_pending(void);
 static void gtao_forget(NvnTexture *t);  // (vk_exec_texture_destroyed: the AO and water passes' saved targets)
 static void planar_replay_pending(void);
 static void planar_light_pending(void);
+static VkPipeline post_pipeline_kind(const char *fs, int kind, VkFormat dsfmt, VkFormat cfmt);  // (za_red_pipe: the post passes' layout)
+static void fullscreen_vertex_bind(VkCommandBuffer cb);  // (za_red_copy's fullscreen triangle)
+static VkPipelineLayout post_layout;  // (defined with the post passes, below; the Reduzida's copies use it)
+static VkDescriptorSetLayout post_set_layout;
+// Z-A's sun-shadow depth array is 1024x1024 with three layers; layers 0 and 1 are its sun-shadow cascades (perto /
+// distante; layer 2 goes unused). Keep this narrowly identified (and ZA-only) so unrelated array render targets and
+// Link's Awakening are untouched. *layer: which single-layer view the pass draws into.
+static bool za_shadow_layer(int *layer) {
+    NvnTexture *t = st.rt.depth;
+    if (g_game_is_la || !t || t->target != 4 || t->width != 1024 || t->height != 1024 || t->depth != 3 ||
+        !renderer_format_is_depth(t->format) || !st.rt.has_dview || !(st.rt.dview.setmask & 2) ||
+        st.rt.dview.min_layer > 2 || st.rt.dview.num_layers != 1) return false;
+    *layer = (int)st.rt.dview.min_layer;
+    return true;
+}
+
+
+// ---- "Distância das sombras: Reduzida". The distant cascade (layer 1) renders into our own half-size attachments and
+// is copied into the game's arrays when the pass ends: the lighting keeps sampling the game's arrays unpatched, and
+// the far shadows cost a quarter of the fill at half their sharpness (the game's own shadow_resolution works the same
+// way: pass_sx scales the viewport, the projection is NDC-based and the lighting samples normalised UVs). The copy is
+// a fullscreen render pass - a blit's format feature need not be reported (Adreno's does not report it for these).
+static TexBackend za_red_b[2];      // 0: our depth, 1: our colour (the object-ID map)
+static VkImageView za_red_v[2];     // their 2D views
+static NvnTexture *za_red_game[2];  // the game's arrays the pass's results are blitted into
+static uint32_t za_red_w = 512;     // our attachments' size
+static bool pass_reduced;           // the pass being recorded draws into ours (begin_pass sets, its end blits and clears)
+static bool za_red_usable = true;   // (cleared if the formats cannot be blitted)
+
+// "Distância das sombras: Só próximas": the distant cascade's pass is skipped entirely (its layer cleared to
+// no-shadow values, exec.c begin_pass), so the sun only shadows what the near cascade covers. A Reduzida whose
+// half-size textures are not made yet (the first pass, or a failed make) skips the same way.
+static bool za_far_shadow_pass(void) {
+    int layer;
+    return za_shadow_layer(&layer) && layer == 1 &&
+           (g_settings.shadow_distance == SHADOW_DISTANCE_NEAR ||
+            (g_settings.shadow_distance == SHADOW_DISTANCE_REDUCED && !za_red_b[0].image));
+}
+
+static void za_red_forget(NvnTexture *t) {  // (vk_exec_texture_destroyed: the game released an array mid-frame)
+    for (int i = 0; i < 2; i++) if (za_red_game[i] == t) za_red_game[i] = NULL;
+}
+static bool za_red_make(int i, uint32_t w, VkFormat vf, VkImageAspectFlags aspect) {
+    TexBackend *b = &za_red_b[i];
+    if (b->image && b->format == vf && b->width == w) return za_red_v[i] != VK_NULL_HANDLE;
+    if (b->image) {
+        vk_views_forget(b);
+        vk_defer_image(b->image, b->mem);
+        b->image = VK_NULL_HANDLE, b->mem = VK_NULL_HANDLE, za_red_v[i] = VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = vf,
+                            .extent = {w, w, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = (aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                                                        : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL) != VK_SUCCESS) return false;
+    b->format = vf, b->width = b->height = w, b->depth = 1, b->layers = 1, b->levels = 1, b->samples = 1, b->aspect = aspect,
+    b->base_type = VK_IMAGE_VIEW_TYPE_2D;
+    vk_image_init_layout(vk_cmd(), b->image, aspect);
+    static const VkComponentMapping id = {0};
+    za_red_v[i] = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, vf, 0, 1, 0, 1, id, aspect);
+    return za_red_v[i] != VK_NULL_HANDLE;
+}
+// The copy's pipeline: the post passes' vertex, a fetch-and-write fragment, and (depth) a depth write of the fetched
+// value. Cached per format; the depth one differs from the colour one by the depth attachment state.
+static VkPipeline za_red_pipe(VkFormat df, bool depth) {
+    static struct { VkFormat f; bool d; VkPipeline p; } cache[8];
+    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].f == df && cache[i].d == depth) return cache[i].p;
+    if (!post_layout) post_pipeline_kind("shadow_far_id.frag", 0, VK_FORMAT_UNDEFINED, VK_FORMAT_R8G8B8A8_UNORM);  // (makes the layout; this fragment is tiny)
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_builtin_shader("post.vert"), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_builtin_shader(depth ? "shadow_far_depth.frag" : "shadow_far_id.frag"), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                                                .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE,
+                                                .depthCompareOp = VK_COMPARE_OP_ALWAYS};
+    VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
+                                              .pAttachments = &cba};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    if (depth) ri.depthAttachmentFormat = df;
+    else { ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &df; }
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = depth ? NULL : &cb, .pDynamicState = &dy, .layout = post_layout};
+    VkPipeline p;
+    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].f = df, cache[i].d = depth, cache[i].p = p; break; }
+    return p;
+}
+// One fullscreen copy: our cascade's texels up onto the game's layer (a render pass - the driver need not report a
+// blit feature for these formats, which Adreno's does not).
+static void za_red_copy(VkCommandBuffer cb, VkImageView src, uint32_t src_w, TexBackend *dst, uint32_t layer, bool depth) {
+    static const VkComponentMapping id = {0};
+    VkImageView dv = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, dst->format, 0, 1, layer, 1, id,
+                                  depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!dv) return;
+    VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv,
+                                   .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                   .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkPipeline pipe = za_red_pipe(dst->format, depth);
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dst->width, dst->height}},
+                          .layerCount = 1, .colorAttachmentCount = depth ? 0u : 1u, .pDepthAttachment = depth ? &a : NULL,
+                          .pColorAttachments = depth ? NULL : &a};
+    rec_CmdBeginRendering(cb, &ri);
+    VkDescriptorSet dset = vk_alloc_set(post_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(false), src, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0,
+                              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    rec_UpdateDescriptorSets(1, &w);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, post_layout, 0, 1, &dset, 0, NULL);
+    VkViewport vp = {0, 0, (float)dst->width, (float)dst->height, 0, 1};
+    VkRect2D sc = {{0, 0}, {dst->width, dst->height}};
+    rec_CmdSetViewport(cb, 0, 1, &vp);
+    rec_CmdSetScissor(cb, 0, 1, &sc);
+    float pc[8] = {(float)src_w / (float)dst->width, (float)src_w / (float)dst->height, (float)src_w, (float)src_w};
+    rec_CmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+    fullscreen_vertex_bind(cb);
+    rec_CmdDraw(cb, 3, 1, 0, 0);
+    rec_CmdEndRendering(cb);
+}
+// The pass's results into the game's arrays: our half-size images onto layer 1 (a depth 1.0 / ID 0 reads as lit where
+// no copy has landed).
+static void za_red_blit(void) {
+    TexBackend *gd = za_red_game[0] ? za_red_game[0]->backend : NULL;
+    TexBackend *gc = za_red_game[1] ? za_red_game[1]->backend : NULL;
+    if (!pass_reduced) return;
+    pass_reduced = false;
+    if (!gd || !za_red_b[0].image || !za_red_v[0]) return;
+    VkCommandBuffer cb = vk_cmd();
+    static const VkComponentMapping id = {0};
+    VkImageView sv = vk_image_view(&za_red_b[0], VK_IMAGE_VIEW_TYPE_2D, za_red_b[0].format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (sv) za_red_copy(cb, sv, za_red_w, gd, 1, true);
+    if (gc && za_red_b[1].image && za_red_v[1]) {
+        VkImageView sc = vk_image_view(&za_red_b[1], VK_IMAGE_VIEW_TYPE_2D, za_red_b[1].format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (sc) za_red_copy(cb, sc, za_red_w, gc, 1, false);
+    }
+    static bool logged;
+    if (!logged) { logged = true; LOG("[vk] sun-shadow reduced: the distant cascade drawn at %ux%u, copied into the game's layer 1\n", za_red_w, za_red_w); }
+}
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
@@ -1934,6 +2089,7 @@ static void begin_pass(void) {
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    za_red_blit();  // (the pass just ended was a Reduzida far cascade: its results into the game's layer 1, ordered)
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -1951,8 +2107,31 @@ static void begin_pass(void) {
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     uint32_t layers = UINT32_MAX;  // layered rendering: the fewest layers of any attachment
+    int red_layer;
+    bool layer1_here = za_shadow_layer(&red_layer) && red_layer == 1;
+    bool reduced = za_red_usable && g_settings.shadow_distance == SHADOW_DISTANCE_REDUCED && layer1_here;
+    // Reduzida makes both of its attachments up front: either both are ours or the mode degrades to Só próximas
+    // (a mixed pass - our depth but the game's object-ID map, or the other way - would render one of them wrong).
+    NvnTexture *idmap = NULL;
+    if (reduced)
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            NvnTexture *t = st.rt.color[i];
+            if (t && t->target == 4 && t->width == 1024 && t->height == 1024 && t->depth == 3 && st.rt.has_cview[i] &&
+                (st.rt.cview[i].setmask & 2) && st.rt.cview[i].min_layer == 1 && st.rt.cview[i].num_layers == 1) { idmap = t; break; }
+        }
+    if (reduced) {
+        renderer_mark_gpu_owned(st.rt.depth);  // (the game's bound arrays: their backends exist from the bind)
+        if (idmap) renderer_mark_gpu_owned(idmap);
+        TexBackend *db = st.rt.depth->backend, *cbk = idmap ? idmap->backend : NULL;
+        reduced = db && cbk && db->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                  za_red_make(0, za_red_w, db->format, VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                  za_red_make(1, za_red_w, cbk->format, VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    bool far_shadow = za_far_shadow_pass() ||  // (Só próximas, and a degraded Reduzida: clear like it)
+                      (g_settings.shadow_distance == SHADOW_DISTANCE_REDUCED && layer1_here && !reduced);
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_samples = 1;
+    za_red_game[0] = reduced ? st.rt.depth : NULL;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1973,11 +2152,26 @@ static void begin_pass(void) {
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
         }
+        // The object-ID map, layer 1 (an array of the cascade's size): a skipped far cascade must read as no object-ID
+        // self-shadow guard; a reduced one renders it into our own half-size copy.
+        if (t->target == 4 && t->width == 1024 && t->height == 1024 && t->depth == 3 &&
+            st.rt.has_cview[i] && (st.rt.cview[i].setmask & 2) && st.rt.cview[i].min_layer == 1 &&
+            st.rt.cview[i].num_layers == 1) {
+            if (reduced) {
+                ca[i].imageView = za_red_v[1];
+                za_red_game[1] = t;
+            }
+            if (reduced || far_shadow) {
+                ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                memset(ca[i].clearValue.color.float32, 0, sizeof ca[i].clearValue.color.float32);
+            }
+        }
         pass_color[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) && vk_format(t->format) == b->format
                       ? vk_format(st.rt.cview[i].format) : b->format;
         pass_color[i] = vk_view_format(b, pass_color[i]);  // (g_vk.lean_usage: the format the view really has)
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
-        uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
+        uint32_t ew = reduced && ca[i].imageView == za_red_v[1] ? za_red_w : level_extent(b->width, lv),
+                 eh = reduced && ca[i].imageView == za_red_v[1] ? za_red_w : level_extent(b->height, lv);
         if (!w) { renderer_texture_scale(t, &pass_sx, &pass_sy); w = ew; }
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;
@@ -2006,10 +2200,17 @@ static void begin_pass(void) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            // Reduzida: the depth comes from our own half-size image (both attachments were made up front, above).
+            if (reduced) a.imageView = za_red_v[0];
             if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { da = a; has_d = true; pass_depth = b->format; }
             if (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sa = a; has_s = true; pass_stencil = b->format; }
+            if ((far_shadow || reduced) && has_d) {
+                da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                da.clearValue.depthStencil.depth = 1.0f;  // (the maximum depth: every comparison reads as lit)
+            }
             uint32_t lv = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
-            uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
+            uint32_t ew = reduced && da.imageView == za_red_v[0] ? za_red_w : level_extent(b->width, lv),
+                     eh = reduced && da.imageView == za_red_v[0] ? za_red_w : level_extent(b->height, lv);
             if (!w) { renderer_texture_scale(st.rt.depth, &pass_sx, &pass_sy); w = ew; }
             if (ew < minw) minw = ew;
             if (eh < minh) minh = eh;
@@ -2057,6 +2258,12 @@ static void begin_pass(void) {
         }
     }
     pass_w = minw; pass_h = minh;
+    if (reduced) {  // the game's viewport (its cascade map's size) lands on our half-size attachments - the whole
+                    // projection in a quarter of the pixels, the same way the game's own shadow_resolution scales
+        TexBackend *gb = za_red_game[0] ? za_red_game[0]->backend : NULL;
+        if (gb && gb->width) { pass_sx = (float)za_red_w / (float)gb->width; pass_sy = (float)za_red_w / (float)gb->height; }
+        pass_reduced = true;
+    }
     pass_layers = layers == UINT32_MAX ? 1 : layers;
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = pass_layers,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = pass_ncolor ? ca : NULL,
@@ -3590,6 +3797,7 @@ void vk_exec_texture_destroyed(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if (st.rt.color[i] == t) st.rt.color[i] = NULL, rt = true;
     if (st.rt.depth == t) st.rt.depth = NULL, rt = true;
     if (rt) st.rt_dirty = true;  // (an open pass keeps its views: they are destroyed once the GPU is done)
+    za_red_forget(t);  // (the reduced cascade's blit targets: skip the copy if the game released an array)
     for (int i = 0; i < 4; i++) if (feedback_tex[i] == t) feedback_tex[i] = NULL;
     snapshots_invalidate(t);
     for (int i = 0; i < 8; i++) if (snap_tex[i] == t) snap_tex[i] = NULL;
@@ -5398,6 +5606,38 @@ static bool xm_on(void) {
 
 static bool xm_inside(uint64_t a, uint64_t n) { return xm_lo && a >= xm_lo && a + n <= xm_lo + XM_SIZE; }
 
+// "Distância das sombras: Só personagens": is this draw a skinned character? Characters are skinned by transform
+// feedback and their draws read the results as vertex streams. Two signals, either one: inside the mirror's window
+// when the XFB mirror is placed (xm_inside; PC), or inside a range some transform feedback session wrote - recorded
+// below no matter the mirror (the guest heap's own addresses; Android places no mirror). Scenery, static, is never
+// in either. With no signal at all (no mirror and no sessions seen) nothing is skipped - the option degrades to
+// Completa.
+#define ZA_XFB_OUT_MAX 512
+static struct { uint64_t lo, hi; } za_xfb_out[ZA_XFB_OUT_MAX];
+static int za_xfb_out_n;
+static void za_xfb_out_note(uint64_t a, uint64_t n) {
+    if (!n) return;
+    uint64_t hi = a + n;
+    for (int i = 0; i < za_xfb_out_n; i++)
+        if (a < za_xfb_out[i].hi + 4096 && hi > za_xfb_out[i].lo - 4096) {  // (overlap or adjacent: merged)
+            za_xfb_out[i].lo = za_xfb_out[i].lo < a ? za_xfb_out[i].lo : a;
+            za_xfb_out[i].hi = za_xfb_out[i].hi > hi ? za_xfb_out[i].hi : hi;
+            return;
+        }
+    if (za_xfb_out_n < ZA_XFB_OUT_MAX) { za_xfb_out[za_xfb_out_n].lo = a, za_xfb_out[za_xfb_out_n].hi = hi; za_xfb_out_n++; }
+}
+static bool za_xfb_out_touch(uint64_t a, uint64_t n) {
+    for (int i = 0; i < za_xfb_out_n; i++)
+        if (a < za_xfb_out[i].hi && a + n > za_xfb_out[i].lo) return true;
+    return false;
+}
+static bool za_shadow_character(void) {
+    if (!xm_lo && !za_xfb_out_n) return true;  // (no way to tell - draw everything)
+    for (int s = 0; s < st.nstream; s++)
+        if (st.vbuf[s].size && (xm_inside(st.vbuf[s].addr, st.vbuf[s].size) || za_xfb_out_touch(st.vbuf[s].addr, st.vbuf[s].size))) return true;
+    return false;
+}
+
 static bool xm_all_written(uint64_t a, uint64_t n) {
     if (!n || !xm_inside(a, n)) return false;
     uint32_t now = (uint32_t)vk_frame_counter() + 1;
@@ -7084,6 +7324,8 @@ static void draw(CmdRec *r, bool indexed) {
             if (xfb_addr[b] >= gwin_base && xfb_size[b] && xfb_addr[b] - gwin_base < gwin_max)
                 vc_mark_gpu(xfb_addr[b] - gwin_base, xfb_addr[b] - gwin_base + xfb_size[b]);
         xm_draw = xm_prepare();
+        for (int b = 0; b < 4; b++)
+            if (xfb_size[b]) za_xfb_out_note(xfb_addr[b], xfb_size[b]);  // (the "só personagens" shadow signal: guest addresses the sessions write; exec.c za_shadow_character)
         static int nlog;
         if (nlog++ < 24)
             LOG("[xfb] draw indexed %d mode %llu first %llx count %llu | buffers %llx+%llx %llx+%llx %llx+%llx\n", indexed,
@@ -7103,6 +7345,41 @@ static bool water_is_surface(Prog *pr);
 static void water_before(void);
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
+    int shadow_layer;
+    if (za_shadow_layer(&shadow_layer)) {
+        static int shadow_dbg = -1;
+        if (shadow_dbg < 0) shadow_dbg = ENV("LARECOMP_SHADOW_DEBUG") != NULL;
+        if (shadow_dbg) {
+            static int shadow_dbg_n;
+            if (shadow_dbg_n < 400) {
+                shadow_dbg_n++;
+                uint64_t va = st.nstream ? st.vbuf[0].addr : 0, vs_ = st.nstream ? st.vbuf[0].size : 0;
+                LOG("[shadowdbg] layer %d xfb %d streams %d vbuf %llx+%llx intable %d prog %llx\n", shadow_layer, xfb_on,
+                    st.nstream, (unsigned long long)va, (unsigned long long)vs_, (int)za_xfb_out_touch(va, vs_),
+                    (unsigned long long)(st.program ? st.program->stages[0].code_addr : 0));
+            }
+        }
+        bool skip;
+        static bool logged_near, logged_chars, logged_off;
+        if (g_settings.shadow_distance == SHADOW_DISTANCE_OFF)
+            skip = true;  // (every layer: begin_pass clears each to the no-shadow values, so nothing casts a shadow)
+        else if (g_settings.shadow_distance == SHADOW_DISTANCE_CHARACTERS)
+            skip = !za_shadow_character();  // (either cascade: only skinned characters cast sun shadows)
+        else
+            skip = za_far_shadow_pass();  // (Near only - and a Reduzida whose textures are not up yet)
+        if (skip) {
+            if (g_settings.shadow_distance == SHADOW_DISTANCE_OFF) {
+                if (!logged_off) { logged_off = true; LOG("[vk] sun-shadow map off (layers cleared to no-shadow values)\n"); }
+            } else if (g_settings.shadow_distance == SHADOW_DISTANCE_CHARACTERS) {
+                if (!logged_chars) { logged_chars = true; LOG("[vk] sun-shadow map keeps only skinned characters\n"); }
+            } else {
+                if (!logged_near) { logged_near = true; LOG("[vk] distant sun-shadow cascade disabled (layer 1 cleared to no-shadow values)\n"); }
+            }
+            begin_pass();  // (clears the distant depth/object-ID layer to the no-shadow values)
+            SKIP(SK_HIDDEN);
+            return;
+        }
+    }
     if (!st.program) { SKIP(SK_NO_PROGRAM); return; }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;

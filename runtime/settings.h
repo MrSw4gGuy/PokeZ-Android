@@ -16,6 +16,8 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
 enum { SHADOW_RES_HALF = 5, SHADOW_RES_3Q = 6 };  // (shadow_res codes below the game's size: 50%, 75%)
+enum { THERMAL_PROFILE_COOLER = 0, THERMAL_PROFILE_NO_COOLER = 1 };
+enum { SHADOW_DISTANCE_FULL = 0, SHADOW_DISTANCE_REDUCED = 1, SHADOW_DISTANCE_NEAR = 2, SHADOW_DISTANCE_CHARACTERS = 3, SHADOW_DISTANCE_OFF = 4 };  // (vulkan/exec.c za_shadow_layer: reduced draws the distant cascade at half size into our own textures and blits it into the game's layer 1; near cascade only skips layer 1 of Z-A's sun-shadow map; characters only skips every non-skinned draw in both; off skips the whole map, cleared to no-shadow values)
 // Sharpening (AMD FSR 1's RCAS, runtime/nvn/vulkan/exec.c post_process): Auto = FSR's own after its upscale only
 enum { SHARPEN_AUTO = 0, SHARPEN_OFF, SHARPEN_LOW, SHARPEN_MEDIUM, SHARPEN_HIGH, SHARPEN_N };
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3, PROMPTS_KEYBOARD = 4, PROMPTS_STEAMDECK = 5 };  // (keyboard: Pokémon Z-A's font glyphs, runtime/hle/pl.c)
@@ -69,7 +71,7 @@ typedef struct {
     int gtao_strength;   // its strength, percent (25-100; 100 the default look)
     // Pokémon Z-A 2.0.2's graphics tweaks (runtime/hle/za_tweaks.c, tools/za_patches.py ZA_TWEAKS), at once:
     int tex_quality;     // 0 high, 1 medium, 2 low: a smaller mip level of the material textures (vulkan/textures.c)
-    int za_lod;          // 0 the game's level of detail, 1 more detail at a distance (less pop-in, more GPU time)
+    int za_lod;          // 0 game, 1 more detail at distance, 2 less detail at distance
     int za_dof_off;      // 1: no depth of field
     int za_fxaa_off;     // 1: no FXAA (the game's own anti-aliasing)
     int za_bloom_off;    // 1: no bloom (its pass skipped too: less GPU time)
@@ -84,6 +86,8 @@ typedef struct {
     int shadow_res;    // 1-4: shadow maps drawn at that many times the game's size, from the next start (vulkan/textures.c);
                        // SHADOW_RES_HALF / _3Q: 50% / 75% of it (a phone: their pass is about half its GPU's frame)
     int shadow_sharp;  // 1-4: the game's shadow filter that many times narrower, up to shadow_res (vulkan/exec.c)
+    int shadow_distance;  // SHADOW_DISTANCE_*: render the distant sun-shadow cascade too, or only the near one (vulkan/exec.c)
+    int thermal_profile;  // THERMAL_PROFILE_*: adaptive render-scale curve for cooler / no cooler (platform/android.c)
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool rumble;         // controller vibration from the game (runtime/hle/input.c)
     int rumble_strength; // its intensity, percent (25 / 50 / 75 / 100)
@@ -138,6 +142,8 @@ typedef struct {
     char rando_seed[128];  // active randomizer seed (rando/<name>/), empty = vanilla
     char rando_options[48];  // the Randomizer tab's New seed options: a seed ID without its random part (empty = defaults)
     bool fps60_lock;  // with fps60: stays at 60 even when this PC can't hold it (slow motion below; runtime/hle/framepace.c)
+    bool fps45;       // Z-A only: the game's 30 fps machinery at a 90 Hz vsync - two world steps and a present every
+                      // other, at the right speed: 45 fps (runtime/hle/framepace.c, runtime/hle/vi.c)
     bool frame_gen;   // at 30 fps, an image made between each two frames: shown at 60 (vulkan/exec.c vk_fg_make)
     int ui_lang;      // UI_LANG_*: the start screen's language (runtime/ui/launcher.mm); auto = the system's
     // mods/ folders (runtime/services/fs.c layers them): '|' between names. order: first wins where two replace the

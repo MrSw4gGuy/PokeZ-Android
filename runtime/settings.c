@@ -65,6 +65,8 @@ Settings g_settings = {
     .shadow_res = 1,
 #endif
     .shadow_sharp = 1,
+    .shadow_distance = SHADOW_DISTANCE_FULL,
+    .thermal_profile = THERMAL_PROFILE_COOLER,
     .gtao_strength = 100,
     .ssgi_strength = 100,
     .inv_keys = true,
@@ -305,6 +307,7 @@ void settings_load(void) {
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
+        else if (!strcmp(key, "fps45")) g_settings.fps45 = atoi(val) != 0;
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) != 0;
         else if (!strcmp(key, "hdr")) g_settings.hdr = atoi(val) != 0;
         else if (!strcmp(key, "hdr_peak_nits")) { int n = atoi(val); g_settings.hdr_peak = n < 200 ? 200 : n > 10000 ? 10000 : n; }
@@ -326,8 +329,10 @@ void settings_load(void) {
                                   : v < 1 ? 1 : v > 4 ? 4 : (int)v;
         }
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
+        else if (!strcmp(key, "shadow_distance")) g_settings.shadow_distance = (atoi(val) >= SHADOW_DISTANCE_FULL && atoi(val) <= SHADOW_DISTANCE_OFF) ? atoi(val) : SHADOW_DISTANCE_FULL;
+        else if (!strcmp(key, "thermal_profile")) g_settings.thermal_profile = atoi(val) == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
-        else if (!strcmp(key, "za_lod")) g_settings.za_lod = atoi(val) == 1;
+        else if (!strcmp(key, "za_lod")) { int v = atoi(val); g_settings.za_lod = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "texture_quality")) { int v = atoi(val); g_settings.tex_quality = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "za_dof_off")) g_settings.za_dof_off = atoi(val) != 0;
         else if (!strcmp(key, "za_fxaa_off")) g_settings.za_fxaa_off = atoi(val) != 0;
@@ -454,6 +459,7 @@ void settings_save(void) {
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "fps60 = %d\n", g_settings.fps60);
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
+    fprintf(f, "fps45 = %d\n", g_settings.fps45);
     fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
     fprintf(f, "aniso16 = %d\n", g_settings.aniso16);
     fprintf(f, "hdr = %d\n", g_settings.hdr);
@@ -473,6 +479,8 @@ void settings_save(void) {
         fprintf(f, "shadow_resolution = %s\n", g_settings.shadow_res == SHADOW_RES_HALF ? "0.5" : "0.75");
     else fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
     fprintf(f, "shadow_sharpness = %d\n", g_settings.shadow_sharp);
+    fprintf(f, "shadow_distance = %d\n", g_settings.shadow_distance);
+    fprintf(f, "thermal_profile = %d\n", g_settings.thermal_profile);
     fprintf(f, "ambient_occlusion = %d\n", g_settings.gtao);
     fprintf(f, "texture_quality = %d\n", g_settings.tex_quality);
     fprintf(f, "za_lod = %d\n", g_settings.za_lod);

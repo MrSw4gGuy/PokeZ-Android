@@ -13,7 +13,7 @@
 
 uint32_t rt_za_tweak(int which, uint32_t game_value) {
     switch (which) {
-    case 0: return g_settings.za_lod == 1 ? 0xbf800000u : game_value;  // (-1.0f)
+    case 0: return g_settings.za_lod == 1 ? 0xbf800000u : g_settings.za_lod == 2 ? 0x3f800000u : game_value;
     case 1: return g_settings.za_dof_off ? 0 : game_value;
     case 2: return g_settings.za_fxaa_off ? 0 : game_value;
     case 3: return g_settings.za_bloom_off ? 0 : game_value;

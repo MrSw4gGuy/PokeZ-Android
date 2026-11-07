@@ -103,6 +103,8 @@ static bool hold_30(bool on) {
 // for the next vsync, not one already passed). Held, a frame that started after vsync S may not let the game start
 // the next one before S + 2: if vsync S + 1 hasn't come yet, wait for it here. (The time counts as blocked: idle.)
 extern volatile uint64_t g_vsync_count, g_vsync_ns;  // runtime/hle/vi.c
+extern volatile uint64_t g_vsync_period_ns;          // (60 Hz, or 90 in framepace.c's 45 fps mode)
+extern bool g_fps45_hold;  // runtime/hle/framepace.c rt_za_frame_cfg: the 45 fps mode forces the hold (2 steps a frame)
 static void hold_cadence(bool held) {
     static uint64_t v_exit;  // the vsync count when the game last went on from here (its next frame: from the vsync after)
     if (held && v_exit) {
@@ -112,7 +114,7 @@ static void hold_cadence(bool held) {
             uint64_t vt = __atomic_load_n(&g_vsync_ns, __ATOMIC_ACQUIRE);  // (first: the count is then at least its vsync's,
             n = __atomic_load_n(&g_vsync_count, __ATOMIC_ACQUIRE);          // so a vsync in between only wakes us early)
             if (n >= target || plat_now_ns() - t0 > 40000000ull) break;
-            uint64_t at = vt + (target - n) * 16666667ull + 250000ull;
+            uint64_t at = vt + (target - n) * g_vsync_period_ns + 250000ull;
             uint64_t now = plat_now_ns();
             plat_sleep_until_ns(at > now + 100000ull ? at : now + 100000ull);
         }
@@ -247,15 +249,14 @@ void pace_frame(void) {
             __atomic_store_n(&hitch_why, (const char *)why, __ATOMIC_RELAXED);
             __atomic_store_n(&hitch_at, now, __ATOMIC_RELEASE);
         }
-        hold_cadence(hold_30(pace_slow && on));
+        hold_cadence(g_game_is_la ? hold_30((pace_slow && on) || g_fps45_hold) : g_fps45_hold);
         return;
-    }
-    double busy = (p > wt ? p - wt : 0) / 1e6;
+    }    double busy = (p > wt ? p - wt : 0) / 1e6;
     // (Android's performance hints: this thread's CPU time for the frame against its budget - 33.3 ms in the game's
     // 30 fps mode, its period over 25 ms, else 16.7. CPU time, not busy time: Pokémon Z-A's wait for its next frame
     // counts as busy, and a frame reported as filling its budget kept the clocks up. platform.h plat_perf_hint, a no-op
     // elsewhere)
-    plat_perf_hint(tc ? tc : 1, p > 25000000ull ? 33333333ull : 16666667ull);
+    plat_perf_hint(tc ? tc : 1, p > 25000000ull ? 33333333ull : g_fps45_hold ? 22222222ull : 16666667ull);
     // What the frame would cost at 60 fps: a frame of the game's 30 fps mode (two vsyncs or more) runs its world twice,
     // and the second step - about half this thread's CPU time then (measured: 3.0 -> 6.0 ms, 4.9 -> 9.3 ms) - is work
     // a 60 fps frame doesn't have. Without that, the 30 fps mode's frames looked 3-5 ms slower than they would be at 60
@@ -316,7 +317,7 @@ void pace_frame(void) {
         if (ha != grace_of) grace_of = ha, ign_n = 0, ign_why = __atomic_load_n(&hitch_why, __ATOMIC_RELAXED);
         ign_n++, ign_busy += b, ign_late += late && !b;
         if (!on) return;
-        hold_cadence(hold_30(pace_slow));
+        hold_cadence(g_game_is_la ? hold_30(pace_slow) : g_fps45_hold);
         return;
     }
     nover += o - (over[idx] & 1);
@@ -378,7 +379,7 @@ void pace_frame(void) {
             memset(recent, 0, sizeof recent);
         }
     }
-    hold_cadence(hold_30(pace_slow));
+    hold_cadence(g_game_is_la ? hold_30(pace_slow) : g_fps45_hold);
 }
 
 uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *entry, uint64_t value) {

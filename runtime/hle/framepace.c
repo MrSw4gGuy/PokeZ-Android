@@ -83,7 +83,7 @@ static bool fps60_holds(void) {
     static bool retry;  // (60 again after a fall back: the shorter test)
     static uint64_t t0, p0, back_at, seen_hitch;
     if (dyn < 0) dyn = !ENV("LARECOMP_FPS60_DYNAMIC") || atoi(ENV("LARECOMP_FPS60_DYNAMIC")) != 0;
-    int setting = g_settings.fps60 | g_settings.fps60_lock << 1;
+    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps45 << 2;  // (the 45 mode: 60's state fresh)
     if (last_setting != setting) {  // (chosen again in F1: a new try)
         last_setting = setting;
         g_fps60_fell_back = retry = false, warm = slow = held_s = 0, backoff = 1, t0 = back_at = 0;
@@ -103,6 +103,15 @@ static bool fps60_holds(void) {
         if (scene) seen_hitch = h;
         held_s++;
         if (held_s % 10 == 0) LOG("[pace] at 30: %.1f ms CPU, GPU %.1f ms a frame\n", cpu, gpu);
+        static int said_hot;
+        if (plat_thermal_throttled()) {  // (while the thermal governor holds the render scale down, a try only heats
+            if (!said_hot) {             // the phone more and keeps it there: retries wait for the scale to recover;
+                LOG("[pace] holding 30: the phone is throttling (render scale down) - no 60 fps tries until it recovers\n");
+                said_hot = 1;
+            }
+            return false;
+        }
+        said_hot = 0;
         bool timer = held_s >= FPS60_RETRY_S * backoff;
         if (!dyn || cpu < 0 || cpu >= FPS60_BACK_MS || !(scene || timer)) return false;
         LOG("[pace] trying 60 fps again (%s; %.1f ms CPU a frame)%s\n", scene ? "the scene changed" : "a while at 30", cpu,
@@ -139,7 +148,20 @@ static bool fps60_holds(void) {
 int32_t rt_za_frame_cfg(int32_t cfg) {
     g_za_frame_hook = true;
     const char *e = ENV("LARECOMP_FPS");
-    bool on = e ? atoi(e) >= 60 : fps60_holds();
+    // The 45 fps mode (the user's fps45): the game's own 30 fps machinery - two world steps and a present interval of
+    // 2, forced by pace.c's hold - over a 90 Hz vsync: each frame is 2/90 s of world and shown 22.2 ms apart, the same
+    // speed and smoothness as a real 45 fps. A frame the GPU misses (over 22.2 ms) still steps 2: the world slows a
+    // little instead of the 60 fps mode's cliff - and nothing retries, so it never oscillates. LARECOMP_FPS wins (tests).
+    extern volatile uint64_t g_vsync_period_ns;  // runtime/hle/vi.c
+    bool f45 = !e && g_settings.fps45;    static bool was45;
+    if (f45 != was45) {
+        was45 = f45;
+        g_vsync_period_ns = f45 ? 11111111 : 16666667;
+        LOG("[pace] 45 fps mode %s: a 90 Hz vsync, two world steps and a present every two\n", f45 ? "on" : "off");
+    }
+    extern bool g_fps45_hold;  // runtime/nvn/pace.c hold_30: forced on while in the mode
+    g_fps45_hold = f45;
+    bool on = e ? atoi(e) >= 60 : f45 ? false : fps60_holds();
     static int logged = -1;
     if (logged != (int)on) { logged = on; LOG("[pace] game frame mode %d -> %d (%s)\n", cfg, on ? 0 : cfg, on ? "60 fps" : "as is"); }
     {   // the game's own time, in vsyncs: each frame it steps max(mode + 1, the vsyncs that really passed) - a replay
@@ -155,3 +177,5 @@ int32_t rt_za_frame_cfg(int32_t cfg) {
     return on ? 0 : cfg;
 }
 uint64_t g_game_vsyncs;  // (see rt_za_frame_cfg)
+bool g_fps45_hold;  // (see rt_za_frame_cfg: the 45 fps mode forces pace.c's hold - only once the game's frame hook has
+                    // run: pace.c reaches here on frames before the game manager exists, and its pointer isn't mapped yet)

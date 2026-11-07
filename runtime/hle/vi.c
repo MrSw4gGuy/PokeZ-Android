@@ -10,15 +10,17 @@ static KEvent *vsync_event;
 uint32_t vi_vsync_handle(void) { return vsync_r; }
 volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framepace.c, runtime/nvn/pace.c)
 volatile uint64_t g_vsync_ns;     // plat_now_ns() of the latest (stored after the count: count >= the vsync it's from)
+volatile uint64_t g_vsync_period_ns = 16666667;  // 60 Hz; framepace.c's 45 fps mode sets 90 Hz (11.1 ms)
 uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
     (void)arg;
-    const uint64_t period = 16666667;
+    uint64_t period = 16666667;  // (re-read each vsync: the 45 fps mode changes it on the fly)
     plat_thread_realtime(period);
     plat_thread_perf_core(PLAT_PERF_VSYNC);
     uint64_t next = plat_now_ns();
     for (;;) {
+        period = g_vsync_period_ns;
         next += period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();

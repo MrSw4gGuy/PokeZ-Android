@@ -490,18 +490,26 @@ static void tab_display(bool in_game) {
         // start); in game only with the frame hook (a supported game version).
         extern bool g_za_frame_hook, g_fps60_fell_back;
         if (!in_game || g_za_frame_hook) {  // (g_game_is_la stays 1 until the boot: no help on the start screen)
-            int fr = g_settings.fps60 ? 1 : 0;
-            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), "60 fps"};
-            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 2, 0,
-                           TR("30 fps: as on the Switch. 60 fps: the game presents every refresh and steps its world 1/60 s "
-                              "a frame - smoother, but it needs a fast CPU and GPU: the game counts frames, not time, so "
-                              "below 60 fps everything moves in slow motion (see the next option).",
-                              "30 fps: como no Switch. 60 fps: o jogo mostra um quadro a cada atualização da tela e avança o "
-                              "mundo 1/60 s por quadro - mais fluido, mas pede CPU e GPU rápidas: o jogo conta quadros, não "
-                              "tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção).")))
-                g_settings.fps60 = fr == 1;
+            int fr = g_settings.fps60 ? 2 : g_settings.fps45 ? 1 : 0;
+            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), TR("45 fps", "45 fps"), "60 fps"};
+            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 3, 0,
+                           TR("30 fps: as on the Switch. 45 fps: the game's own 30 fps pacing over a 90 Hz clock - two "
+                              "steps and a picture every other, at the right speed: smoother than 30 and far lighter than "
+                              "60; if a frame misses 45, the world slows a little instead of swinging between modes. 60 fps: "
+                              "the game presents every refresh and steps its world 1/60 s a frame - smoother still, but it "
+                              "needs a fast CPU and GPU: the game counts frames, not time, so below 60 fps everything moves "
+                              "in slow motion (see the next option).",
+                              "30 fps: como no Switch. 45 fps: o próprio ritmo de 30 fps do jogo sobre um clock de 90 Hz - "
+                              "dois passos e uma imagem a cada dois, na velocidade certa: mais fluido que 30 e muito mais "
+                              "leve que 60; se um quadro não alcançar 45, o mundo desacelera um pouco em vez de ficar "
+                              "alternando entre modos. 60 fps: o jogo mostra um quadro a cada atualização da tela e avança o "
+                              "mundo 1/60 s por quadro - mais fluido ainda, mas pede CPU e GPU rápidas: o jogo conta quadros, "
+                              "não tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção)."))) {
+                g_settings.fps60 = fr == 2;
+                g_settings.fps45 = fr == 1;
+            }
             bool fall = !g_settings.fps60_lock;
-            ImGui::BeginDisabled(!g_settings.fps60);
+            ImGui::BeginDisabled(!g_settings.fps60 || g_settings.fps45);
             if (opt_toggle(TR("Dynamic 30 / 60 fps", "30 / 60 fps dinâmico"), &fall, false,
                            TR("With 60 fps: when this PC doesn't keep 60 for a few seconds, the game goes to 30 fps by "
                               "itself instead of running in slow motion, and back to 60 once there is room again (the "
@@ -513,7 +521,7 @@ static void tab_display(bool in_game) {
                               "câmera lenta quando não acompanha.")))
                 g_settings.fps60_lock = !fall;
             ImGui::EndDisabled();
-            if (in_game && g_settings.fps60 && g_fps60_fell_back)
+            if (in_game && g_settings.fps60 && !g_settings.fps45 && g_fps60_fell_back)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
                                    TR("Running at 30 fps for now: 60 wasn't held (back to 60 when there is room).",
                                       "Rodando a 30 fps por enquanto: 60 não segurou (volta para 60 quando houver folga)."));
@@ -529,6 +537,19 @@ static void tab_display(bool in_game) {
                       "(barato para a GPU, cerca de meio quadro a mais de atraso nos comandos). Movimentos rápidos e "
                       "bordas de coisas em movimento podem borrar um pouco. Não faz nada quando o próprio jogo roda a 60."));
     }
+#ifdef __ANDROID__
+    if (!g_game_is_la && opt_button(TR("Turbo profile", "Perfil Turbo"),
+                                    TR("Applies 60 fps with automatic fallback to 30, the game's dynamic resolution, reduced distant shadows, and earlier use of simpler models. Frame generation stays off. Other video settings are unchanged. Dynamic resolution can lower image sharpness; the LOD setting can make model changes more visible.",
+                                       "Aplica 60 fps com retorno automático a 30, resolução dinâmica do jogo, sombras distantes reduzidas e uso mais cedo de modelos simples. A geração de quadros fica desligada. As demais opções de vídeo não mudam. A resolução dinâmica pode reduzir a nitidez, e o LOD pode deixar as trocas de modelo mais visíveis."))) {
+        g_settings.fps60 = true;
+        g_settings.fps60_lock = false;
+        g_settings.game_drs = true;
+        g_settings.shadow_distance = SHADOW_DISTANCE_REDUCED;
+        g_settings.za_lod = 2;
+        g_settings.frame_gen = false;
+        settings_save();
+    }
+#endif
     {   // (runtime/nvn/vulkan/textures.c vk_sampler_settings: every sampler made again, at once)
         int tf = g_settings.aniso16 ? 1 : 0;
         const char *tfs[] = {TR("Game's", "Do jogo"), TR("High", "Alta")};
@@ -663,6 +684,14 @@ static void tab_display(bool in_game) {
         if (opt_choice(TR("Internal resolution", "Resolução interna"), &ri, res, NRES, rdef, d, false))
             g_settings.res_mode = res_mode[ri], g_settings.res_auto = false;
     }
+#ifdef __ANDROID__
+    {
+        const char *profiles[] = {TR("With cooler", "Com cooler"), TR("Without cooler", "Sem cooler")};
+        opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 2, THERMAL_PROFILE_COOLER,
+                   TR("Choose the curve for your setup. With cooler: starts scaling down at headroom 0.80, in steps to 60%. Without cooler: reacts at 0.70, can drop to 50%, and recovers only below 0.45. This does not detect a cooler; select the matching profile yourself.",
+                      "Escolha a curva conforme seu uso. Com cooler: começa a reduzir a escala no headroom 0,80, em degraus até 60%. Sem cooler: reage em 0,70, pode cair até 50% e só recupera abaixo de 0,45. O app não detecta o cooler; selecione o perfil correspondente manualmente."));
+    }
+#endif
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
 #ifdef __APPLE__
         const char *ups[] = {TR("Bilinear", "Bilinear"), "MetalFX"};
@@ -744,6 +773,13 @@ static void tab_display(bool in_game) {
             opt_disable_next();  // (nothing to narrow at the game's size or below)
         if (opt_choice(TR("Shadow sharpness", "Nitidez das sombras"), &sh, sz, 4, 0, shd))
             g_settings.shadow_sharp = sh + 1;
+        if (!g_game_is_la) {
+            const char *sd[] = {TR("Full", "Completa"), TR("Reduced", "Reduzida"), TR("Near only", "Só próximas"),
+                                TR("Characters only", "Só personagens"), TR("No shadows", "Sem sombras")};
+            opt_choice(TR("Shadow distance", "Distância das sombras"), &g_settings.shadow_distance, sd, 5, SHADOW_DISTANCE_FULL,
+                       TR("Full draws both sun-shadow cascades. Reduced draws the distant cascade at half resolution, with softer distant shadows and lower raster cost. Near only skips the distant cascade and leaves that area unshadowed. Characters only keeps no scenery shadows at all: only the game's characters and Pokémon cast sun shadows (a short shadow under each of them). No shadows skips the whole sun-shadow map - nothing casts a shadow, the lightest option, for weak phones. Changes at once.",
+                          "Completa desenha as duas cascatas de sombras do sol. Reduzida desenha a cascata distante com metade da resolução, deixando as sombras longínquas mais suaves e reduzindo o custo de rasterização. Só próximas pula a cascata distante e deixa essa área sem sombras. Só personagens abandona as sombras do cenário: só os personagens e Pokémon do jogo projetam sombra do sol (uma sombra curta embaixo de cada um). Sem sombras pula o mapa de sombras inteiro - nada projeta sombra, a opção mais leve, para celulares mais fracos. Muda na hora."));
+        }
     }
 #ifndef __APPLE__
     {   // (runtime/nvn/vulkan/exec.c post_process)
@@ -784,12 +820,14 @@ static void tab_display(bool in_game) {
                       "heat), softer up close; on a phone's screen it hardly shows. Changes at once.",
                       "Média / Baixa: as texturas na metade / num quarto do tamanho - menos tráfego de memória para a GPU "
                       "(menos calor), mais suaves de perto; na tela de um celular quase não se nota. Muda na hora."));
-        const char *lod[] = {TR("Game's", "Do jogo"), TR("High", "Alto")};
-        opt_choice(TR("Level of detail", "Nível de detalhe"), &g_settings.za_lod, lod, 2, 0,
+        const char *lod[] = {TR("Game's", "Do jogo"), TR("High", "Alto"), TR("Performance", "Desempenho")};
+        opt_choice(TR("Level of detail", "Nível de detalhe"), &g_settings.za_lod, lod, 3, 0,
                    TR("High: characters and buildings keep their detailed models farther away - less pop-in, at more "
-                      "GPU time. Changes at once.",
+                      "GPU time. Performance: simpler models are used sooner, which may reduce GPU load but can make "
+                      "pop-in more visible. Changes at once.",
                       "Alto: personagens e prédios mantêm os modelos detalhados até mais longe - menos pop-in, por mais "
-                      "tempo da GPU. Muda na hora."));
+                      "tempo da GPU. Desempenho: modelos mais simples entram mais cedo; isso pode reduzir a carga da GPU, "
+                      "mas deixar a troca de modelos mais visível. Muda na hora."));
         bool b = !g_settings.za_bloom_off;
         if (opt_toggle("Bloom", &b, true,
                        TR("The glow around bright lights and the sky. Off: a little less GPU time (its pass is skipped). "

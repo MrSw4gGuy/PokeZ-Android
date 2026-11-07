@@ -73,6 +73,9 @@ bool plat_gpu_share(uint64_t addr, uint64_t size);
 // The shared range and its AHardwareBuffer (NULL: none)
 void *plat_gpu_shared(uint64_t *addr, uint64_t *size);
 double plat_thermal_scale(double now);
+// 1 while the thermal governor holds the render scale below 100% (framepace.c: an automatic 60 fps try while it does
+// only heats the phone more and keeps the scale down; one chosen again in F1 still runs)
+int plat_thermal_throttled(void);
 // The presenting thread's frame: what it took and what it may take (Android's performance hints, ADPF: the CPU clocks
 // it keeps follow the real frame budget, not a guess)
 void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
@@ -83,6 +86,7 @@ void plat_frame_rate_hint(void *sdl_window, float fps);
 static inline void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) { (void)work_ns, (void)target_ns; }
 static inline void plat_frame_rate_hint(void *sdl_window, float fps) { (void)sdl_window, (void)fps; }
 static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
+static inline int plat_thermal_throttled(void) { return 0; }
 #endif
 
 // ---- process
