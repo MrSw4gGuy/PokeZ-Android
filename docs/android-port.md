@@ -84,6 +84,28 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
   a 60 Hz, velocidade certa, 25 ms de GPU por quadro em média; a cadência é 16,7 / 33,3 ms (não perfeitamente regular).
 - **Glitch nos olhos** (íris com faixa branca): NÃO é o LOD (persiste com za_lod=0). Aberto: investigar shader/
   textura do olho no backend Vulkan.
+- **G-buffer não depende de pixels** (medido em 2026-11-06 na estação, `save-diag`, `LARECOMP_FPS=60`,
+  `LARECOMP_THERMAL=0`, `LARECOMP_GPUPROF_AT=2400,2700,3000`; passe fs `97b51b1ac26933a3`, 289 desenhos em todas as
+  rodadas):
+
+  | Resolução | LOD | G-buffer |
+  |---|---|---|
+  | 75% | do jogo | 9,7–11,5 ms; repetido: 8,2–9,4 ms |
+  | 50% | do jogo | 10,0–10,9 ms |
+  | 75% | Desempenho | 10,6–11,3 ms |
+  | 50% | Desempenho | 8,8–10,5 ms |
+
+  Com 56% menos pixels o passe custa o mesmo, então texturas menores, resolução e upscaler não aliviam o maior
+  custo da GPU (o viés de mip do F1 já cobre a banda de textura, e o Adreno 830 lê BC1–BC7 nativamente, sem
+  descompactar). O LOD Desempenho não muda nem o número de desenhos na estação. O custo é por vértice/desenho:
+  ~2,9 milhões de vértices por quadro a ~290 milhões/s, muito abaixo do que o Adreno 830 faz; as sombras já
+  mostravam o mesmo (metade da resolução, mesmo custo). Próximo passo: descobrir por que o shader de vértice
+  traduzido é lento (despejar o GLSL dos VS do G-buffer: leitura dos atributos e dos buffers de constantes na memória
+  do AHB?). Simplificar malhas no runtime (meshoptimizer, só índices novos) fica para depois, se os vértices ainda
+  pesarem.
+- **Ghidra**: `tools/za/nso2elf.py <exefs/main> <saída.elf>` gera o `main` descomprimido como ELF AArch64 (base
+  `0x7000000000`, relocações aplicadas); importar com File › Import File. O ELF contém código do jogo: nunca
+  commitar.
 - **Throttling**: com Turbo + cena pesada, o telefone entra em status 2/3 mesmo com cooler; o retry do 60 fps agora
   espera a escala térmica recuperar (plat_thermal_throttled). Para cenas pesadas, 30 fps segue sendo o modo seguro.
 
