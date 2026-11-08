@@ -44,6 +44,20 @@ static VkFormat depth24_stencil8(void) {
     return f;
 }
 
+// NVN RGB565 (0x3C) keeps red in the low bits: VK_FORMAT_B5G6R5_UNORM_PACK16 (Metal's B5G6R5Unorm, as MoltenVK maps
+// them). R5G6B5 swapped red and blue: Echoes of Wisdom's hearts (HUD, file select) take their alpha from such a mask's
+// red, and drew as solid red squares. B5G6R5 isn't a mandatory format: R5G6B5 where a driver lacks it.
+static VkFormat rgb565(void) {
+    static VkFormat f;
+    if (!f) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_B5G6R5_UNORM_PACK16, &p);
+        f = p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_FORMAT_B5G6R5_UNORM_PACK16 : VK_FORMAT_R5G6B5_UNORM_PACK16;
+        if (f == VK_FORMAT_R5G6B5_UNORM_PACK16) LOG("[vk] no B5G6R5: RGB565 textures with red and blue swapped\n");
+    }
+    return f;
+}
+
 static VkFmt fmt_of(uint32_t f) {
     switch (f) {
     case 0x01: return (VkFmt){VK_FORMAT_R8_UNORM};
@@ -94,7 +108,7 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
     case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return (VkFmt){rgb565()};
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};

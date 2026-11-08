@@ -121,10 +121,14 @@ extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // 0: one buffer.
 extern uint32_t maxwell_gmem_chunk_shift;
 extern bool maxwell_gmem_lazy;
-// The straight-line form of forward-only branches (glsl_flatten) unless LARECOMP_SHADER_FLAT says otherwise: the
-// runtime sets it before the first translation (Vulkan: off on AMD GPUs, exec.c vk_exec_init).
-extern bool maxwell_flat_default;
+// The straight-line form (glsl_flatten) unless LARECOMP_SHADER_FLAT says otherwise: 0 off, 1 forward branches only,
+// 2 loops too. The runtime sets it before the first translation (Vulkan: off on AMD GPUs, 2 on Android - exec.c
+// vk_exec_init).
+extern int maxwell_flat_default;
 extern bool maxwell_quad_ops;
+// GLSL: fmin / fmax / saturate as GLSL.std.450 NMin / NMax / NClamp (one instruction each) instead of explicit NaN
+// tests; the same NaN rules (translate.c glsl_minmax_nmin). Set before the first translation (exec.c vk_exec_init).
+extern bool maxwell_nmin;
 // Lazy mode, fragment: a shader without discard / depth output / stores declares early fragment tests (its GMiss
 // atomics would turn them off); one with discard / depth output (no stores) counts no misses - the
 // runtime imports the bound storage buffers' chunks before the draw. true (LARECOMP_VK_GMEM_FS_MISS=1): every shader
