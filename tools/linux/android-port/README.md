@@ -36,6 +36,27 @@ Device probes, built here and run with `adb shell` from `/data/local/tmp`: `test
 (`test_turnip.c`: what a custom Turnip driver build offers, loaded as a HAL module).
 The aarch64 Linux build (no Android): `build_aarch64.sh`, `gen_aarch64.sh`.
 
+## A custom Vulkan driver (Adreno: Mesa Turnip), optional
+
+`make ... VOLK=1 ADRENOTOOLS=<dir>` builds libmain.so on [volk](https://github.com/zeux/volk) instead of the Vulkan
+loader's prototypes, and loads the driver through [libadrenotools](https://github.com/bylaws/libadrenotools), so a
+Turnip build can replace Qualcomm's driver without root (runtime/nvn/vulkan/device.c `custom_driver`). Without
+`VOLK=1` nothing changes. Tested on a Snapdragon 8 Gen 2 (Adreno 740), where Turnip 27.0.0 R2 draws Z-A correctly
+and the phone's own driver (1.3.128) does not.
+
+1. volk matching the deps' Vulkan headers (1.4.350): `volk.h` and `volk.c` of its `1.4.350` tag into
+   `build/android/deps/include/volk/`.
+2. libadrenotools, cloned with its submodules and built for arm64 with the NDK:
+   `cmake -G Ninja -B build -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake
+   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31 -DCMAKE_BUILD_TYPE=Release && ninja -C build`.
+3. Its hook libraries (`build/src/hook/*.so`) and the driver, named `libvulkan_turnip.so`, into
+   `build/android/deps/adrenotools/`: make_project.sh packages that folder beside libmain.so.
+4. Build with the two variables, e.g. `MAKEFLAGS='VOLK=1 ADRENOTOOLS=/root/libadrenotools' bash za_apk.sh`.
+
+`LARECOMP_DRIVER` (env.txt) picks another driver at run time: a file name beside libmain.so, an absolute path to a
+driver unpacked into the app's internal storage, or `system` for the phone's own. A driver without `shaderInt64`
+(Qualcomm's) gets 32-bit integer pairs in the translated shaders (`LARECOMP_VK_INT64=0/1` forces either form).
+
 ## What is different on Android
 
 - The guest window is at 0x20_0000_0000, not 0x70_0000_0000: scudo, the platform allocator, owns that range from

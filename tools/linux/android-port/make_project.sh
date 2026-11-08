@@ -157,6 +157,9 @@ cp "$GAME_BUILD/libmain.so" "$JNI/"
 for l in libSDL3.so libavformat.so libavcodec.so libavutil.so libswscale.so libshaderc_shared.so; do
     cp "$DEPS/lib/$l" "$JNI/"
 done
+# Makefile VOLK=1: libadrenotools' hook libraries and the custom driver (libvulkan_turnip.so), when staged in
+# deps/adrenotools (README.md)
+if [ -d "$DEPS/adrenotools" ]; then cp "$DEPS/adrenotools/"*.so "$JNI/"; fi
 # libc++_shared is deliberately NOT packaged: see the Makefile's android LDFLAGS
 
 echo "=== bundled free fonts into assets/fonts (with their licences) ==="

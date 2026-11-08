@@ -1530,6 +1530,15 @@ void vk_exec_init(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &pr2);
     maxwell_quad_ops = (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) && (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT);
     LOG("[vk] subgroups: %u lanes, quad operations in fragment shaders: %s\n", sg.subgroupSize, maxwell_quad_ops ? "yes" : "no");
+    {   // 64-bit integers in translated shaders (carry chains, funnel shifts, global addresses) only where the device has
+        // shaderInt64: else (Qualcomm's own driver) 32-bit pairs with explicit carries. LARECOMP_VK_INT64=0/1 forces it.
+        VkPhysicalDeviceFeatures fe;
+        vkGetPhysicalDeviceFeatures(g_vk.phys, &fe);
+        const char *ie = getenv("LARECOMP_VK_INT64");
+        maxwell_int64 = ie && *ie ? atoi(ie) != 0 : fe.shaderInt64 != 0;
+        LOG("[vk] shader 64-bit integer math: %s (device shaderInt64 %d%s)\n", maxwell_int64 ? "native" : "32-bit pairs",
+            fe.shaderInt64, ie && *ie ? ", LARECOMP_VK_INT64" : "");
+    }
     if (!getenv("LARECOMP_SHADER_FLAT") && !maxwell_flat_default)
         LOG("[vk] straight-line shader form off (%s; LARECOMP_SHADER_FLAT=1: on)\n",
             fcs == GPU_OFF ? "F1 > Compatibility" : "this AMD GPU, F1 > Compatibility to turn it on");

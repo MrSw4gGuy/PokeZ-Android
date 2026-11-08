@@ -129,6 +129,17 @@ SHADERC  ?= -lshaderc_shared
 # then died in a std::string call (tombstone: snapalloc::SnapConstraintParser::StringToEnumType). Nothing
 # here passes C++ objects across a library boundary, so a private copy is safe.
 LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lnativewindow -lm
+# VOLK=1: Vulkan through volk (its volk.h / volk.c in $(DEPS)/include/volk) instead of linking the loader's
+# prototypes, so a custom driver - Mesa Turnip on Adreno GPUs, loaded with libadrenotools (ADRENOTOOLS=<its source
+# dir, built in build/>) - can stand in for the system's (runtime/nvn/vulkan/device.c custom_driver; README.md in
+# tools/linux/android-port). GENARCH=<-mcpu=...> tunes the game code for one CPU (default: none, generic armv8-a).
+ifeq ($(VOLK),1)
+# (_GNU_SOURCE: volk.h, included first, pulls in the system headers before platform/android.c's own #define)
+DEPINC   += -I$(DEPS)/include/volk -I$(ADRENOTOOLS)/include -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_ANDROID_KHR \
+            -DIMGUI_IMPL_VULKAN_USE_VOLK -DLARECOMP_VOLK -D_GNU_SOURCE -include volk.h
+LDFLAGS  += $(ADRENOTOOLS)/build/libadrenotools.a $(ADRENOTOOLS)/build/lib/linkernsbypass/liblinkernsbypass.a -ldl
+endif
+GENFLAGS += $(GENARCH)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
