@@ -486,7 +486,7 @@ VkCommandBuffer vk_cmd(void) {
             pthread_mutex_unlock(&cq_lock);
             if (q->pool) rec_CmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
         }
-        gp_mark(s->main, "(submission start; includes GPU idle before it)");
+        gp_mark(s->main, "(submission start: its work outside the passes below, e.g. the window image's)");
         if (prof_qp) {
             rec_CmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 3, 3);
             rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 3);
@@ -675,6 +675,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     s->ts_skip = wait != VK_NULL_HANDLE;
     if (s->ts_win && !s->ts_skip) s->ts_win = false;  // (not the window image's after all: counted as game work)
+    gp_mark(s->main, "(submission end: the GPU idle until the next one starts)");
     if (s->ts) rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 3 + 1);
     rec_EndCommandBuffer(s->main);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -1525,6 +1526,22 @@ void vk_exec_init(void) {
     bool flat_auto = g_vk.props.vendorID != 0x1002;
 #endif
     maxwell_flat_default = fcs != GPU_AUTO ? fcs == GPU_ON : flat_auto;
+#ifdef __ANDROID__
+    // loops kept straight-line too (translate.c glsl_flatten, LARECOMP_SHADER_FLAT=2): Adreno 740 + Turnip 27.0.0,
+    // Lumiose street walk, GPU 15.6 -> 12.4 ms a frame (p95 19.0 -> 14.3; the three culling dispatches 3.6 -> 0.5 ms)
+    if (maxwell_flat_default) maxwell_flat_default = 2;
+#endif
+    {   // fmin / fmax / saturate as NMin / NMax / NClamp (translate.c glsl_minmax_nmin; the same NaN rules). On by
+        // default on Android: Adreno 740 + Turnip 27.0.0, Lumiose street walk, GPU 12.4 -> 12.0 ms a frame (p95 14.5 ->
+        // 13.9; lighting 2.50 -> 2.34, final post 1.33 -> 1.18). LARECOMP_SHADER_NMIN=0/1 forces it.
+        const char *e = getenv("LARECOMP_SHADER_NMIN");
+#ifdef __ANDROID__
+        maxwell_nmin = e && *e ? atoi(e) != 0 : true;
+#else
+        maxwell_nmin = e && *e ? atoi(e) != 0 : false;
+#endif
+        if (maxwell_nmin) LOG("[vk] shader min / max / saturate: GLSL.std.450 NMin / NMax / NClamp\n");
+    }
     VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 pr2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &pr2);
@@ -2051,6 +2068,8 @@ static void za_red_blit(void) {
     static bool logged;
     if (!logged) { logged = true; LOG("[vk] sun-shadow reduced: the distant cascade drawn at %ux%u, copied into the game's layer 1\n", za_red_w, za_red_w); }
 }
+static void ac_run(void);  // (the indirect parameter clamp, with draw_indirect)
+static bool ac_dirty;
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
@@ -2058,6 +2077,7 @@ static void begin_pass(void) {
     planar_light_pending();   // (the lighting pass just ended: its draw again, on them)
     gtao_apply_pending();  // (the lighting pass just ended: its image times the ambient occlusion)
     water_apply_pending();  // (the water drawn: its reflections)
+    ac_run();  // (GPU-filled indirect parameters clamped before the pass that draws them)
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     else {
         // Submit the frame in chunks (as Metal, renderer.m begin_pass): the game puts a whole frame in one command
@@ -6886,6 +6906,7 @@ static void args_trace(const char *what, uint64_t code) {
 static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz);
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     dispatch_compute_(gx, gy, gz);
+    ac_dirty = true;  // (ac_run before the next pass)
     args_trace("dispatch", st.program ? st.program->stages[5].code_addr : 0);
 }
 static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -8487,6 +8508,111 @@ static bool ib_overrun(CmdRec *r, const uint32_t *p, uint64_t pa) {
     stat_skipped_here();
     return true;
 }
+// ---- GPU-filled indirect parameters, clamped on the GPU. ib_overrun / ind_args_bad check the parameters as the CPU
+// sees them; the instance count is the GPU's (Pokémon Z-A's culling compute writes it just before the draws). When the
+// culling's visible-instance list overran the parameters in the same buffer (a late-game Lumiose save, Adreno 740), a
+// count of ~10^9 instances got through to the GPU: "gpu timeout", device lost. Every parameter block a draw has read
+// from GPU memory is kept (ac_note); when compute work ran since the last time, the next render pass is preceded by a
+// small compute pass over those blocks, in place: instances over the cap become the cap, and a block whose vertex /
+// index count no draw can have (over 4M) draws no instance. LARECOMP_ARGS_CLAMP=<cap> (default 65536; 0: off). The
+// game's culled counts are a few thousand at most (ind_args_bad's logs). A safety net: what lets the list overrun is
+// not found yet.
+#define AC_MAX 4096
+static uint32_t ac_word[AC_MAX];  // (GM_OFF of each block / 4)
+static int ac_n;
+static long args_clamp_cap(void) {
+    static long cap = -1;
+    if (cap < 0) cap = ENV("LARECOMP_ARGS_CLAMP") ? atol(ENV("LARECOMP_ARGS_CLAMP")) : 65536;
+    return cap;
+}
+static void ac_note(uint64_t off) {
+    if (args_clamp_cap() <= 0 || off & 3 || off / 4 > 0xFFFFFFFFull) return;
+    uint32_t w = (uint32_t)(off / 4), h = (w * 2654435761u) >> 20;  // (12 bits: a small open-addressing set)
+    static uint32_t set[AC_MAX];  // (w + 1; 0 empty)
+    for (int i = 0; i < AC_MAX; i++, h = (h + 1) & (AC_MAX - 1)) {
+        if (set[h] == w + 1) return;
+        if (!set[h]) {
+            if (ac_n >= AC_MAX / 2) return;  // (kept at most half full)
+            set[h] = w + 1, ac_word[ac_n++] = w;
+            return;
+        }
+    }
+}
+static void ac_run(void) {
+    long cap = args_clamp_cap();
+    if (cap <= 0 || !ac_dirty || !ac_n || !gmem_buf) return;
+    ac_dirty = false;
+    static VkDescriptorSetLayout sl;
+    static VkPipelineLayout pl;
+    static VkPipeline pipe;
+    static int failed;
+    if (failed) return;
+    if (!pipe) {
+        static const char *src =
+            "#version 450\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, set = 0, binding = 0) buffer H { uint h[]; };\n"
+            "layout(std430, set = 0, binding = 1) readonly buffer O { uint o[]; };\n"
+            "layout(push_constant) uniform P { uint n; uint cap; } pc;\n"
+            "void main() {\n"
+            "  uint i = gl_GlobalInvocationID.x;\n"
+            "  if (i >= pc.n) return;\n"
+            "  uint w = o[i];\n"
+            "  if (h[w] > 4194304u) h[w + 1u] = 0u;\n"
+            "  else if (h[w + 1u] > pc.cap) h[w + 1u] = pc.cap;\n"
+            "}\n";
+        VkShaderModule m = vk_compile_glsl(src, STAGE_COMPUTE, "args_clamp.comp");
+        if (!m) { failed = 1; LOG("[vk] indirect parameter clamp: shader failed, off\n"); return; }
+        VkDescriptorSetLayoutBinding b[2];
+        for (int i = 0; i < 2; i++)
+            b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                  .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &sl));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &sl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &pi, NULL, &pl));
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = pl,
+                                          .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                    .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}};
+        VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe));
+        LOG("[vk] indirect parameter clamp: on (instances <= %ld; LARECOMP_ARGS_CLAMP)\n", cap);
+    }
+    // the blocks' span, bound from an aligned base (they sit together in one buffer: a few hundred KB)
+    uint64_t lo = ~0ull, hi = 0, align = g_vk.props.limits.minStorageBufferOffsetAlignment;
+    if (!align) align = 256;
+    for (int i = 0; i < ac_n; i++) {
+        uint64_t a = (uint64_t)ac_word[i] * 4;
+        if (a < lo) lo = a;
+        if (a + 20 > hi) hi = a + 20;
+    }
+    lo -= lo % align;
+    if (hi > gmem_size) hi = gmem_size;
+    if (hi <= lo || hi - lo > g_vk.props.limits.maxStorageBufferRange) return;  // (scattered: not covered)
+    uint32_t idx[AC_MAX];
+    int n = 0;
+    for (int i = 0; i < ac_n; i++)
+        if ((uint64_t)ac_word[i] * 4 + 8 <= hi) idx[n++] = ac_word[i] - (uint32_t)(lo / 4);
+    if (!n) return;
+    VkSpan s = vk_transient_copy(idx, (uint64_t)n * 4, 256);
+    VkCommandBuffer cb = vk_cmd();
+    VkDescriptorSet set = vk_alloc_set(sl);
+    VkDescriptorBufferInfo bi[2] = {{gmem_buf, lo, (hi - lo + 3) & ~3ull}, {s.buf, s.off, (uint64_t)n * 4}};
+    VkWriteDescriptorSet w[2];
+    for (uint32_t k = 0; k < 2; k++)
+        w[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = k,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[k]};
+    rec_UpdateDescriptorSets(2, w);
+    vk_full_barrier(cb);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
+    uint32_t pc[2] = {(uint32_t)n, (uint32_t)cap};
+    rec_CmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    rec_CmdDispatch(cb, ((uint32_t)n + 63) / 64, 1, 1);
+    vk_full_barrier(cb);
+    gw_note("indirect parameter clamp", gwin_base + gmem_lo + lo, hi - lo, 0);
+}
 // Parameters no draw can have, in blocks the GPU reads in place (#70 #81 #82 #86: the GPU stopped for 10 s, or the
 // device was lost, where blocks held other data for frames on end - every field near one small number, a base
 // instance in the hundreds of thousands): a count over 4M (ib_overrun leaves those alone), or a base instance whose
@@ -8570,6 +8696,7 @@ static void draw_indirect(CmdRec *r) {
             }
             if (ind_args_bad(p, pa, elements) || (elements && ib_overrun(r, p, pa))) continue;
             ir_note(pa, p, st.program ? st.program->stages[0].code_addr : 0);
+            ac_note(GM_OFF(pa));  // (clamped on the GPU from now on, ac_run)
             g_ind_gpu = true; g_ind_off = GM_OFF(pa); g_ind_stride = stride;
             d.x[0] = r->x[0];
             if (elements) {
@@ -11148,6 +11275,57 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vmaDestroyImage(g_vk.vma, img, mem);
 }
 
+// nvnCommandBufferClearBuffer(dst, size, value): recorded (cmdbuf.c) but never executed - the executor had no case for
+// it, so the buffer kept its old contents. Inside the guest memory import: a copy of the value in the command stream
+// (GPU order, outside a render pass, barriers on both sides), elsewhere the CPU fills it after the GPU work before (as
+// CopyBufferToBuffer). LARECOMP_CLEAR_BUFFER=0: skipped, as before.
+static void gpu_fill(uint64_t dst, uint64_t size, uint32_t value, const char *what);
+static void clear_buffer(uint64_t dst, uint64_t size, uint32_t value) {
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_CLEAR_BUFFER") || atoi(ENV("LARECOMP_CLEAR_BUFFER")) != 0;
+    static uint64_t count;
+    if (count++ % 3000 == 0)
+        LOG("[vk] ClearBuffer #%llu: %llx+%llu = %#x%s\n", (unsigned long long)count, (unsigned long long)dst,
+            (unsigned long long)size, value, on ? "" : " (skipped: LARECOMP_CLEAR_BUFFER=0)");
+    if (on) gpu_fill(dst, size, value, "ClearBuffer");
+}
+// nvnCommandBufferReportValue(value, dst) (cmdbuf.c): the 32-bit value written in GPU order
+static void report_value(uint32_t value, uint64_t dst) {
+    static uint64_t count;
+    if (count++ % 3000 == 0)
+        LOG("[vk] ReportValue #%llu: %llx = %#x (in the import %d)\n", (unsigned long long)count, (unsigned long long)dst,
+            value, GM_IN(dst, 4) ? 1 : 0);
+    gpu_fill(dst, 4, value, "ReportValue");
+}
+// value into [dst, dst + size): in the command stream inside the guest memory import, else on the CPU after a flush
+static void gpu_fill(uint64_t dst, uint64_t size, uint32_t value, const char *what) {
+    if (!dst || !size || dst < GUEST_LO || size > (256ull << 20)) return;
+    size &= ~3ull;
+    gmem_info();  // (the import, made on first use)
+    gw_note(what, dst, size, value);
+    if (GM_IN(dst, size) && !(dst & 3)) {
+        vk_end_pass();
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        for (uint64_t done = 0; done < size;) {
+            uint64_t n = size - done > (4ull << 20) ? 4ull << 20 : size - done;
+            VkSpan s = vk_transient(n, 16);
+            uint32_t *w = s.ptr;
+            for (uint64_t i = 0; i < n / 4; i++) w[i] = value;
+            VkBufferCopy c = {s.off, GM_OFF(dst + done), n};
+            rec_CmdCopyBuffer(cb, s.buf, gmem_buf, 1, &c);
+            done += n;
+        }
+        vk_full_barrier(cb);
+        return;
+    }
+    // (outside the import the GPU can't see it anyway: ClearBuffer waits for the work before it, a ReportValue -
+    // possibly every frame - is written at once, as close as the CPU gets)
+    if (strcmp(what, "ReportValue")) { wait_why = "ClearBuffer (outside the import)"; renderer_flush(); }
+    uint32_t *w = (uint32_t *)(uintptr_t)dst;
+    for (uint64_t i = 0; i < size / 4; i++) w[i] = value;
+}
+
 // ================================================================== executor (renderer.m exec_list)
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
@@ -11477,7 +11655,9 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
+        case CMD_REPORT_VALUE: report_value((uint32_t)r->x[0], r->x[1]); break;  // (was a no-op)
         case CMD_COPY_TEXTURE_TO_BUFFER: pw_op("CopyTextureToBuffer", r->x[3], 0); copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_CLEAR_BUFFER: clear_buffer(r->x[0], r->x[1], (uint32_t)r->x[2]); break;  // (was skipped)
         case CMD_COPY_BUFFER_TO_BUFFER:
             pw_op("CopyBufferToBuffer", r->x[1], r->x[2]);
             wait_why = "buffer -> buffer copy";
