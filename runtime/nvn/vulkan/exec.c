@@ -71,6 +71,20 @@ static bool list_fenced;       // the list being run has a FenceSync: its submis
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
 uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
+// Render-thread CPU switches, LARECOMP_RENDER_OPT=<bits> (default 15 on Android, 0 elsewhere): 1 the fragment-shader
+// hash (draw_'s 512-byte hmix) once per program, 2 ib_overrun's index scan once per index range and frame, 4 prefetch
+// the command records ahead in exec_list, 8 stencil_slots' answer per stage while its handles repeat. Snapdragon 8 Gen 2,
+// Lumiose street (a late-game save, walking): render thread 10.2 -> 9.3 ms a frame, p95 frame 35.7 -> 33.4 ms
+enum { PZ_FSH_MEMO = 1, PZ_IB_MEMO = 2, PZ_PREFETCH = 4, PZ_SLOT_MEMO = 8 };
+static int pz_opt(int bit) {
+    static int v = -1;
+#ifdef __ANDROID__
+    if (v < 0) { const char *e = getenv("LARECOMP_RENDER_OPT"); v = e ? (int)strtol(e, NULL, 0) : 15; }
+#else
+    if (v < 0) { const char *e = getenv("LARECOMP_RENDER_OPT"); v = e ? (int)strtol(e, NULL, 0) : 0; }
+#endif
+    return v & bit;
+}
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
@@ -1062,6 +1076,10 @@ static __thread int t_build_slot;
 static void *worker(void *a) {
     int me = (int)(intptr_t)a;
     t_worker = me;
+#ifdef __ANDROID__
+    extern void plat_thread_worker(const char *name) __attribute__((weak));  // (off the render thread's core,
+    if (plat_thread_worker) plat_thread_worker("za-build");                   // LARECOMP_AFFINITY_WORKERS; weak: links alone)
+#endif
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1091,6 +1109,10 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    extern void plat_thread_worker(const char *name) __attribute__((weak));  // (as worker())
+    if (plat_thread_worker) plat_thread_worker("za-shader");
+#endif
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -2565,6 +2587,7 @@ typedef struct {
     struct PipeMemo *pmemo;     // (render thread) draw_'s pipeline key memo for this program
     bool reuse;                 // set reuse (stage_set): some uniform buffers are dynamic, sets are kept while their contents repeat
     struct SetCache *scache[2]; // (render thread) stage_set's last set per set index
+    uint64_t fsh_addr, fsh;     // (render thread) draw_'s fragment-shader hash (hmix) for this fragment code address
 } Prog;
 static void fullcap_draw(Prog *pr, CmdRec *r, bool indexed, uint32_t inst, int ndraw, bool gpu_params);  // (full capture)
 static void fullcap_before(void);  // (full capture: the targets just before a draw)
@@ -7018,6 +7041,15 @@ static uint32_t stencil_slots(int stage, uint32_t *sint) {
     static int nomemo = -1;
     if (nomemo < 0) nomemo = ENV("LARECOMP_VK_NO_SLOT_MEMO") != NULL;
     static struct { const NvnDescPool *pool; uint32_t tic, gen; int kind; } memo[4096];
+    // (LARECOMP_RENDER_OPT & 8) the stage's whole answer while its 32 handles, the pool and the list repeat
+    // (most draws in a row): two 32-slot walks a draw were 4 % of the render thread on the Lumiose street
+    static struct { uint64_t tex[32]; const NvnDescPool *pool; uint32_t gen, m, sint; bool ok; } sm[2];
+    bool smo = !nomemo && pz_opt(PZ_SLOT_MEMO) && stage >= 0 && stage < 2;
+    if (smo && sm[stage].ok && sm[stage].pool == st.tpool && sm[stage].gen == exec_gen &&
+        !memcmp(sm[stage].tex, st.tex[stage], sizeof sm[stage].tex)) {
+        *sint = sm[stage].sint;
+        return sm[stage].m;
+    }
     for (int s = 0; s < 32; s++) {
         uint64_t h = st.tex[stage][s];
         uint32_t tic = h & 0xFFFFF;
@@ -7032,6 +7064,10 @@ static uint32_t stencil_slots(int stage, uint32_t *sint) {
         }
         if (k == 1) m |= 1u << s;
         if (k == 2) *sint |= 1u << s;
+    }
+    if (smo) {
+        memcpy(sm[stage].tex, st.tex[stage], sizeof sm[stage].tex);
+        sm[stage].pool = st.tpool, sm[stage].gen = exec_gen, sm[stage].m = m, sm[stage].sint = *sint, sm[stage].ok = true;
     }
     return m;
 }
@@ -7484,7 +7520,11 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t fs = st.program->stages[1].code_addr;
         if (fs != last_fs) {
             last_fs = fs;
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+            if (fs && pz_opt(PZ_FSH_MEMO) && pr->fsh_addr == fs) last_hash = pr->fsh;  // (LARECOMP_RENDER_OPT & 1: once per program)
+            else {
+                last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+                pr->fsh_addr = fs, pr->fsh = last_hash;
+            }
         }
         static uint64_t skip[16];
         static int nskip = -1;
@@ -8466,9 +8506,25 @@ static bool ib_overrun(CmdRec *r, const uint32_t *p, uint64_t pa) {
     if (!count || count > (1u << 22) || !ib || ib < GUEST_LO) return false;
     uint32_t restart = st.prim_restart ? st.restart_index : 0xFFFFFFFFu, mx = 0;
     const uint8_t *ip = (const uint8_t *)(uintptr_t)(ib + first * isz);
-    for (uint64_t i = 0; i < count; i++) {
-        uint32_t v = isz == 1 ? ip[i] : isz == 2 ? ((const uint16_t *)ip)[i] : ((const uint32_t *)ip)[i];
-        if (v != (restart & (isz == 1 ? 0xFFu : isz == 2 ? 0xFFFFu : 0xFFFFFFFFu)) && v > mx) mx = v;
+    // (LARECOMP_RENDER_OPT & 2) the same index range in the same frame (a mesh in the shadow cascades and the
+    // G-buffer: 2-4 draws a frame) scanned once - a guard, so indices the CPU rewrote mid-frame are checked next frame
+    static struct { uint64_t addr, frame; uint32_t count, key, mx; } im[1024];
+    uint64_t ia = (uint64_t)(uintptr_t)ip, fr = vk_frame_counter();
+    uint32_t ikey = isz | (restart << 3);
+    unsigned ms = (unsigned)(((ia >> 2) ^ (ia >> 13) ^ count * 0x9E3779B1u) & 1023);
+    bool memo = pz_opt(PZ_IB_MEMO);
+    if (memo && im[ms].addr == ia && im[ms].frame == fr && im[ms].count == count && im[ms].key == ikey) mx = im[ms].mx;
+    else {
+        if (isz == 2) {
+            const uint16_t *q = (const uint16_t *)ip;
+            uint32_t rs = restart & 0xFFFFu;
+            for (uint64_t i = 0; i < count; i++) if (q[i] != rs && q[i] > mx) mx = q[i];
+        } else
+            for (uint64_t i = 0; i < count; i++) {
+                uint32_t v = isz == 1 ? ip[i] : ((const uint32_t *)ip)[i];
+                if (v != (restart & (isz == 1 ? 0xFFu : 0xFFFFFFFFu)) && v > mx) mx = v;
+            }
+        if (memo) im[ms].addr = ia, im[ms].frame = fr, im[ms].count = (uint32_t)count, im[ms].key = ikey, im[ms].mx = mx;
     }
     int64_t last = (int64_t)mx + (int32_t)p[3];
     uint64_t stride = st.stream[s][0];
@@ -11154,6 +11210,7 @@ static void exec_list(uint64_t handle, int depth) {
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
+        if (pz_opt(PZ_PREFETCH)) __builtin_prefetch((const char *)r + 256), __builtin_prefetch((const char *)r + 512);
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
         case CMD_END: return;

@@ -983,6 +983,11 @@ static void unpack_some(void) {  // (the queue's next items, until none are left
 
 static void *unpack_helper(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    // (off the render thread's core, LARECOMP_AFFINITY_WORKERS; weak: links without android.c's part)
+    extern void plat_thread_worker(const char *name) __attribute__((weak));
+    if (plat_thread_worker) plat_thread_worker("za-unpack");
+#endif
     uint32_t seen = 0;
     for (;;) {
         pthread_mutex_lock(&up_lock);

@@ -665,10 +665,20 @@ static void pipeline_cache_tag(char *out, size_t n) {
     shader_cache_tag(out, n, gpu);
 }
 
-static void *pipeline_cache_saver(void *a) {  // every 3 minutes, when it grew
+// Every 30 s when it grew (EoWRecomp's interval; it was 3 minutes): an app is killed far more often than it quits, and
+// what a kill loses is every pipeline built since the last save. LARECOMP_PCACHE_SAVE_S=<s>: another interval.
+static void *pipeline_cache_saver(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    // (off the render thread's core when it was started from there - vkGetPipelineCacheData + the write, 6-9 ms every
+    // 30 s on a Snapdragon 8 Gen 2; weak: links without android.c's part)
+    extern void plat_thread_worker(const char *name) __attribute__((weak));
+    if (plat_thread_worker) plat_thread_worker("za-pcache");
+#endif
+    const char *e = getenv("LARECOMP_PCACHE_SAVE_S");
+    Uint32 ms = e && atoi(e) > 0 ? (Uint32)atoi(e) * 1000 : 30000;
     for (;;) {
-        SDL_Delay(180000);
+        SDL_Delay(ms);
         if (rq_stopping()) break;  // (quitting: backend_quit saves it)
         vk_pipeline_cache_save();
     }
@@ -2471,6 +2481,21 @@ static void window_event_log(const SDL_Event *e) {
     if (n++ < 300) LOG("[window] %s (t=%.1f)\n", what, SDL_GetTicks() / 1000.0);
 }
 
+// (EoWRecomp 48c12b4) On Android SDL_WaitEventTimeout never sleeps (each pump queues a sentinel that
+// wakes it at once), so the UI thread spins a big core. Poll, then sleep 4 ms. LARECOMP_UI_POLL=0: SDL's wait.
+static bool next_event(SDL_Event *e) {
+#ifdef __ANDROID__
+    static int poll = -1;
+    if (poll < 0) poll = !ENV("LARECOMP_UI_POLL") || atoi(ENV("LARECOMP_UI_POLL")) != 0;
+    if (poll) {
+        if (SDL_PollEvent(e)) return true;
+        SDL_DelayNS(4000000);
+        return false;
+    }
+#endif
+    return SDL_WaitEventTimeout(e, 16);
+}
+
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
@@ -2479,7 +2504,7 @@ int ui_run(void) {
         SDL_Event e;
         atomic_store(&ui_beat, SDL_GetTicksNS());
         atomic_store(&ui_stage, "waiting for events");
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        while (next_event(&e)) {
             input_rumble_poll();
             atomic_store(&ui_beat, SDL_GetTicksNS());
             window_event_log(&e);
