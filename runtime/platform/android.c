@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -282,7 +283,19 @@ void plat_frame_rate_hint(void *sdl_window, float fps) {
 // next forecast seconds, to its severe throttling point - 1.0 is that point. The thermal profile selects the render
 // scale curve: the cooler profile uses the tested 100/85/70/60% steps; the no-cooler profile reacts earlier and adds
 // 50%. The API wants a call a second at most (more often it answers NaN). A "[thermal]" line every 30 s and on each step.
-// LARECOMP_THERMAL=0: off.
+// LARECOMP_THERMAL=0: off; =hal: Android's headroom only; =sysfs: the zones below only; unset: the headroom, and the
+// zones when it has answered nothing for 5 s.
+//
+// The zones: on the AYN Thor (Snapdragon 8 Gen 2, a test device) the thermal HAL never becomes ready ("HAL Ready:
+// false"), so the headroom is NaN for the whole session and nothing ever stepped (a 4 min run sat at 93-95 C CPU, GPU
+// 62->80, xo-therm 53->64). The kernel's thermal zones are readable by an app, trip points included, so the same
+// headroom is computed from them the way Android's thermal service does it for its skin sensor: 0 at 30 C below the
+// severe point, 1.0 at it. Per group the hottest zone; the severe point is the group's lowest passive trip under 125 C
+// (there: CPU 108, GPU 95, xo-therm 78); the device's headroom is the highest group's. The skin zone is slow (a board
+// thermistor), so as Android does it is forecast 10 s ahead from its trend over the last 10 s; the CPU and GPU zones
+// follow the load within a second (the first try forecast those too: a 88 -> 95 C CPU jump at a scene load read as
+// 0.84 and stepped down for nothing), so they count as their 5 s mean.
+// LARECOMP_THERMAL_CPU / _GPU / _SKIN=<C>: another severe point for that group.
 static const double thermal_steps_cooler[] = {1.0, 0.85, 0.7, 0.6};
 static const double thermal_steps_no_cooler[] = {1.0, 0.85, 0.7, 0.6, 0.5};
 
@@ -290,9 +303,121 @@ static double thermal_scale_cache = 1.0;  // (the scale above, for plat_thermal_
 
 int plat_thermal_throttled(void) { return thermal_scale_cache < 1.0; }
 
+enum { TZ_CPU, TZ_GPU, TZ_SKIN, TZ_N };
+static const char *const tz_names[TZ_N] = {"cpu", "gpu", "skin"};
+static struct {
+    int fd[96], group[96], n;
+    double severe[TZ_N], temp[TZ_N];
+    char skin[32];
+    double hist[TZ_N][10];  // (each group's temperature a second, newest last)
+    int nhist;
+} g_tz;
+
+static int tz_group(const char *type) {
+    if (!strncmp(type, "cpu-", 4) || !strncmp(type, "cpuss-", 6) || !strncmp(type, "cpu_", 4)) return TZ_CPU;
+    if (!strncmp(type, "gpuss-", 6) || !strncmp(type, "gpu", 3)) return TZ_GPU;
+    if (!strcmp(type, "xo-therm") || strstr(type, "skin") || !strcmp(type, "quiet-therm") || !strcmp(type, "sys-therm-0"))
+        return TZ_SKIN;
+    return -1;
+}
+
+static long sysfs_long(const char *path) {
+    char b[32];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t k = fd < 0 ? -1 : read(fd, b, sizeof b - 1);
+    if (fd >= 0) close(fd);
+    if (k <= 0) return LONG_MIN;
+    b[k] = 0;
+    return strtol(b, NULL, 10);
+}
+
+static bool tz_scan(void) {
+    static const double fallback[TZ_N] = {105, 95, 50};
+    static const char *const env[TZ_N] = {"LARECOMP_THERMAL_CPU", "LARECOMP_THERMAL_GPU", "LARECOMP_THERMAL_SKIN"};
+    double lowest[TZ_N] = {1e9, 1e9, 1e9};
+    int count[TZ_N] = {0};
+    for (int i = 0; i < 256 && g_tz.n < (int)(sizeof g_tz.fd / sizeof *g_tz.fd); i++) {
+        char p[96], type[48];
+        snprintf(p, sizeof p, "/sys/class/thermal/thermal_zone%d/type", i);
+        FILE *f = fopen(p, "r");
+        if (!f) { if (i > 128) break; continue; }
+        bool ok = fgets(type, sizeof type, f) != NULL;
+        fclose(f);
+        if (!ok) continue;
+        type[strcspn(type, "\r\n")] = 0;
+        int g = tz_group(type);
+        if (g < 0) continue;
+        snprintf(p, sizeof p, "/sys/class/thermal/thermal_zone%d/temp", i);
+        long t = sysfs_long(p);
+        if (t == LONG_MIN || t < -30000 || t > 200000) continue;  // (a disabled sensor answers EINVAL)
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        g_tz.fd[g_tz.n] = fd, g_tz.group[g_tz.n++] = g, count[g]++;
+        if (g == TZ_SKIN && !g_tz.skin[0]) snprintf(g_tz.skin, sizeof g_tz.skin, "%s", type);
+        for (int k = 0; k < 16; k++) {
+            char tp[112], tt[24] = "";
+            snprintf(tp, sizeof tp, "/sys/class/thermal/thermal_zone%d/trip_point_%d_type", i, k);
+            FILE *tf = fopen(tp, "r");
+            if (!tf) break;
+            ok = fgets(tt, sizeof tt, tf) != NULL;
+            fclose(tf);
+            snprintf(tp, sizeof tp, "/sys/class/thermal/thermal_zone%d/trip_point_%d_temp", i, k);
+            long v = sysfs_long(tp);
+            if (ok && !strncmp(tt, "passive", 7) && v > 40000 && v < 125000 && v / 1000.0 < lowest[g]) lowest[g] = v / 1000.0;
+        }
+    }
+    for (int g = 0; g < TZ_N; g++) {
+        const char *e = getenv(env[g]);
+        g_tz.severe[g] = e && atof(e) > 0 ? atof(e) : lowest[g] < 1e9 ? lowest[g] : fallback[g];
+    }
+    fprintf(stderr, "[thermal] sysfs zones: %d cpu, %d gpu, %d skin (%s); severe at cpu %.0f, gpu %.0f, skin %.0f C\n",
+            count[TZ_CPU], count[TZ_GPU], count[TZ_SKIN], g_tz.skin[0] ? g_tz.skin : "none", g_tz.severe[TZ_CPU],
+            g_tz.severe[TZ_GPU], g_tz.severe[TZ_SKIN]);
+    return g_tz.n > 0;
+}
+
+// The device's headroom from the zones (Android's scale: 1.0 = severe; the skin zone's forecast 10 s ahead); NaN if none
+static float tz_headroom(void) {
+    double hot[TZ_N] = {-1e9, -1e9, -1e9};
+    for (int i = 0; i < g_tz.n; i++) {
+        char b[24];
+        ssize_t k = pread(g_tz.fd[i], b, sizeof b - 1, 0);
+        if (k <= 0) continue;
+        b[k] = 0;
+        double t = strtol(b, NULL, 10) / 1000.0;
+        if (t > hot[g_tz.group[i]]) hot[g_tz.group[i]] = t;
+    }
+    if (g_tz.nhist == 10) {
+        for (int g = 0; g < TZ_N; g++) memmove(g_tz.hist[g], g_tz.hist[g] + 1, 9 * sizeof **g_tz.hist);
+        g_tz.nhist--;
+    }
+    int n = ++g_tz.nhist;
+    double h = -1e9;
+    for (int g = 0; g < TZ_N; g++) {
+        g_tz.temp[g] = g_tz.hist[g][n - 1] = hot[g];
+        if (hot[g] <= -1e9) continue;
+        double t = 0;
+        if (g != TZ_SKIN) {  // (the mean of the last 5 s)
+            int k = n < 5 ? n : 5;
+            for (int i = n - k; i < n; i++) t += g_tz.hist[g][i] > -1e9 ? g_tz.hist[g][i] : hot[g];
+            t /= k;
+        } else if (n < 5) t = hot[g];
+        else {  // (least squares over the samples, a second apart, 10 s past the newest)
+            double mx = (n - 1) / 2.0, my = 0, sxy = 0, sxx = 0;
+            for (int i = 0; i < n; i++) my += g_tz.hist[g][i] > -1e9 ? g_tz.hist[g][i] : hot[g];
+            my /= n;
+            for (int i = 0; i < n; i++)
+                sxy += (i - mx) * ((g_tz.hist[g][i] > -1e9 ? g_tz.hist[g][i] : hot[g]) - my), sxx += (i - mx) * (i - mx);
+            t = my + sxy / sxx * (n - 1 - mx + 10);
+        }
+        h = fmax(h, (t - (g_tz.severe[g] - 30)) / 30);
+    }
+    return h == -1e9 ? NAN : (float)fmax(h, 0);
+}
+
 double plat_thermal_scale(double now) {
     static AThermalManager *mgr;
-    static int off = -1, step, last_profile = -1;
+    static int off = -1, step, last_profile = -1, src, nan_s;  // (src: 0 Android's headroom, 1 the sysfs zones)
     static double next_read, last_change = -1e9, last_line = -1e9, scale = 1.0;
     int profile = g_settings.thermal_profile == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
     const double *steps = profile == THERMAL_PROFILE_NO_COOLER ? thermal_steps_no_cooler : thermal_steps_cooler;
@@ -311,13 +436,27 @@ double plat_thermal_scale(double now) {
     if (off < 0) {
         const char *e = getenv("LARECOMP_THERMAL");
         off = e && !strcmp(e, "0");
-        if (!off && !(mgr = AThermal_acquireManager())) off = 1;
-        fprintf(stderr, "[thermal] render scale by thermal headroom: %s\n", off ? "off" : "on");
+        bool sysfs = e && !strcmp(e, "sysfs"), hal = e && !strcmp(e, "hal");
+        if (!off && !sysfs) mgr = AThermal_acquireManager();
+        if (!off && (sysfs || !mgr)) {
+            if (!hal && tz_scan()) src = 1;
+            else off = 1;
+        }
+        if (hal) nan_s = -1;  // (never falls back)
+        fprintf(stderr, "[thermal] render scale by thermal headroom: %s\n", off ? "off" : src ? "on (sysfs zones)" : "on");
     }
     if (off || now < next_read) return thermal_scale_cache = scale;
     next_read = now + 1.0;
-    float h = AThermal_getThermalHeadroom(mgr, 10);
-    if (isnan(h)) return thermal_scale_cache = scale;
+    float h = src ? tz_headroom() : AThermal_getThermalHeadroom(mgr, 10);
+    if (isnan(h)) {
+        if (!src && nan_s >= 0 && ++nan_s == 5) {
+            fprintf(stderr, "[thermal] no headroom from the system in 5 s (thermal HAL not ready?): the sysfs zones instead\n");
+            if (tz_scan()) src = 1;
+            else off = 1;
+        }
+        return thermal_scale_cache = scale;
+    }
+    if (!src) nan_s = -1;  // (it answered: Android's headroom stays the source)
     int last = nsteps - 1, was = step;
     float down_at = profile == THERMAL_PROFILE_NO_COOLER ? 0.70f : 0.80f;
     float up_below = profile == THERMAL_PROFILE_NO_COOLER ? 0.45f : 0.60f;
@@ -330,7 +469,10 @@ double plat_thermal_scale(double now) {
     thermal_scale_cache = scale;
     if (step != was || now - last_line >= 30) {
         last_line = now;
-        fprintf(stderr, "[thermal] headroom %.2f (10 s forecast): render scale %.0f%%%s\n", h, scale * 100,
+        char temps[96] = "";
+        if (src) snprintf(temps, sizeof temps, " (cpu %.0f, gpu %.0f, %s %.0f C)", g_tz.temp[TZ_CPU], g_tz.temp[TZ_GPU],
+                          g_tz.skin[0] ? g_tz.skin : tz_names[TZ_SKIN], g_tz.temp[TZ_SKIN]);
+        fprintf(stderr, "[thermal] headroom %.2f (10 s forecast)%s: render scale %.0f%%%s\n", h, temps, scale * 100,
                 step > was ? " - stepped down" : step < was ? " - stepped up" : "");
     }
     return scale;
@@ -358,7 +500,87 @@ int plat_cpu_count(void) {
     return sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 0;
 }
 
-void plat_thread_guest(int prio) { (void)prio; }
+// ---- core placement (LARECOMP_AFFINITY). Cores by top frequency: "fast" = the single fastest core (Snapdragon 8 Gen 2:
+// cpu7, the X3), "big" = the next tier (cpu3-6). =render (the default): the render thread on the fastest core, the
+// game's main thread on the big ones (EoWRecomp's choice) - on a Snapdragon 8 Gen 2 at 30 fps the render thread's CPU
+// per frame went from 8.1 to 5.3 ms in the first street (it had been on the A715s; the X3 is ~1.45x one of those), at
+// the same app CPU; =x3: the game's main thread alone on the fastest core, the render thread on the big ones, every
+// other guest thread off the fastest (no gain measured); =big: game and render threads on fast + big; =0: Android
+// decides.
+static cpu_set_t g_set_fast, g_set_big, g_set_notfast;
+static int g_aff_mode;  // 0 off, 1 x3, 2 render, 3 big
+static void aff_scan(void) {
+    const char *e = getenv("LARECOMP_AFFINITY");
+    g_aff_mode = !e || !*e || !strcmp(e, "render") ? 2 : !strcmp(e, "0") ? 0 : !strcmp(e, "big") ? 3 : 1;
+    if (!g_aff_mode) return;
+    long f[CPU_SETSIZE] = {0}, best = 0, second = 0;
+    int n = 0;
+    for (; n < CPU_SETSIZE; n++) {
+        char p[96];
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+        FILE *fp = fopen(p, "r");
+        if (!fp) break;
+        if (fscanf(fp, "%ld", &f[n]) != 1) f[n] = 0;
+        fclose(fp);
+        if (f[n] > best) best = f[n];
+    }
+    for (int i = 0; i < n; i++) if (f[i] < best && f[i] > second) second = f[i];
+    CPU_ZERO(&g_set_fast), CPU_ZERO(&g_set_big), CPU_ZERO(&g_set_notfast);
+    for (int i = 0; i < n; i++) {
+        if (f[i] == best) CPU_SET(i, &g_set_fast); else CPU_SET(i, &g_set_notfast);
+        if (f[i] == second) CPU_SET(i, &g_set_big);
+    }
+    if (!CPU_COUNT(&g_set_fast) || !CPU_COUNT(&g_set_big)) g_aff_mode = 0;
+    fprintf(stderr, "[cpu] affinity mode %d: %d fastest core(s) %ld MHz, %d big %ld MHz\n", g_aff_mode,
+            CPU_COUNT(&g_set_fast), best / 1000, CPU_COUNT(&g_set_big), second / 1000);
+}
+static void aff_apply(const cpu_set_t *s, const char *who) {
+    if (sched_setaffinity(0, sizeof *s, s) != 0) fprintf(stderr, "[cpu] affinity for %s: %s\n", who, strerror(errno));
+}
+// (the threads get names too - all of them were "SDLThread" in top / systrace: za-game, za-render, za-recorder,
+// za-vsync, za-guest for the game's other threads, the helpers' own in plat_thread_worker)
+void plat_thread_guest(int prio) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    (void)prio;
+    pthread_once(&once, aff_scan);
+    pthread_setname_np(pthread_self(), "za-guest");
+    if (g_aff_mode == 1 || g_aff_mode == 3) aff_apply(&g_set_notfast, "guest");
+}
+// The recorder thread (record.c, PLAT_PERF_RECORDER): never on the fastest core, which is the render thread's -
+// LARECOMP_AFFINITY_RECORDER=fast puts it back there (as before), =big on the big ones, =0 Android decides. With the
+// render thread on the fastest core, each packet batch the render thread published woke the recorder on the same core,
+// which preempted it (Lumiose street, a late-game save: the render thread runnable but not running 29 % of the time,
+// ~21k switches/s). On the big cores: 25.5 -> 28.3 fps, the game thread's wait for the translation 29.5 -> 13.1 ms a
+// frame.
+void plat_thread_perf_core(int role) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, aff_scan);
+    pthread_setname_np(pthread_self(), role == PLAT_PERF_GAME ? "za-game" : role == PLAT_PERF_VSYNC ? "za-vsync" :
+                                       role == PLAT_PERF_RECORDER ? "za-recorder" : "za-render");
+    if (!g_aff_mode || role == PLAT_PERF_VSYNC) return;
+    cpu_set_t both = g_set_fast;
+    CPU_OR(&both, &both, &g_set_big);
+    bool game = role == PLAT_PERF_GAME;
+    const cpu_set_t *s = g_aff_mode == 3 ? &both : (g_aff_mode == 1) == game ? &g_set_fast : &g_set_big;
+    if (role == PLAT_PERF_RECORDER) {
+        const char *e = getenv("LARECOMP_AFFINITY_RECORDER");
+        if (e && !strcmp(e, "0")) return;
+        if (e && !strcmp(e, "fast")) s = &g_set_fast;
+        else if ((e && !strcmp(e, "big")) || s == &g_set_fast) s = &g_set_big;
+        fprintf(stderr, "[cpu] recorder thread on the %s core(s)\n", s == &g_set_fast ? "fastest" : s == &g_set_big ? "big" : "fast + big");
+    }
+    if (sched_setaffinity(0, sizeof *s, s) != 0) aff_apply(&both, game ? "game (fastest core parked: fast + big)" : "render");
+}
+// The render thread's helpers (shader translation, pipeline builds, texture unpacking) on every core but the fastest:
+// they inherited the render thread's affinity, so all of them ran on the fastest core with it.
+// LARECOMP_AFFINITY_WORKERS=0: left as inherited (as before)
+void plat_thread_worker(const char *name) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, aff_scan);
+    pthread_setname_np(pthread_self(), name);
+    const char *e = getenv("LARECOMP_AFFINITY_WORKERS");
+    if (g_aff_mode && (!e || atoi(e))) aff_apply(&g_set_notfast, name);
+}
 
 // SCHED_FIFO needs a privilege an app never has, so in practice this is the setpriority path. Worth keeping: on a
 // phone the vsync thread competing with the guest threads is the difference between steady and stuttering frames.

@@ -52,8 +52,12 @@ The aarch64 Linux build (no Android): `build_aarch64.sh`, `gen_aarch64.sh`.
   and Android restarts its display stack.
 - Rendering: Vulkan features are checked one by one against the driver (an Adreno lacks some a 1.3 desktop driver
   has), the swapchain is pre-rotated (the phone's native orientation is portrait), and the resolution steps down with
-  Android's thermal headroom forecast (`[thermal]` log lines; `LARECOMP_THERMAL=0`: off). Each step is a real
-  resolution change: drawing into part of the targets put Z-A's picture in a corner.
+  Android's thermal headroom forecast (`[thermal]` log lines; `LARECOMP_THERMAL=0`: off; where the system never
+  answers, the kernel's thermal zones instead). Each step is a real resolution change: drawing into part of the
+  targets put Z-A's picture in a corner.
+- Threads (runtime/platform/android.c): the render thread on the fastest core, the game thread on the next tier, the
+  Vulkan recorder and the render thread's helpers off the fastest core (`LARECOMP_AFFINITY`, `_RECORDER`,
+  `_WORKERS`); all of them named (`za-*`) for top / simpleperf.
 - nn::os fibers (Z-A's job system) switch with an aarch64 context switch of their own
   (runtime/platform/android_fiber.c): bionic has no `swapcontext` on arm64.
 - Touch controls are drawn over the game (runtime/ui/touch_overlay.mm): on by default on Android, hidden while a

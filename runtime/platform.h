@@ -56,12 +56,20 @@ int plat_cpu_count(void);  // logical cores this process may run on (its affinit
 void plat_thread_guest(int prio);  // a guest thread's host scheduling class from its Switch priority (lower = more urgent)
 uint64_t plat_thread_cpu_ns(void);  // the calling thread's CPU time so far (user + system; diagnostics)
 // The calling thread is one of the frame's critical threads: on Windows, no power throttling (EcoQoS) for it and, on a
-// hybrid CPU, a preference for the performance cores (selected CPU sets; LARECOMP_PCORE=0: off). Elsewhere a no-op.
-enum { PLAT_PERF_GAME, PLAT_PERF_RENDER, PLAT_PERF_VSYNC };
-#ifdef _WIN32
+// hybrid CPU, a preference for the performance cores (selected CPU sets; LARECOMP_PCORE=0: off). On Android its core
+// placement and name (platform/android.c, LARECOMP_AFFINITY). Elsewhere a no-op.
+// (PLAT_PERF_RECORDER: the Vulkan recorder thread, record.c - on Android kept off the render thread's core)
+enum { PLAT_PERF_GAME, PLAT_PERF_RENDER, PLAT_PERF_VSYNC, PLAT_PERF_RECORDER };
+#if defined(_WIN32) || defined(__ANDROID__)
 void plat_thread_perf_core(int role);
 #else
 static inline void plat_thread_perf_core(int role) { (void)role; }
+#endif
+// (Android: platform/android.c) a helper thread the render thread starts (shader / pipeline builds, texture unpacking):
+// threads inherit their creator's affinity, so they ran on the render thread's core and competed with it; moved off
+// that core, named `name`. Callers declare it weak themselves (their builds link without this part).
+#ifdef __ANDROID__
+void plat_thread_worker(const char *name);
 #endif
 // The share of the render scale the device's temperature allows, 1.0 = no limit; now: seconds. Android reads the
 // thermal headroom forecast and steps it down before the system throttles (runtime/platform/android.c); a desktop
