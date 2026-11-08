@@ -130,6 +130,9 @@ extern bool maxwell_quad_ops;
 // runtime imports the bound storage buffers' chunks before the draw. true (LARECOMP_VK_GMEM_FS_MISS=1): every shader
 // counts, none declares early tests.
 extern bool maxwell_gmem_fs_miss;
+// GLSL with 64-bit integer types (carry chains, funnel shifts, global addresses) - true - or only 32-bit pairs with
+// explicit carries - false: a device without shaderInt64 (Qualcomm's own driver). Set before the first translation.
+extern bool maxwell_int64;
 // Lazy mode, vertex / fragment: the chunks under the draw's storage buffers (where the heap reads are) come as push
 // constants, GDirect { uvec4 gd[GMEM_DIRECT_MAX]; } (x = first word, y = words, 0: unused, z, w = device address), and
 // as storage buffers GDir<k> at GMEM_DIRECT_BINDING + k of the chunk set: an access in one is a compare and a plain

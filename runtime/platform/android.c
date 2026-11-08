@@ -3,7 +3,9 @@
 // Android is Linux, so most of this is runtime/platform/linux.c unchanged. It is its own file rather than #ifdefs
 // in that one because the differences are not cosmetic: bionic has no <execinfo.h>, an app cannot read
 // /proc/self/pagemap, and it cannot start a child process at all. Each of those is noted where it bites.
+#ifndef _GNU_SOURCE  // (the Makefile's VOLK=1 defines it)
 #define _GNU_SOURCE
+#endif
 #include <SDL3/SDL.h>
 #include <android/hardware_buffer.h>
 #include <android/log.h>
