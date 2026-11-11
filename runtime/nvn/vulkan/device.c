@@ -1199,8 +1199,7 @@ static void create_device(void) {
                                             .variablePointers = g_vk.fsr4 && have11.variablePointers,
                                             .variablePointersStorageBuffer = g_vk.fsr4 && have11.variablePointersStorageBuffer,
                                             .pNext = &f12};
-    if (!have11.storageBuffer16BitAccess) LOG("[vk] warning: the GPU driver has no storageBuffer16BitAccess
-");
+    if (!have11.storageBuffer16BitAccess) LOG("[vk] warning: the GPU driver has no storageBuffer16BitAccess\n");
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
