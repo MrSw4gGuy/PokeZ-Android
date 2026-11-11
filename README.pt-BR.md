@@ -69,7 +69,6 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 - Lumiose: algum tempo depois de chegar, o jogo pode parar com "device lost" (a GPU desistiu). Alguns desenhos
   indiretos leem os parâmetros quando a memória do jogo ali já tem outros dados. Acontece de vez em quando no driver
   da Qualcomm e, até agora, sempre com um driver Turnip personalizado.
-- Criação de personagem: o corpo do personagem aparece cortado logo abaixo dos ombros.
 - Olhos: corrigidos no driver da Qualcomm desde o ZA Recomp v0.1.22 (a correção da íris precisa do quad control do
   driver). Os drivers Turnip personalizados (v39, PurpleVK T30) não têm quad control, então a íris ainda aparece em
   quadradinhos neles.

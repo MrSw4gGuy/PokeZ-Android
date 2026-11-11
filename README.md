@@ -69,7 +69,6 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 - Lumiose City: some time after arriving, the game can stop with "device lost" (the GPU gave up). Some indirect draws
   read their parameters after the game's memory there already holds other data. It happens on Qualcomm's driver now
   and then, and every time so far with a custom Turnip driver.
-- Character creation: the character's body is cut off just below the shoulders.
 - Eyes: fixed on Qualcomm's driver since ZA Recomp v0.1.22 (its iris fix needs the driver's quad control). Custom
   Turnip drivers (v39, PurpleVK T30) have no quad control, so the iris still shows squares there.
 - Faint straight light strips over faces and bodies in some close-up cutscenes (seen in one run).
