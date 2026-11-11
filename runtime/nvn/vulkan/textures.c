@@ -212,6 +212,16 @@ static bool tex_scalable(const NvnTexture *t) {
     if (off < 0) off = getenv("LARECOMP_NO_SCALE") != NULL;
     if (off) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    // Pokémon Z-A's character creation draws the player into a 1600x1080 render target of its own (format 0x38) with the
+    // scene's 1920x1080 depth, which is scaled. Left at its size, the pass took the smaller of the two: at 75% everything
+    // below row 810 and right of column 1440 was cut - the shirt ended at the shoulders in the close-up, the legs at the
+    // shins zoomed out (Galaxy S25+). Render targets at the game's render height (1080) and narrower than 16:9 are
+    // scaled with it; later passes sample them through the scale table like the 16:9 ones. LARECOMP_SCALE_1080=0: not
+    if (t->height == 1080 && t->width >= 1280 && t->width < 1920) {
+        static int on = -1;
+        if (on < 0) on = !getenv("LARECOMP_SCALE_1080") || atoi(getenv("LARECOMP_SCALE_1080")) != 0;
+        if (on) return true;
+    }
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
 }
