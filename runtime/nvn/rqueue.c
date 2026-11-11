@@ -29,6 +29,7 @@
 
 #include "../platform.h"
 #include "../rt.h"
+#include "../hle.h"  // (RT_ON_RESET)
 
 __thread uint64_t g_rq_wait_ns;
 __thread uint64_t g_rq_lock_ns;
@@ -204,6 +205,9 @@ static void wait_until(pthread_cond_t *cv, bool (*ready)(uint64_t), uint64_t arg
 static bool has_room(uint64_t a) { (void)a; return q_enq - q_done < RQ_CAP; }
 static bool no_present(uint64_t a) { (void)a; return presents_pending == 0; }
 static bool all_done(uint64_t a) { (void)a; return q_done == q_enq; }
+// (a present waits for both at once: room checked before the wait for the previous present went stale while the lock
+// was released - other threads filled the queue, and the present was written over an item not yet run)
+static bool present_ready(uint64_t a) { return has_room(a) && no_present(a); }
 // (each waiter its own item: with one shared target, a waiter for a later item let one for an earlier item go on
 // before its list was translated, and the other way round)
 static bool item_done(uint64_t q) { return q_done >= q; }
@@ -235,7 +239,8 @@ static uint64_t enqueue(const Item *it, const uint64_t *fences, int nfences) {
     if (!has_room(0)) { if (!t0) t0 = plat_now_ns(); wait_until(&cv_done, has_room, 0, false, "queue full"); }
     if (it->kind == IT_PRESENT) {
         if (!t0) t0 = plat_now_ns();
-        wait_until(&cv_done, no_present, 0, true, "present (the previous one to finish)");
+        wait_until(&cv_done, present_ready, 0, true, "present (the previous one to finish)");
+        if (!has_room(0)) wait_until(&cv_done, has_room, 0, false, "queue full");  // (only after an unwind's early exit)
         presents_pending++;
         last_present_q = q_enq + 1;
     }
@@ -284,7 +289,13 @@ static void *run(void *arg) {
             if (it.nlists > 1) { backend_execute_batch(it.lists, it.nlists); free(it.lists); }
             else backend_execute(it.handle);
             break;
-        case IT_PRESENT: backend_present_now(it.tex, it.frame); break;
+        case IT_PRESENT: {
+            backend_present_now(it.tex, it.frame);
+            // (vulkan/device.c: F9's frame, as translated; weak - the Metal backend decides it on the game thread)
+            extern void debug_frame_after_present(uint64_t frame) __attribute__((weak));
+            if (debug_frame_after_present) debug_frame_after_present(it.frame);
+            break;
+        }
         case IT_DESTROY: { extern void nvn_texture_destroy(NvnTexture *t); nvn_texture_destroy(it.tex); break; }
         case IT_UPLOAD: backend_upload_now(it.tex, it.up_kind, it.data, it.w, it.h, it.stride, it.uv_off); break;
         case IT_FLUSH: { extern void renderer_flush(void); renderer_flush(); break; }
@@ -374,6 +385,12 @@ static void prescan(uint64_t handle, Fences *f, int depth) {
 // ~100 small lists over a frame at a time; one submission each cost ~20% of the translating thread). Every fence in
 // them names this item, so a wait on any of them waits for the whole call's submission - later than its own list's
 // end at most, never earlier.
+// (exec.c: the GPU-filled indirect parameters' submit-time snapshot, ia_snap_submit) Called on the game's thread after
+// its lists are queued, before nvnQueueSubmitCommands returns: what the game wrote for them, before it goes on to the
+// next frame (under the GPU overlap it rewrites them while the render thread may be items behind)
+void (*rq_submit_hook)(uint64_t q);
+uint64_t rq_queued_relaxed(void) { return __atomic_load_n(&q_enq, __ATOMIC_RELAXED); }  // (diagnostics: no lock)
+
 uint64_t rq_submit_lists(const uint64_t *handles, int n) {
     if (n == 1) return rq_submit(handles[0]);
     Fences f = {.n = 0, .cap = 32};
@@ -383,6 +400,7 @@ uint64_t rq_submit_lists(const uint64_t *handles, int n) {
     memcpy(it.lists, handles, sizeof *it.lists * (size_t)n);
     uint64_t q = enqueue(&it, f.p, f.n);
     if (f.p != f.v) free(f.p);
+    if (rq_submit_hook) rq_submit_hook(q);
     return q;
 }
 
@@ -393,6 +411,7 @@ uint64_t rq_submit(uint64_t handle) {
     Item it = {.kind = IT_EXEC, .handle = handle};
     uint64_t q = enqueue(&it, f.p, f.n);
     if (f.p != f.v) free(f.p);
+    if (rq_submit_hook) rq_submit_hook(q);
     return q;
 }
 
@@ -552,12 +571,17 @@ static bool hang_check(uint64_t limit, char *why, size_t nwhy) {
     static uint64_t last_frames, frames_at;
     static bool reported_first, reported_stall;
     static uint64_t reported_since[NWATCH];
+    static uint64_t seen_start;
     uint64_t t_start = atomic_load(&hang_t_start);
     if (!t_start) return false;
     uint64_t now = plat_now_ns();
-    if (!frames_at) frames_at = now;
     extern uint64_t renderer_present_count(void);
     uint64_t f = renderer_present_count() + atomic_load(&presents_done);
+    if (t_start != seen_start) {  // (a new boot after "return to the start screen": counted afresh)
+        seen_start = t_start, last_frames = f, frames_at = now, reported_first = reported_stall = false;
+        memset(reported_since, 0, sizeof reported_since);
+    }
+    if (!frames_at) frames_at = now;
     if (f != last_frames || g_rt_unwind) last_frames = f, frames_at = now, reported_stall = false;
     bool hit = false;  // (one reason per check: the dump shows every wait anyway)
     if (!f && !reported_first && now - t_start > 2 * limit) {  // (the first frame: twice the time, loading)
@@ -591,4 +615,12 @@ static void watchdog_start_once(void) {
     extern void kernel_hang_hooks(bool (*)(uint64_t, char *, size_t), void (*)(const char *));
     kernel_hang_hooks(hang_check, hang_state);
 }
-void rq_hang_watch_start(void) { pthread_once(&wd_once, watchdog_start_once); }
+void rq_hang_watch_start(void) {
+    pthread_once(&wd_once, watchdog_start_once);
+    uint64_t none = 0;  // (again after a reboot: rq_hang_reset stopped it)
+    atomic_compare_exchange_strong(&hang_t_start, &none, plat_now_ns());
+}
+// "Return to the start screen": the game presents nothing while the start screen is up, and the check above went on
+// counting - a "presenting stopped" dump 30 s into every start screen after a reboot (#151's log). Off until the next
+// boot's GPU device setup.
+RT_ON_RESET(rq_hang_reset) { atomic_store(&hang_t_start, 0); }

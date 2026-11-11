@@ -7,7 +7,14 @@
 #define STACK_BASE GUEST_REBASE(0x7200000000ull)  // (rt.h: moved with the rest of the window)
 #define STACK_SIZE 0x0040000000ull
 
-typedef enum { KOBJ_THREAD = 1, KOBJ_EVENT, KOBJ_SESSION, KOBJ_SHMEM, KOBJ_TMEM } KType;
+typedef enum { KOBJ_THREAD = 1, KOBJ_EVENT, KOBJ_SESSION, KOBJ_SHMEM, KOBJ_TMEM, KOBJ_PROCESS } KType;
+
+// Code mods' writable views of code (svcMapProcessMemory, kernel.c): exlaunch and Hakkun map the code they hook (and
+// their own trampoline pool) a second time, writable, and write through that. Here the view is a copy (dst) of src:
+// the lifted code can't change, so runtime/hle/codehooks.c reads what was written there and turns it into hooks.
+typedef struct { uint64_t dst, src, size; } CodeAlias;
+#define MAX_CODE_ALIAS 64
+int kernel_code_aliases(CodeAlias *out, int max);  // a snapshot (g_mlock)
 typedef enum { WAIT_NONE = 0, WAIT_MUTEX, WAIT_CONDVAR, WAIT_ARBITER } WaitKind;
 
 typedef struct KObject {
@@ -79,3 +86,5 @@ void kernel_dump_threads(const char *prefix);
 void kernel_hang_hooks(bool (*check)(uint64_t limit_ns, char *why, size_t n), void (*state)(const char *prefix));
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize
 uint64_t kernel_phys_largest(uint64_t *addr);  // largest svcMapPhysicalMemory region: size (0 if none), *addr
+uint64_t kernel_phys_ring(uint64_t after, uint64_t size);  // reserve [after, after + size) for the runtime (no game mapping there): after, or 0
+void kernel_phys_ring_recommit(void);  // (after a reboot's guest memory reset: the ring committed again, #157)

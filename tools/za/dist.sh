@@ -55,13 +55,17 @@ dotnet publish tools/zaimport -c Release -r win-x64 --self-contained true -p:Pub
 # 5. the folder
 rm -rf build/dist-za && mkdir -p "$D/gamelib-src" "$D/zaimport"
 cp $B/lasrecomp.exe $B/lasrecomp.dll.a "$D/"
+# the release notes' last line: the start screen reads it to say whether updating compiles the game again
+# (runtime/ui/launcher.mm update_thread) - paste build/release-gamelib.txt at the end of the notes
+echo "<!-- zarecomp-gamelib: $(make -s gamelib-id B=$B RELEASE=1 GENARCH="$GENARCH" GENOPT="$GENOPT") -->" > build/release-gamelib.txt
+cat build/release-gamelib.txt
 cp -R build/helper/lasgen "$D/"
 cp -R build/helper/zaprompts "$D/"
 cp third_party/ooz/COPYING "$D/zaprompts/COPYING-GPLv3.txt"
 cp third_party/ooz/README.ZARecomp.md "$D/zaprompts/README-ooz.md"
 cp -R build/zig-slim "$D/zig"
 cp build/zaimport/zaimport.exe "$D/zaimport/"
-cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
+cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h runtime/modlib.h tools/gamelib_entry.c tools/modlib_entry.c runtime/hle/hle_symbols.txt \
     "$D/gamelib-src/"
 cp docs/icon/icon_1024.png "$D/icon.png"
 cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$D/"
@@ -70,11 +74,31 @@ cp README.md LICENSE "$D/"
 mkdir -p "$D/docs"
 cp docs/XBOX-ATTACK-LAYOUT.md "$D/docs/"
 [ -f README.pt-BR.md ] && cp README.pt-BR.md "$D/"
+# DirectX 12 (F1 > Display > Graphics API): the patched Dozen, dxil.dll and its DLLs in dx12/, the Agility SDK's
+# D3D12Core.dll in D3D12/ (tools/dx12/build_dozen.sh, made here once)
+[ -f build/dx12/dx12/vulkan_dzn.dll ] || bash tools/dx12/build_dozen.sh
+cp -R build/dx12/dx12 build/dx12/D3D12 "$D/"
+cp build/dx12/Mesa-LICENSE.rst build/dx12/D3D12-Agility-LICENSE.txt "$D/dx12/"
+cp tools/dx12/dozen-za.patch "$D/dx12/"  # (the changes to Mesa 26.2.5, as its MIT licence lets us ship them)
 cp tools/za/za-default.ini "$D/za-default.ini"  # (not larecomp.ini: the first run copies it, runtime/paths.c - a new zip unzipped over an install keeps the player's own)
 # (every DLL but Windows' own and the Vulkan loader: also when copies sit next to the exe in $B, a dev setup)
 PATH="$PWD/build/deps-win/bin:$PATH" ldd $B/lasrecomp.exe | awk 'tolower($3) !~ /^\/c\/windows\// && !/vulkan-1/ {print $3}' | sort -u |
     while read -r f; do cp "$f" "$D/"; done
 ! ls "$D" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
+# AMD FSR 3.1 (runtime/nvn/vulkan/fsr3.cpp, loaded at run time; third_party/ffx_api/README.ZARecomp.md): AMD's signed
+# DLLs from the SDK's v2.4.0 tag, downloaded once, hash checked, with the SDK's licence (it asks for its notice)
+FFX=build/ext/ffx-2.4.0
+for p in "amd_fidelityfx_loader_vk.dll 38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9" \
+         "amd_fidelityfx_upscaler_vk.dll 4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"; do
+    set -- $p
+    mkdir -p $FFX
+    [ -f $FFX/$1 ] || { /c/Windows/System32/curl.exe -fsSL -o $FFX/$1.part \
+        "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin/$1" &&
+        mv $FFX/$1.part $FFX/$1; }  # (.part: a cut download isn't taken for the file)
+    echo "$2 *$FFX/$1" | sha256sum -c --quiet
+    cp $FFX/$1 "$D/"
+done
+cp third_party/ffx_api/LICENSE.md "$D/AMD-FSR-LICENSE.md"
 du -sh "$D"
 if [ "${ZIP:-0}" = 1 ]; then
     (cd build/dist-za && /c/Windows/System32/tar.exe -a -cf ZA-Recomp-windows.zip "ZA Recomp")

@@ -32,6 +32,17 @@ uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; s
 bool maxwell_gmem_lazy;
 bool maxwell_flat_default = true;
 bool maxwell_quad_ops;  // (vk_exec_init: the device has quad subgroup operations in fragment shaders)
+int maxwell_gather_bias_default;  // (vk_exec_init: the sub-texel bits on AMD / Intel Windows; gather_bias)
+bool maxwell_quad_deriv_default;  // (vk_exec_init: AMD; quad_deriv)
+bool maxwell_quad_control_ok, maxwell_quad_control_default;  // (vk_exec_init: the device has quad control; AMD: on)
+bool maxwell_lockstep_default = true;  // (vk_exec_init: helpers guaranteed - NVIDIA, or quad control on; quad_lockstep)
+// (vulkan/device.c: the device has shaderOutputLayer. Without it - Dozen, DirectX 12 underneath - a vertex shader's
+// render target layer is written to a local and dropped: the draw goes to layer 0 instead of its pipeline failing)
+bool maxwell_output_layer = true;
+// (test) LARECOMP_SHADER_GUARD_REPORT=1: a compute shader whose pc state machine runs into its bound (loop_guard)
+// stores where it was - the pc, the code's id, 5 registers - into gmem words from maxwell_guard_word on (exec.c
+// gmir: an area past the copy of the guest window, read back and logged as "[guard]")
+uint32_t maxwell_guard_word;
 bool maxwell_gmem_fs_miss;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
@@ -132,6 +143,8 @@ typedef struct {
     uint32_t brx_pc[32], brx_tgt[32][64];
     int brx_ntgt[32], nbrx;
     bool brx_unknown;
+    bool full_quads;  // (a fragment shader with the game's own derivatives, written as quad swaps: quad_control_on)
+    bool quad_lockstep;  // (such a shader with branches: its quad's pixels step the pc state machine together - quad_lockstep)
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -403,6 +416,88 @@ static bool quad_on(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("LARECOMP_SHADER_QUAD"); on = e ? atoi(e) != 0 : maxwell_quad_ops; }
     return on;
+}
+
+// Those derivatives (quad_on) at a triangle's edge: the quad's uncovered pixels are helper invocations, and before
+// VK_KHR_shader_quad_control it is the driver's choice whether they take part in subgroup operations. NVIDIA's do (as
+// the Switch's); on AMD a swap with one gives no value, and the eyes' iris - small triangles, a parallax march steered
+// by these derivatives - turned to grain at every edge (#74 #95 #103, still there after v0.1.14's quad fix, which
+// only fixed which lane is which). The hardware's own derivatives always have the helpers (the spec requires them for
+// derivatives): such a SHFL - one an FSWZADD reads soon after - is written as the value plus its fine derivative
+// toward that neighbour. LARECOMP_SHADER_QUAD_DERIV=1 on (default on AMD), 0 off (quad swaps, the default elsewhere),
+// 2 test: quad swaps whose helper partner gives the pixel's own value (what AMD's look like, on any GPU)
+static int quad_deriv(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("LARECOMP_SHADER_QUAD_DERIV"); m = e ? atoi(e) : maxwell_quad_deriv_default; }
+    return m;
+}
+
+// The way the spec defines it, in place of quad_deriv: VK_KHR_shader_quad_control (+ maximal reconvergence). A fragment
+// shader with the game's own derivatives asks for full quads (helpers run and take part in quad operations, as on the
+// Switch and NVIDIA), derivatives over the whole quad, and quads together again after its branches and loops - the
+// eyes' iris is a march loop inside the pc state machine, where dFdxFine (quad_deriv) is undefined once the quad's
+// pixels part ways: v0.1.16 left grain on AMD (#74 #95 #144). The SHFLs are then the game's quad swaps as they are.
+// LARECOMP_SHADER_QUAD_CONTROL=1 on (default on AMD where the driver has both extensions), 0 off
+static bool quad_control_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_SHADER_QUAD_CONTROL");
+        on = maxwell_quad_control_ok && (e ? atoi(e) != 0 : maxwell_quad_control_default);
+    }
+    return on;
+}
+
+// Those shaders' quads, in step. Their branches are a `switch (pc)` state machine, and the eyes' iris is a parallax
+// march loop in it that runs a different number of turns per pixel: a quad's pixels then reach the iris's texture
+// reads in different turns. The Switch (SIMT, SSY/SYNC) brings the quad together first; here each pixel goes on alone,
+// and an implicit-LOD read takes its derivative from neighbours that are elsewhere in the shader. AMD (Vulkan, and
+// DirectX 12 through Dozen) works the quad's coordinates out on the neighbours' own stale registers, so a random mip
+// per pixel: the grain left after v0.1.16's dFdxFine and v0.1.17's quad control (#74 #95 #144 #150 #167 #177 #179).
+// Each turn the quad runs only its lowest pc (its pixels' pcs, through fine derivatives, which always have the
+// helpers), and the others wait: loops run before what follows them, branches meet again at their join, as with SSY.
+// Fall-through between cases becomes a jump, so a block only starts at the top of a turn. A finished pixel waits (pc
+// 0xffffff) until the quad is done; KIL kills it after the loop. LARECOMP_SHADER_QUAD_LOCKSTEP=1 on (default), 0 off,
+// 3 test: every fragment shader with branches; 4 test: on, those shaders blue and red where a pixel waited for its
+// quad; 5 test: off, red by the turns each pixel took (the iris: rings of turns, quads split at their edges).
+// The quad's lowest pc counts its helper invocations (the pixels outside the triangle): it needs them to step with the
+// others. AMD without VK_KHR_shader_quad_control (every GCN card - Vega iGPUs, RX 400/500 - and drivers without it)
+// doesn't promise that: there the quad's lowest pc stayed a helper's, no real pixel could step, and the loop ran to its
+// guard - eyes cut short (solid cyan) and 9 fps whenever NPC eyes were on screen (#203, Ryzen 7 5700G's Vega 8; #189;
+// #192 RX 570 slower since v0.1.18). Simulated here with helpers that never step (6 / 7 below): 9 fps, as reported;
+// leaving helpers out of the lowest pc gave back the speed but garbled irises (their values feed the derivatives). So
+// the lockstep only runs where helpers are guaranteed: NVIDIA (seen here) or quad control on; elsewhere off - v0.1.17's eyes
+// (AMD GCN #203; Intel's frozen Ice Lake driver hung the GPU on it, #208).
+// 6 test: helpers never step, and don't count; 7 test: helpers never step and do count (v0.1.18 on GCN: the bug).
+static int quad_lockstep(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("LARECOMP_SHADER_QUAD_LOCKSTEP");
+        m = e ? atoi(e) : maxwell_lockstep_default;  // (vk_exec_init: NVIDIA, or quad control on)
+    }
+    return m;
+}
+
+// Whether the SHFL at pc (into register d) is read by an FSWZADD as its first operand within the next few
+// instructions, before d is written again: the derivative pattern (quad_deriv)
+static bool shfl_feeds_fswzadd(const Ctx *c, uint32_t pc, int d) {
+    const uint64_t *code = (const uint64_t *)c->code;
+    for (size_t i = pc / 8 + 1, n = 0; i < c->ninsts && n < 48; i++) {
+        if (i % 4 == 0) continue;
+        n++;
+        uint64_t w = code[i];
+        if ((w & 0xfff8000000000000ull) == 0x50f8000000000000ull && (int)bits(w, 8, 8) == d) return true;
+        if ((int)bits(w, 0, 8) == d) return false;  // (written again - or an instruction whose bits there aren't a destination)
+    }
+    return false;
+}
+
+// The pc state machine's bound on its dispatch loop (the guest code's own loops run inside it): 100000 turns.
+// LARECOMP_SHADER_LOOP_GUARD=<n> (test): another bound - a shader that is slow because it runs into the bound (a loop
+// that never ends here) gets faster with a lower one, one that is just slow doesn't
+static unsigned loop_guard(void) {
+    static long g = -1;
+    if (g < 0) { const char *e = getenv("LARECOMP_SHADER_LOOP_GUARD"); g = e && atol(e) > 0 ? atol(e) : 100000; }
+    return (unsigned)g;
 }
 
 static bool warp_emu(void) {
@@ -887,7 +982,8 @@ static void emit_atom(Ctx *c, uint64_t w, bool red) {
                                          "atomicXor", "atomicExchange"};
     bool sgn = size == 1;
     static const char *const gma[] = {"GMA_ADD", "GMA_MIN", "GMA_MAX", NULL, NULL, "GMA_AND", "GMA_OR", "GMA_XOR", "GMA_XCH"};
-    const bool lazy = maxwell_gmem_chunk_shift && maxwell_gmem_lazy;  // (chunks imported lazily: no gmem_ buffer, the GMA_ functions)
+    // (chunks imported lazily, or windows of one import: no gmem_ buffer, the GMA_ functions)
+    const bool lazy = maxwell_gmem_chunk_shift != 0;
     for (int k = 0; k < (fast ? 2 : 1); k++) {
         const char *m = fast && k == 0 ? "gfast_.w[fw]" : "gmem_.w[uint(ga >> 2)]";
         const char *guard = fast && k == 0 ? "if (fw != 0xFFFFFFFFu)" : fast ? "else if (ok)" : "if (ok)";
@@ -918,6 +1014,36 @@ static void emit_atom(Ctx *c, uint64_t w, bool red) {
     sp(&c->body, "    }\n");
 }
 
+// A gather's 2D coordinates (TLD4S, TLD4 but cubes) through uvs() as glsl_sample's: a scaled texture whose contents
+// occupy its top-left part is gathered there. Without it Pokémon Z-A's lighting gathered its half-size shadow mask
+// over the whole image with FSR's 67% render resolution (and Dynamic resolution): the whole picture's shadows squeezed
+// into a 67% rectangle, older frames' shadows outside it (other lighting in the rectangle, a ghost of the player's
+// shadow beside it)
+//
+// Then a bias of a fraction of a texel (Ryujinx's TexturePass gather bias, the same rule): a gather whose coordinate
+// sits exactly between two texels may take either 2x2 group by the spec, and AMD's and Intel's Windows drivers take the
+// other one than the Switch (and NVIDIA): shadow edges and gathered depth then step by a texel as the camera moves.
+// The bias is 1 / (size * 2^(subTexelPrecisionBits + 1)), the least that moves a midpoint to the Switch's side.
+// LARECOMP_GATHER_BIAS=0 off, =<bits> that precision; default the device's bits on AMD / Intel Windows, else off.
+static int gather_bias(void) {
+    static int b = -1;
+    if (b < 0) { const char *e = getenv("LARECOMP_GATHER_BIAS"); b = e ? atoi(e) : maxwell_gather_bias_default; }
+    return b > 0 && b < 24 ? b : 0;
+}
+
+static void gather_uv(Ctx *c, int slot, char *xy, size_t n) {
+    char w[700];
+    if (c->stage != STAGE_VERTEX) {
+        snprintf(w, sizeof w, "uvs(%s, rscale[%d])", xy, slot + 1);
+        snprintf(xy, n, "%s", w);
+        c->uses_rscale = true;
+    }
+    if (gather_bias()) {
+        snprintf(w, sizeof w, "(%s + 1.0 / (vec2(tsize%d(0).xy) * %.1f))", xy, slot, (double)(1u << (gather_bias() + 1)));
+        snprintf(xy, n, "%s", w);
+    }
+}
+
 // TLD4S (2D gather, one component or a depth compare; per Ryujinx's EmitTexs Tld4s): x in Ra, y in Rb - or y in Ra+1
 // when Rb holds the offset (.AOFFI: 6-bit signed x, y at bits 0 / 8) and / or the depth reference (.DC, after the
 // offset). Results as TEXS: two components (Rd, Rd+1), four with Rd2 (Rd2, Rd2+1); .F16 (0xdf8) packs them.
@@ -941,6 +1067,7 @@ static void emit_tld4s(Ctx *c, uint64_t w) {
                  "bitfieldExtract(int(%s), 8, 6)) / vec2(tsize%d(0).xy))", A, y, Bv, Bv, slot);
     else
         snprintf(P, sizeof P, "vec2(as_type<float>(%s), as_type<float>(%s))", A, y);
+    gather_uv(c, slot, P, sizeof P);
     if (dc) snprintf(call, sizeof call, "textureGather(t%d, %s, as_type<float>(%s))", slot, P, dref);
     else snprintf(call, sizeof call, "textureGather(t%d, %s, %d)", slot, P, comp);
     write_tex_result(c, slot, call, d1 == RZ ? 3u : 15u, d0, d1, true, f16);
@@ -986,6 +1113,7 @@ static void emit_tld4(Ctx *c, uint64_t w) {
         } else {
             snprintf(xy, sizeof xy, "vec2(%s, %s)", co[0], co[1]);
         }
+        if (!cube) gather_uv(c, slot, xy, sizeof xy);
         if (cube && array) snprintf(P, sizeof P, "vec4(%s, %s, %s, %s)", co[0], co[1], co[2], lay);
         else if (cube) snprintf(P, sizeof P, "vec3(%s, %s, %s)", co[0], co[1], co[2]);
         else if (array) snprintf(P, sizeof P, "vec3(%s, %s)", xy, lay);
@@ -1217,6 +1345,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->info->uses_discard = true;
         if (getenv("LARECOMP_NO_DISCARD")) {
         } else if (!c->glsl) sp(&c->body, "    discard_fragment();\n");
+        else if (c->stage == STAGE_FRAGMENT && c->quad_lockstep) sp(&c->body, "    kill_ = true;\n    exit_now = true; break;\n");
         else if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    discard;\n");
         else sp(&c->body, "    /* kil */\n");  // GLSL has discard in fragment shaders only
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
@@ -1978,7 +2107,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (c->stage != STAGE_FRAGMENT) {
             sprintf(t, "as_type<uint>(%s + %s)", F(R(a)), F(R((int)bits(w, 20, 8))));
         } else {
-            bool ql = c->glsl && quad_on();
+            bool ql = c->glsl && (quad_on() || quad_deriv() == 1);  // (the pixel's own place, as the SHFL's sign)
             if (!ql) c->uses_lane = true;
             sprintf(t, "as_type<uint>(fswzadd(%s, %s, 0x%02xu, %s))", F(R(a)), F(R((int)bits(w, 20, 8))), swz, ql ? "qlane" : "lane");
         }
@@ -2041,7 +2170,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             const char *const *fn = warp_emu() ? fn_w : fn_s;  // (per 32-lane warp: the prelude's w* functions)
             static const char *const quad[] = {NULL, "subgroupQuadSwapHorizontal", "subgroupQuadSwapVertical", "subgroupQuadSwapDiagonal"};
             unsigned m = (unsigned)bits(w, 20, 5);
-            if (c->stage == STAGE_FRAGMENT && mode == 3 && bits(w, 28, 1) && m >= 1 && m <= 3 && quad_on())
+            bool feeds = c->stage == STAGE_FRAGMENT && mode == 3 && bits(w, 28, 1) && (m == 1 || m == 2) &&
+                         (quad_deriv() || quad_control_on()) && shfl_feeds_fswzadd(c, pc, d);
+            bool qd = feeds && !quad_control_on();
+            if (feeds && quad_control_on()) c->full_quads = true;  // (the quad swap below, in full quads: quad_control_on)
+            if (qd && quad_deriv() == 2)  // (test: a helper partner gives nothing - this pixel's own value)
+                sprintf(t, "(%s(uint(gl_HelperInvocation)) != 0u ? %s : %s(%s))", quad[m], R(a), quad[m], R(a));
+            else if (qd)  // (the neighbour from the hardware's derivative, the helpers included: quad_deriv)
+                sprintf(t, "as_type<uint>(as_type<float>(%s) + %s(as_type<float>(%s)) * ((uint(gl_FragCoord.%c) & 1u) == 0u ? 1.0f : -1.0f))",
+                        R(a), m == 1 ? "dFdxFine" : "dFdyFine", R(a), m == 1 ? 'x' : 'y');
+            else if (c->stage == STAGE_FRAGMENT && mode == 3 && bits(w, 28, 1) && m >= 1 && m <= 3 && quad_on())
                 sprintf(t, "%s(%s)", quad[m], R(a));
             else sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
             set_reg(c, d, t);
@@ -2194,7 +2332,7 @@ static void glsl_rewrite(Ctx *c, Str *o, const char *src) {
             snprintf(mem, sizeof mem, "%.*s", (int)(me - m), m);
             if (!strcmp(mem, "pos")) sp(o, c->stage == STAGE_FRAGMENT ? "gl_FragCoord" : "gl_Position");
             else if (!strcmp(mem, "psize")) sp(o, "gl_PointSize");
-            else if (!strcmp(mem, "layer")) sp(o, "gl_Layer");
+            else if (!strcmp(mem, "layer")) sp(o, maxwell_output_layer || c->stage != STAGE_VERTEX ? "gl_Layer" : "vlayer_");
             else sp(o, "%s", mem);  // a<i> (vertex input), v<i> (varying)
             p = me;
             continue;
@@ -2580,6 +2718,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
     sp(&s, "#version 460\n");  // (the prelude's first line; an extension directive has to follow it)
+    if (c->full_quads) sp(&s, "#extension GL_EXT_shader_quad_control : require\n#extension GL_EXT_maximal_reconvergence : require\n");
     if (info->uses_gmem && maxwell_gmem_chunk_shift && maxwell_gmem_lazy) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
     {   // (test) LARECOMP_WARP_FORCE_EMU=1: the 64-lane warp code even on 32-lane subgroups (it must change nothing there)
         const char *pre = glsl_prelude + sizeof "#version 460\n" - 1;
@@ -2629,6 +2768,18 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 sp(&s, "}\n");
             }
             sp(&s, "#define GMW(i, v) GMW_(i, v)\n#define GMAND(i, m) GMAND_(i, m)\n#define GMOR(i, m) GMOR_(i, m)\n");
+            // the atomics (emit ATOM: GMA_<op>, GMCAS), each on its word's window - as the lazy chunks' functions do
+            static const char *const am[][2] = {{"GMA_ADD", "atomicAdd"}, {"GMA_MIN", "atomicMin"}, {"GMA_MAX", "atomicMax"},
+                                                {"GMA_AND", "atomicAnd"}, {"GMA_OR", "atomicOr"}, {"GMA_XOR", "atomicXor"},
+                                                {"GMA_XCH", "atomicExchange"}};
+            for (size_t op = 0; op < sizeof am / sizeof am[0]; op++) {
+                sp(&s, "uint %s(uint i, uint v) { uint c = i >> %du, o = i & 0x%xu;\n", am[op][0], ws, (1u << ws) - 1);
+                for (int k = 0; k < n; k++) sp(&s, "  if (c == %du) return %s(gmem%d_.w[o], v);\n", k, am[op][1], k);
+                sp(&s, "  return 0u; }\n");
+            }
+            sp(&s, "uint GMCAS(uint i, uint cmp, uint v) { uint c = i >> %du, o = i & 0x%xu;\n", ws, (1u << ws) - 1);
+            for (int k = 0; k < n; k++) sp(&s, "  if (c == %du) return atomicCompSwap(gmem%d_.w[o], cmp, v);\n", k, k);
+            sp(&s, "  return 0u; }\n");
         }
     } else if (info->uses_gmem) {  // chunks imported lazily: a table of device addresses, buffer references (shader.h)
         int ws = (int)maxwell_gmem_chunk_shift - 2, cs = GMEM_CHUNK_SET(stage);
@@ -2744,6 +2895,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "invariant gl_Position;\nprecise gl_Position;\n");
         for (int i = 0; i < 32; i++)
             if (c->out_attr_mask & (1u << i)) sp(&s, "layout(location = %d) out vec4 v%d;\n", i, i);
+        if (info->writes_layer && !maxwell_output_layer) {  // (the layer for exec.c's geometry shader: a free location)
+            int l = 31;
+            while (l >= 0 && (c->out_attr_mask >> l & 1)) l--;
+            if (l >= 0) { sp(&s, "layout(location = %d) flat out int vlayer_;\n", l); info->layer_loc = (uint8_t)(l + 1); }
+            else sp(&s, "int vlayer_;\n");  // (no location left: dropped, layer 0)
+        }
     } else if (stage == STAGE_FRAGMENT) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
@@ -2757,16 +2914,17 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         }
         if (c->omap_depth) info->writes_depth = true;
         if (glsl_early_tests(c)) sp(&s, "layout(early_fragment_tests) in;\n");
+        if (c->full_quads) sp(&s, "layout(full_quads) in;\nlayout(quad_derivatives) in;\n");  // (quad_control_on)
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
     }
-    sp(&s, "void main() {\n");
+    sp(&s, c->full_quads ? "void main() [[maximally_reconverges]] {\n" : "void main() {\n");
     if (stage == STAGE_VERTEX) {
         sp(&s, "  gl_Position = vec4(0, 0, 0, 1);\n");
         for (int i = 0; i < 32; i++)
             if (c->out_attr_mask & (1u << i)) sp(&s, "  v%d = vec4(0, 0, 0, 1);\n", i);
         if (info->writes_point_size) sp(&s, "  gl_PointSize = 0.0f;\n");
-        if (info->writes_layer) sp(&s, "  gl_Layer = 0;\n");
+        if (info->writes_layer) sp(&s, maxwell_output_layer ? "  gl_Layer = 0;\n" : "  vlayer_ = 0;\n");
     }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0u;\n", i);
@@ -2777,6 +2935,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     int flat_on = maxwell_flat_on();
     Str flat = {0};
+    if (c->quad_lockstep) sp(&s, "  bool kill_ = false, waited_ = false;  // (KIL, once the quad is done: quad_lockstep)\n");
     if (any_branch && flat_on && !dbg && glsl_flatten(c, body.buf ? body.buf : "", &flat)) {
         sp(&s, "  uint tgt = 0u;  // (straight-line form: the address being skipped to, 0 running - glsl_flatten)\n");
         sp(&s, "%s", flat.buf ? flat.buf : "");
@@ -2785,14 +2944,57 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         free(flat.buf);
         sp(&s, "  uint pc = 8u; uint ssy_0 = 0u; uint ssy_1 = 0u; uint ssy_2 = 0u; uint ssy_3 = 0u; uint ssy_4 = 0u; uint ssy_5 = 0u; uint ssy_6 = 0u; uint ssy_7 = 0u; uint ssy_8 = 0u; uint ssy_9 = 0u; uint ssy_10 = 0u; uint ssy_11 = 0u; uint ssy_12 = 0u; uint ssy_13 = 0u; uint ssy_14 = 0u; uint ssy_15 = 0u; uint pbk_0 = 0u; uint pbk_1 = 0u; uint pbk_2 = 0u; uint pbk_3 = 0u; uint pbk_4 = 0u; uint pbk_5 = 0u; uint pbk_6 = 0u; uint pbk_7 = 0u; uint pbk_8 = 0u; uint pbk_9 = 0u; uint pbk_10 = 0u; uint pbk_11 = 0u; uint pbk_12 = 0u; uint pbk_13 = 0u; uint pbk_14 = 0u; uint pbk_15 = 0u; uint pcnt_0 = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
-        sp(&s, "%s", body.buf ? body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        bool report = maxwell_guard_word && c->stage == STAGE_COMPUTE && c->info->uses_gmem;
+        sp(&s, "  uint guard = 0u;\n  for (; guard < %uu; guard++) {\n", loop_guard());
+        if (c->quad_lockstep && quad_lockstep() != 5) {  // (the quad's lowest pc runs, the others wait: quad_lockstep)
+            sp(&s, quad_lockstep() != 6 ? "  { float pf_ = float(min(pc, 16777215u));\n"
+                                        : "  { float pf_ = gl_HelperInvocation ? 16777215.0f : float(min(pc, 16777215u));\n");
+            sp(&s, "%s"
+                   "    float m_ = min(pf_, pf_ + dFdxFine(pf_) * ((uint(gl_FragCoord.x) & 1u) == 0u ? 1.0f : -1.0f));\n"
+                   "    m_ = min(m_, m_ + dFdyFine(m_) * ((uint(gl_FragCoord.y) & 1u) == 0u ? 1.0f : -1.0f));\n"
+                   "    if (m_ >= 16777215.0f) break;\n    if (float(min(pc, 16777215u)) != m_) { %scontinue; } }\n",
+               "", quad_lockstep() == 4 ? "waited_ = true; " : "");
+            if (quad_lockstep() == 6 || quad_lockstep() == 7)  // (test: helpers never step, as on AMD without quad control)
+                sp(&s, "  if (gl_HelperInvocation) continue;\n");
+            // a case's fall-through into the next one: a jump, so the next block starts at the top of a turn
+            const char *b = body.buf ? body.buf : "";
+            bool first = true;
+            for (const char *l = b; *l;) {
+                const char *nl = strchr(l, '\n');
+                size_t n = nl ? (size_t)(nl - l + 1) : strlen(l);
+                unsigned cpc;
+                if (!strncmp(l, "  case ", 7) && sscanf(l + 7, "%uu:", &cpc) == 1) {
+                    if (!first) sp(&s, "    pc = %uu; continue;\n", cpc);
+                    if (first) sp(&s, "  switch (pc) {\n");
+                    first = false;
+                }
+                sp(&s, "%.*s", (int)n, l);
+                l += n;
+            }
+            if (first) sp(&s, "  switch (pc) {\n");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n"
+                   "  if (exit_now) { pc = 16777215u; exit_now = false; }\n  }\n");
+        } else {
+            sp(&s, "  switch (pc) {\n");
+            sp(&s, "%s", body.buf ? body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        }
+        if (report) {  // (test: maxwell_guard_word)
+            uint32_t id = 2166136261u;
+            for (size_t i = 0; i < 256 && i < c->ninsts * 8; i++) id = (id ^ c->code[i]) * 16777619u;
+            sp(&s, "  if (guard >= %uu) { uint k_ = atomicAdd(gmem_.w[%uu], 1u); if (k_ < 400u) { uint b_ = %uu + 4u + k_ * 12u;\n"
+                   "    gmem_.w[b_] = pc; gmem_.w[b_ + 1u] = 0x%08xu;\n", loop_guard(), maxwell_guard_word, maxwell_guard_word, id);
+            int k = 0;
+            for (int i = 0; i < 255 && k < 5; i++)
+                if (c->reg_used[i]) { sp(&s, "    gmem_.w[b_ + %du] = %du; gmem_.w[b_ + %du] = r%d;\n", 2 + 2 * k, i, 3 + 2 * k, i); k++; }
+            sp(&s, "  } }\n");
+        }
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
     free(body.buf);
-    if (xfb) {  // transform feedback: the written varying components, in order, to the buffers (ShaderKey.xfb_count)
+    if (c->quad_lockstep) sp(&s, "  if (kill_) discard;\n");  // (quad_lockstep)
+    bool lstest = c->quad_lockstep && strstr(s.buf, "uint guard = 0u;") && (quad_lockstep() == 4 || quad_lockstep() == 5);    if (xfb) {  // transform feedback: the written varying components, in order, to the buffers (ShaderKey.xfb_count)
         int b = 0, k = 0;
         for (int i = 0; i < 32 && b < 4; i++)
             for (int comp = 0; comp < 4 && b < 4; comp++) {
@@ -2842,6 +3044,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             sp(&s, "  if (ltint[0].w > 0.0f) { vec3 g = c0.rgb; float l = dot(g, vec3(0.299f, 0.587f, 0.114f));\n"
                    "    c0.rgb = mix(g, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n");
         if (tint) emit_recolour(&s, "c0", "vec3", "vec4");
+        // (test, quad_lockstep 4: every target blue, red where a pixel waited for its quad; 5, lockstep off: red = the
+        // pixel's turns of the state machine, so neighbours that differ went their own ways)
+        for (int rt = 0; rt < 8 && lstest; rt++)
+            if ((c->omap_target >> (rt * 4)) & 0xF && (!key || key->rt_kind[rt] == 0))
+                sp(&s, quad_lockstep() == 4 ? "  c%d = waited_ ? vec4(0.3f, 0.0f, 0.0f, 1.0f) : vec4(0.0f, 0.0f, 0.3f, 1.0f);\n"
+                                            : "  c%d = vec4(float(guard %% 8u) / 7.0f * 0.4f, 0.0f, 0.05f, 1.0f);\n", rt);
         if (c->omap_depth) {
             if (c->reg_used[r + 1]) sp(&s, "  gl_FragDepth = as_f(r%d);\n", r + 1);
             else sp(&s, "  gl_FragDepth = gl_FragCoord.z;\n");
@@ -2947,6 +3155,7 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;
     }
     size_t end = code_end(blob, code, max_size);
+    c->code = code, c->ninsts = end;  // (shfl_feeds_fswzadd looks ahead)
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
@@ -2981,6 +3190,15 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
             any_branch = true;
         (void)is_branch_target_op;
     }
+    if (any_branch && c->glsl && stage == STAGE_FRAGMENT && quad_lockstep())  // (quad_lockstep: the game's own derivatives)
+        for (size_t i = 0; i < end && !c->quad_lockstep; i++) {
+            uint64_t w = ((const uint64_t *)code)[i];
+            unsigned m = (unsigned)bits(w, 20, 5);
+            if (i % 4 && (w & 0xfff8000000000000ull) == 0xef10000000000000ull && bits(w, 30, 2) == 3 && bits(w, 28, 1) &&
+                (m == 1 || m == 2) && shfl_feeds_fswzadd(c, (uint32_t)(i * 8), (int)bits(w, 0, 8)))
+                c->quad_lockstep = true;
+            if (quad_lockstep() == 3) c->quad_lockstep = true;  // (test: every fragment shader with branches)
+        }
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
@@ -3251,7 +3469,7 @@ static uint64_t cache_key(const uint8_t *blob, size_t max_size, int stage, const
         if ((((const uint64_t *)code)[i] & 0xfff0000000000000ull) == 0xe250000000000000ull) return 0;  // BRX
     // (the straight-line switch is in the key: on and off translations of one shader differ, and a GPU that changes
     // the default - AMD - or a player's LARECOMP_SHADER_FLAT must not load the other form)
-    uint64_t v[6] = {(uint64_t)stage, max_size, maxwell_gmem_base, maxwell_gmem_size, (uint64_t)maxwell_flat_on(), (uint64_t)quad_on() + 2};
+    uint64_t v[6] = {(uint64_t)stage, max_size, maxwell_gmem_base, maxwell_gmem_size, (uint64_t)maxwell_flat_on() | (uint64_t)loop_guard() << 8 | (uint64_t)maxwell_guard_word << 32, (uint64_t)quad_on() + 2 + 16 * (uint64_t)quad_deriv() + 64 * (uint64_t)!maxwell_output_layer + 128 * (uint64_t)quad_control_on() + 256 * (uint64_t)quad_lockstep()};
     uint64_t h = fnv(fnv(fnv(0xcbf29ce484222325ull, cache_build, sizeof cache_build), v, sizeof v), key, sizeof *key);
     h = fnv(h, blob, (size_t)(code - blob) + end * 8);
     return h ? h : 1;

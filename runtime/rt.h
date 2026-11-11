@@ -83,8 +83,11 @@ typedef struct Module {
     uint64_t symtab, strtab, nsyms;
 } Module;
 
-extern Module g_modules[4];
+extern Module g_modules[6];
 extern int g_nmodules;
+extern Module g_rtld;  // (exefs/rtld, mapped only for code mods: loader_map_rtld; base 0: not)
+void loader_map_rtld(const char *exefs);
+Module *loader_load_mod(const char *path, uint64_t base, const char *name);  // a code mod's NSO, after them
 void loader_load(const char *exefs_dir);  // (again after a reboot: modules are reloaded into wiped memory)
 uint64_t loader_find_symbol(const char *name);
 const char *loader_symbol_at(uint64_t addr, uint64_t *offset);
@@ -93,6 +96,7 @@ const char *loader_symbol_at(uint64_t addr, uint64_t *offset);
 typedef void (*HostFn)(Cpu *c);
 void dispatch_init(void);
 GuestFn dispatch_lookup(uint64_t addr);
+bool dispatch_add_table(const uint64_t *addrs, const GuestFn *fns, uint64_t count);  // a code mod's (codemods.c)
 uint64_t hle_register(const char *name, HostFn fn);  // returns fake guest address
 HostFn hle_lookup_impl(const char *name);
 void hle_override(uint64_t guest_addr, HostFn fn, const char *name);
@@ -107,6 +111,7 @@ void launcher_log_open(void);
 void launcher_log_file(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rt_launcher_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int rt_gpu_bad_code;     // (invalid instructions on this driver: device.c vk_bad_code_note)
+extern bool rt_game_huge_alloc;  // (the game asked for 4 GB or more at once and was refused: heaps.c, #121 #138)
 extern bool rt_game_data_bad;  // (the game's decompressor reported damaged data: am.c)
 extern int rt_mods_on;         // (mods layered over the game's files: fs.c)
 void crash_handler_install(void);  // per thread (alternate signal stack)

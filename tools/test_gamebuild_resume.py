@@ -39,8 +39,21 @@ extern "C" bool rt_dev_mode() { return false; }
 extern "C" uint64_t plat_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 extern "C" void plat_sleep_until_ns(uint64_t t) { auto now=plat_now_ns(); if(t>now)std::this_thread::sleep_for(std::chrono::nanoseconds(t-now)); }
 extern "C" intptr_t plat_spawn(const char *const *a,const char *l,bool append) { return start_cb(a,l,append); }
+extern "C" intptr_t plat_spawn_no_cfg(const char *const *a,const char *l,bool append,unsigned long *e) { if(e)*e=0; return start_cb(a,l,append); }
 extern "C" int plat_proc_wait(intptr_t p,bool block) { return wait_cb(p,block); }
 extern "C" void plat_proc_kill(intptr_t p) { kill_cb(p); }
+// (ZA Recomp's gamebuild.c also logs to launcher.log, asks for free memory after a failed compile and for the CPU level)
+#include <cstdarg>
+extern "C" void rt_launcher_log(const char *fmt, ...) { va_list a; va_start(a, fmt); vfprintf(stderr, fmt, a); va_end(a); }
+extern "C" void plat_mem_free(uint64_t *phys, uint64_t *commit) { *phys = *commit = 0; }
+extern "C" bool gamelib_old_cpu(void) { return false; }
+// (and reads the Mods page's code switches: no mod's code is on here)
+extern "C" void settings_load(void) {}
+extern "C" bool settings_mod_code_on(const char *) { return false; }
+// (and the code mods' builds: modbuild_run)
+extern "C" int plat_cpu_count(void) { return (int)std::thread::hardware_concurrency(); }
+extern "C" bool plat_remove_tree(const char *d) { std::error_code e; std::filesystem::remove_all(std::filesystem::u8path(d), e); return !e; }
+extern "C" int plat_rename(const char *a, const char *b) { std::error_code e; std::filesystem::rename(std::filesystem::u8path(a), std::filesystem::u8path(b), e); return e ? -1 : 0; }
 '''
 GENERATOR = r'''
 import pathlib,sys,time
@@ -80,7 +93,7 @@ with tempfile.TemporaryDirectory() as temporary:
         subprocess.run(cc+[str(stub),'-shared','-Wl,--out-implib,'+str(resources/'build/lasrecomp.dll.a'),
                            '-o',str(tmp/'stub.dll')],check=True)
     objects=[]
-    for source in ('runtime/gamebuild.c',):
+    for source in ('runtime/gamebuild.c', 'runtime/services/mod_layout.c'):
         obj=tmp/(Path(source).stem+'.o'); objects.append(str(obj))
         subprocess.run(cc+['-std=gnu11','-fPIC','-Iruntime','-DGAMELIB_ID="cache-fixture"',
                            '-DGAMELIB_CFLAGS="-O0 -fPIC"','-DGAMELIB_SHARED="-shared"',
@@ -110,7 +123,10 @@ with tempfile.TemporaryDirectory() as temporary:
         if command[0] == str(relocated): command[0] = compiler
         if command[0]==str(generator): command=[sys.executable,*command]
         elif (fail_compile and '-c' in command) or (fail_link and '-c' not in command):
-            fail_compile=fail_link=False
+            # (a compile fails every try: ZA Recomp's gamebuild.c tries a failed file twice more - clang crashing
+            # under memory pressure, #116 - so a one-shot failure would just be retried)
+            if '-c' in command: fail_compile-=1
+            else: fail_link=False
             command=[sys.executable,'-c','import sys;print("synthetic failure");sys.exit(7)']
         stream=open(log.decode(),'ab' if append else 'wb')
         try:
@@ -173,8 +189,9 @@ with tempfile.TemporaryDirectory() as temporary:
         assert not (work/'in-progress').exists()
         assert hashlib.sha256(output.read_bytes()).digest()==before
         (work/'sdk_000.o').write_bytes(b'corrupt')
-        fail_compile=True
+        fail_compile=3
         assert not run(),why.value
+        fail_compile=0
         assert hashlib.sha256(output.read_bytes()).digest()==before
         assert run(),why.value
         assert len(compiles())==2 and not generators()

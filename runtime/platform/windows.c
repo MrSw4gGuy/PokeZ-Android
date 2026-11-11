@@ -15,6 +15,14 @@
 
 #include "../platform.h"
 
+// The Direct3D 12 Agility SDK: with these two exported, d3d12.dll loads D3D12Core.dll from the D3D12 folder next to
+// the exe (Microsoft's redistributable, 1.620.1) when it's there, the system's when not. DirectX 12 through Mesa's
+// Dozen needs it on Windows 10: Dozen offers the guest memory import (VK_EXT_external_memory_host) only with
+// ID3D12Device13's OpenExistingHeapFromAddress1, which Windows 10's own D3D12Core lacks - without it the world was black.
+// Vulkan drivers don't go through d3d12.dll: nothing changes for them.
+__declspec(dllexport) const unsigned int D3D12SDKVersion = 620;
+__declspec(dllexport) const char *D3D12SDKPath = ".\\D3D12\\";
+
 void rt_crash_explain(char *out, size_t n, const char *log_path);  // runtime/crash_explain.c
 void rt_launcher_log(const char *fmt, ...);  // runtime/launcher_log.c
 
@@ -820,7 +828,17 @@ bool plat_exe_path(char *buf, size_t size) {
 }
 
 // RtlGetVersion: the real version (GetVersionEx answers what the manifest declares). Build 22000+ is Windows 11.
+// Wine / Proton: its ntdll exports wine_get_version (Windows' doesn't). The logs then say so - they showed "Windows 10"
+// for Steam Decks and Linux desktops (#165, #201) - and the start screen can say why the game code can't build there.
+const char *plat_wine_version(void) {
+    typedef const char *(CDECL * WineVersionFn)(void);
+    WineVersionFn f = (WineVersionFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version");
+    return f ? f() : NULL;
+}
+
 void plat_os_name(char *buf, size_t size) {
+    const char *wine = plat_wine_version();
+    if (wine) { snprintf(buf, size, "Wine %s (Linux / Steam Deck: the Windows build under Wine or Proton)", wine); return; }
     typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
     RtlGetVersionFn f = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
     OSVERSIONINFOW v = {.dwOSVersionInfoSize = sizeof v};
@@ -1157,7 +1175,18 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) { return prw(fd, (v
 // ---- child processes
 typedef struct { HANDLE process, job; } WinProcess;
 
-PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+// Control Flow Guard off for one child (plat_spawn_no_cfg), as a process mitigation policy: it wins over the
+// system-wide Exploit protection setting, which the exe's header (tools/pe_no_cfg.py) does not (#337)
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+#ifndef PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF
+#define PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF (0x00000002ull << 40)
+#endif
+
+// no_cfg: NULL = a plain start; else *no_cfg = 0 when the child runs with CFG off, or the error that prevented it
+// (then it is started without the policy)
+static PlatProc spawn_child(const char *const argv[], const char *log_path, bool append_log, unsigned long *no_cfg) {
     static __thread char cmd[32768];
     cmd[0] = 0;
     for (int i = 0; argv[i]; i++) append_arg(cmd, sizeof cmd, argv[i]);
@@ -1177,7 +1206,34 @@ PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_
     MultiByteToWideChar(CP_UTF8, 0, argv[0], -1, wprog, MAX_PATH);
     for (wchar_t *p = wprog; *p; p++) if (*p == L'/') *p = L'\\';
     const wchar_t *app = GetFullPathNameW(wprog, MAX_PATH, wfull, NULL) ? wfull : NULL;
-    BOOL ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
+    BOOL ok = FALSE;
+    if (no_cfg) {
+        *no_cfg = ERROR_NOT_SUPPORTED;
+        STARTUPINFOEXW six = {.StartupInfo = si};
+        six.StartupInfo.cb = sizeof six;
+        DWORD64 policy[2] = {PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF, 0};
+        SIZE_T size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+        six.lpAttributeList = size ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(size) : NULL;
+        if (!six.lpAttributeList || !InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &size)) {
+            *no_cfg = six.lpAttributeList ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
+            free(six.lpAttributeList);
+            six.lpAttributeList = NULL;
+        } else if (!UpdateProcThreadAttribute(six.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, policy,
+                                              sizeof policy, NULL, NULL)) {
+            *no_cfg = GetLastError();
+        } else {
+            ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE,
+                                CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                                &six.StartupInfo, &pi);
+            *no_cfg = ok ? 0 : GetLastError();  // (older Windows: ERROR_INVALID_PARAMETER; or a policy refuses it)
+        }
+        if (six.lpAttributeList) {
+            DeleteProcThreadAttributeList(six.lpAttributeList);
+            free(six.lpAttributeList);
+        }
+    }
+    if (!ok) ok = CreateProcessW(app, wcmd, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
     if (!ok) rt_launcher_log("[plat] could not start %s (error %lu)\n", argv[0], GetLastError());
     CloseHandle(log);
     if (!ok) return 0;
@@ -1206,6 +1262,17 @@ PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_
     return (PlatProc)child;
 }
 
+PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
+    return spawn_child(argv, log_path, append_log, NULL);
+}
+
+PlatProc plat_spawn_no_cfg(const char *const argv[], const char *log_path, bool append_log, unsigned long *error) {
+    unsigned long e = 0;
+    PlatProc p = spawn_child(argv, log_path, append_log, &e);
+    if (error) *error = e;
+    return p;
+}
+
 void plat_proc_kill(PlatProc p) {
     WinProcess *child = (WinProcess *)p;
     if (child->job) TerminateJobObject(child->job, 255);
@@ -1229,6 +1296,7 @@ int plat_proc_wait(PlatProc p, bool block) {
     // a helper that dies before writing anything leaves only this: 0xC0000135 / 0xC0000142 can't load, 0xC0000005 crashed,
     // 0xC0000022 access denied, usually an antivirus; #99 had only "exit status 255" and an empty log)
     if (code > 255) rt_launcher_log("[plat] a helper process ended with status 0x%08lX\n", (unsigned long)code);
+    if (code == 0xC0000409) return PLAT_PROC_FAST_FAIL;  // (Control Flow Guard and other security checks, #337)
     return code > 255 ? 255 : (int)code;
 }
 
@@ -1288,6 +1356,17 @@ bool plat_remove_tree(const char *dir) {
     FindClose(h);
     return remove_tree_w(w, len, fd.dwFileAttributes,
                          (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? fd.dwReserved0 : 0);
+}
+
+bool plat_is_link(const char *path) {
+    static __thread wchar_t w[MAX_PATH * 4];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, MAX_PATH * 4) <= 1) return false;
+    for (wchar_t *p = w; *p; p++) if (*p == L'/') *p = L'\\';
+    WIN32_FIND_DATAW fd;  // (the reparse tag, in dwReserved0: a OneDrive placeholder is a plain file / folder here)
+    HANDLE h = FindFirstFileExW(w, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, 0);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    FindClose(h);
+    return (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && !cloud_placeholder(fd.dwReserved0);
 }
 
 // ---- OneDrive
@@ -1417,4 +1496,42 @@ bool plat_window_screen_hash(void *hwnd, uint32_t *out) {
     if (mdc) DeleteDC(mdc);
     ReleaseDC(NULL, sdc);
     return ok;
+}
+
+// (main.c, before logs/play.log is rotated) A session that ended in a crash keeps its log as logs/crash-<date>.log, the
+// last 3 only: two more starts rotated it away before - #151's first start after the recompile crashed and its play.log
+// was gone by the time the player looked. "Ended in a crash" = the crash dialog's "[crash]" line in the log's last 8 KB.
+static int cmp_names(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+void plat_keep_crash_log(void) {
+    FILE *pf = fopen("logs/play.log", "rb");
+    if (!pf) return;
+    static char tail[8193];
+    fseek(pf, 0, SEEK_END);
+    long sz = ftell(pf);
+    fseek(pf, sz > 8192 ? sz - 8192 : 0, SEEK_SET);
+    size_t got = fread(tail, 1, 8192, pf);
+    fclose(pf);
+    tail[got] = 0;
+    for (size_t i = 0; i < got; i++) if (!tail[i]) tail[i] = ' ';
+    if (!strstr(tail, "[crash]")) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char cp[64];
+    snprintf(cp, sizeof cp, "logs/crash-%04u%02u%02u-%02u%02u%02u.log", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+             st.wSecond);
+    CopyFileA("logs/play.log", cp, FALSE);
+    static char names[64][64];  // (the oldest beyond 3 removed: the names sort by date)
+    int nn = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA("logs/crash-*.log", &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do if (nn < 64) snprintf(names[nn++], 64, "%s", fd.cFileName); while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    qsort(names, (size_t)nn, sizeof names[0], cmp_names);
+    for (int i = 0; i + 3 < nn; i++) {
+        char p[80];
+        snprintf(p, sizeof p, "logs/%s", names[i]);
+        remove(p);
+    }
 }

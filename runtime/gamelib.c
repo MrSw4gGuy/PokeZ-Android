@@ -59,10 +59,17 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     return n;
 }
 
+// This build's game-code id (the Makefile's GAMELIB_ID): the start screen compares it with a newer release's (its notes'
+// "<!-- zarecomp-gamelib: <id> -->", runtime/ui/launcher.mm update_thread) to say whether updating rebuilds the game
+// code (tools/za/dist.sh writes the notes' line from make gamelib-id).
+const char *gamelib_build_id(void) { return GAMELIB_ID; }
+
+// (a library already loaded - back on the start screen after playing - counts only while it is still the one wanted:
+// the on mods' .pchtxt patches are in the id, and a set turned on or off since needs another; gamelib_stale)
 bool gamelib_present(const char *game_dir) {
-    if (g_tables) return true;
     char want[GAMELIB_FULL_ID_SIZE];
-    if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return false;
+    if (!game_dir || !gamelib_full_id(game_dir, want, sizeof want)) return g_tables != NULL;
+    if (g_tables) return !strcmp(g_tables->id, want);
     // LARECOMP_GAME_LIB: as gamelib_load takes it - as given, the library's own id decides - rather than asking
     // for a <library>.id beside it. On Android that file cannot exist: the library ships in the APK's lib
     // directory, which only ever holds .so files, and without this the start screen would try to build the game
@@ -74,6 +81,11 @@ bool gamelib_present(const char *game_dir) {
     for (int i = 0; i < n; i++)
         if (exists(c[i]) && id_matches(c[i], want)) return true;
     return false;
+}
+
+bool gamelib_stale(const char *game_dir) {
+    char want[GAMELIB_FULL_ID_SIZE];
+    return g_tables && game_dir && gamelib_full_id(game_dir, want, sizeof want) && strcmp(g_tables->id, want);
 }
 
 static const GameLibTables *open_lib(const char *path, const char *want) {

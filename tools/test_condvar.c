@@ -9,8 +9,10 @@
 
 // Unused platform/IPC entry points from the included kernel translation unit.
 // Abort if a test accidentally leaves the synchronization code under test.
-Module g_modules[4];
+Module g_modules[6];
 int g_nmodules;
+Module g_rtld;
+void hooks_capture(void) { abort(); }  // (code mods: their views at svcUnmapProcessMemory)
 uint32_t vi_vsync_handle(void) { abort(); }
 void rt_fatal_trace(void) { abort(); }
 void rt_fatal_msg(const char *fmt, ...) { (void)fmt; abort(); }
@@ -18,6 +20,10 @@ void plat_thread_guest(int prio) { (void)prio; abort(); }
 void plat_commit(uint64_t addr, uint64_t size) { abort(); }
 const char *plat_symbol(uint64_t pc, uint64_t *offset) { abort(); }
 void plat_print_backtrace(void) { abort(); }
+// (ZA Recomp's kernel.c: the audio threads in a hang dump, guest memory reset on reboot, HLE allocations - unused here)
+void audio_wait_dump(void) {}
+bool plat_reset_guest(uint64_t lo, uint64_t hi) { (void)lo; (void)hi; abort(); }
+void *hle_alloc(uint64_t size) { (void)size; abort(); }
 void crash_handler_install(void) { abort(); }
 void guest_call(Cpu *c, uint64_t addr) { abort(); }
 int ipc_handle_request(Cpu *c, uint32_t handle) { abort(); }

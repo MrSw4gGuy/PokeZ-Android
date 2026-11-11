@@ -10,10 +10,13 @@
 
 #include "platform.h"
 #include "rt.h"
+#include "settings.h"
 
+const char *codemods_at(uint64_t pc);  // runtime/codemods.c
 static char g_line[512];   // the first fatal line (FATAL message / "signal 11 accessing 0x10")
 static uint64_t g_pc;      // a crash's host pc (0: a FATAL)
 bool rt_game_data_bad;
+bool rt_game_huge_alloc;
 int rt_mods_on;
 int rt_gpu_bad_code;
 int rt_romfs_files = -1;   // the game's own RomFS files (runtime/services/fs.c; -1: not read yet)
@@ -55,10 +58,33 @@ static bool in_gpu_driver(uint64_t pc) {
     static const char *const drivers[] = {"nvoglv", "nvgpucomp", "nvwgf", "libnvidia", "amdvlk", "amdxc", "atiumd",
                                           "atig6", "igvk", "igc64", "igd", "libvulkan_radeon", "libvulkan_intel",
                                           "libvulkan_nouveau", "libvulkan_lvp", "libvulkan_virtio", "AGXMetal",
-                                          "MTLCompiler", "libLLVM", "radeonsi"};
+                                          "MTLCompiler", "libLLVM", "radeonsi",
+                                          // (DirectX 12: our Dozen and the DXIL compiler under it - a compute shader's
+                                          // build crashed deep in vulkan_dzn's recursion during the startup preparation)
+                                          "vulkan_dzn", "dxil", "dxcompiler"};
     for (size_t i = 0; i < sizeof drivers / sizeof *drivers; i++)
         if (contains_nocase(m, drivers[i])) return true;
     return false;
+}
+
+// A crash in our DirectX 12 (Dozen: vulkan_dzn.dll), not while compiling a pipeline (that one is recovered, #93):
+// the settings say Vulkan from the next start. #172: an RTX 4050 Laptop on DirectX 12 crashed in vulkan_dzn on the
+// first frames of every start - Vulkan is the normal path there, DirectX 12 the way round AMD driver crashes, and a
+// start that crashes the same way each time is a loop the player can only break in F1 if the game gets that far.
+// LARECOMP_DX12_NO_FALLBACK=1: left as chosen.
+static bool dozen_crash_to_vulkan(void) {
+#ifdef _WIN32
+    char m[512];
+    if (!g_settings.dx12 || getenv("LARECOMP_DX12_NO_FALLBACK") || !g_pc || !plat_module_name(g_pc, m, sizeof m) ||
+        !contains_nocase(m, "vulkan_dzn"))
+        return false;
+    g_settings.dx12 = false;
+    settings_save();
+    rt_launcher_log("[crash] in DirectX 12 (Dozen): the Graphics API is Vulkan from the next start\n");
+    return true;
+#else
+    return false;
+#endif
 }
 
 // (device.c vk_compile_crash_recover; LARECOMP_TEST_COMPILE_CRASH: the test's crash is in build_pipeline itself)
@@ -67,7 +93,9 @@ bool rt_compile_crash_at(uint64_t pc) { return in_gpu_driver(pc) || getenv("LARE
 void rt_crash_explain(char *out, size_t n, const char *log_path) {
     static const char *const report = "Please report it as a GitHub issue and attach the log file below. "
                                       "Your progress up to your last save or autosave is safe.";
-    const char *app = g_game_is_la ? "LAS Recomp" : "ZA Recomp";
+    // (g_game_is_la is Link's Awakening's until the game's files are read: a crash on the start screen or while the
+    // GPU starts said "LAS Recomp stopped", #159)
+    const char *app = g_game_is_la && rt_romfs_files >= 0 ? "LAS Recomp" : "ZA Recomp";
     char head[160], what[600];
     extern void vk_compile_crash_note(void) __attribute__((weak));  // (Vulkan: was this thread compiling a pipeline?)
     if (vk_compile_crash_note && g_pc && rt_compile_crash_at(g_pc)) vk_compile_crash_note();
@@ -105,19 +133,36 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
     } else if (rt_gpu_bad_code) {  // (before the Vulkan messages: the device loss that follows says nothing useful)
         snprintf(head, sizeof head, "The graphics driver produced bad code for the GPU");
         snprintf(what, sizeof what, rt_gpu_bad_code == 1
-                 ? "%s has deleted the driver's shader cache, which may be why. Start the game again: it stutters for a while "
-                   "as shaders are built again, nothing else changes. If it comes back, updating your graphics driver can help."
-                 : "%s will now build shaders without the driver's optimizer, which avoids this kind of driver bug. Start the "
-                   "game again: it may run slower until you update your graphics driver.", app);
+                 ? "%s has deleted the driver's shader cache, which may be why, and will skip the few effects that first "
+                   "appeared just before it (one may be missing). Start the game again: it stutters for a while as shaders are "
+                   "built again. If it comes back, updating your graphics driver can help."
+                 : "%s will now build shaders without the driver's optimizer and skip the few effects that first appeared "
+                   "just before it (one may be missing). Start the game again: it may run slower until you update your "
+                   "graphics driver.", app);
     } else if (has("svcBreak") && rt_game_data_bad) {  // (the same spot every time: nothing another start would change, #89)
         snprintf(head, sizeof head, "Damaged game data");
         snprintf(what, sizeof what, "The game read data from its files that can't be unpacked, so it stopped. %s"
                  "Dump the game again from your Switch and set it up on the start screen (Game Files).",
                  rt_mods_on ? "Turn your mods off first: a mod made for another version of the game can do this. If it still happens: " : "");
+    } else if (has("svcBreak") && rt_game_huge_alloc) {  // (#121 #138: a 6 GB list read from data at the first scene,
+        // on 1.0.0 code, on any GPU and on DirectX 12 too: the data most likely isn't that code's version)
+        snprintf(head, sizeof head, "The game files don't match each other");
+        snprintf(what, sizeof what, "While reading its data the game asked for an impossible amount of memory (over 4 GB "
+                 "at once) and stopped. This usually means the game data is from another version than the game code "
+                 "- for example a romfs folder extracted with another tool, or a base game mixed with an update. %s"
+                 "Set the game files up again on the start screen (Game Files), from your .xci or .nsp, together with "
+                 "its update file if you have one. %s",
+                 rt_mods_on ? "Turn your mods off first: a mod made for another version of the game can also do this. " : "",
+                 report);
     } else if (has("svcBreak")) {  // (the game's own check failed: Pokémon Z-A, rarely, while it starts - a timing race)
         snprintf(head, sizeof head, "The game stopped at one of its own checks");
         snprintf(what, sizeof what, "Start it again: this happens now and then while the game starts, and the next "
                  "start is normally fine. If it keeps happening at the same place, it's a bug in %s. %s", app, report);
+    } else if (in_gpu_driver(g_pc) && dozen_crash_to_vulkan()) {
+        snprintf(head, sizeof head, "DirectX 12 crashed");
+        snprintf(what, sizeof what, "The DirectX 12 mode (F1 > Display > Graphics API) crashed on this PC, so the next "
+                 "start uses Vulkan, the normal mode. Start the game again: nothing is lost, up to your last save or "
+                 "autosave. %s", report);
     } else if (in_gpu_driver(g_pc)) {
         snprintf(head, sizeof head, "Your graphics driver crashed");
         snprintf(what, sizeof what, "Update your graphics driver (NVIDIA, AMD or Intel) and try again. If it keeps "
@@ -129,6 +174,10 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
     } else if (has("out of memory") || has("cannot allocate") || has("alloc failed")) {
         snprintf(head, sizeof head, "Out of memory");
         snprintf(what, sizeof what, "Close other programs and try again.");
+    } else if (g_pc && codemods_at(g_pc)) {  // (before the game code's case: a mod's functions are in its tables too)
+        snprintf(head, sizeof head, "A code mod crashed");
+        snprintf(what, sizeof what, "The mod \"%s\" stopped the game: it may be made for another version of the game. "
+                 "Turn its code off on the start screen's Mods page.", codemods_at(g_pc));
     } else if (g_pc && rt_host_fn_name(g_pc, NULL)) {
         snprintf(head, sizeof head, "The game crashed");
         snprintf(what, sizeof what, "This is a bug in %s, not a problem with your game files or PC. %s", app, report);

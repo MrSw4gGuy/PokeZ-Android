@@ -15,7 +15,8 @@ void vk_shaders_init(void) {  // (compilers are per thread: check shaderc works 
 }
 
 static shaderc_shader_kind kind_of(int stage) {
-    return stage == STAGE_VERTEX ? shaderc_vertex_shader : stage == STAGE_FRAGMENT ? shaderc_fragment_shader : shaderc_compute_shader;
+    return stage == STAGE_VERTEX ? shaderc_vertex_shader : stage == STAGE_FRAGMENT ? shaderc_fragment_shader
+         : stage == STAGE_GEOMETRY ? shaderc_geometry_shader : shaderc_compute_shader;
 }
 
 // SPIR-V disk cache: cache/spirv/<hash of stage + source>.spv, so a known shader costs a file read instead of a
@@ -427,6 +428,44 @@ static const char *builtin_src(const char *name, int *stage) {
                "  mv = c.w > 0.0 ? (puv - uv) / u.jit.zw : vec2(0.0);\n"
                "  uint s = texelFetch(sten, p, 0).r;\n"
                "  rx = (s & 0xF0u) == 0x30u ? u.react.x : s == 2u ? u.react.y : 0.0;\n"
+               "}\n";
+    }
+    // DLAA for the clothing screen's character (exec.c pv_resolve), before DLSS: its motion vectors as fsr2_mv's, through
+    // the character's own transform (camera x its model matrix: the camera stays, the model turns), none where nothing
+    // was drawn (alpha 0); and its alpha as a grey picture, resolved by a DLSS feature of its own.
+    if (!strcmp(name, "pv_prep.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D dep;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D col;\n"
+               "layout(set = 0, binding = 2) uniform U { mat4 inv_cur; mat4 prev; vec4 jit; } u;\n"
+               "layout(location = 0) out vec2 mv;\n"
+               "layout(location = 1) out vec4 al;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  float a = texelFetch(col, p, 0).a;\n"
+               "  al = vec4(a, a, a, 1.0);\n"
+               "  if (a <= 0.0) { mv = vec2(0.0); return; }\n"
+               "  float d = max(texelFetch(dep, p, 0).r, 1e-7);\n"
+               "  vec2 uv = (gl_FragCoord.xy - u.jit.xy) * u.jit.zw;\n"
+               "  vec4 c = u.prev * (u.inv_cur * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0));\n"
+               "  vec2 puv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);\n"
+               "  mv = c.w > 0.0 ? (puv - uv) / u.jit.zw : vec2(0.0);\n"
+               "}\n";
+    }
+    // After DLSS: the colour (black where nothing was drawn: alpha-weighted already) and the alpha, each resolved, back
+    // into the character's image as colour / alpha - the game blends it with SRC_ALPHA, ONE_MINUS_SRC_ALPHA.
+    if (!strcmp(name, "pv_combine.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D oc;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D oa;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  float a = clamp(texelFetch(oa, p, 0).r, 0.0, 1.0);\n"
+               "  vec3 c = max(texelFetch(oc, p, 0).rgb, vec3(0.0));\n"
+               "  o = a > 1.0 / 512.0 ? vec4(min(c / a, vec3(1.0)), a) : vec4(0.0);\n"
                "}\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.
@@ -1106,6 +1145,35 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(s / max(n, 1e-6), 1.0);\n"
                "}\n";
     }
+    // Lightmap smoothing (textures.c lm_smooth): an edge-preserving (bilateral) filter per channel over the game's
+    // block-compressed lightmap, into an RGBA8 image of the same size. The steps between its 4x4 blocks are small and
+    // go; the edges between the atlas's regions are large and stay. Weights on the stored (sRGB-encoded) values.
+    // a = sRGB source (1 / 0), sigma in texels, sigma of the values (0-1).
+    if (!strcmp(name, "lightmap_smooth.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 enc(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }\n"
+               "vec3 dec(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }\n"
+               "vec4 load(ivec2 p) { vec4 c = texelFetch(t, p, 0); return pc.a.x > 0.5 ? vec4(enc(max(c.rgb, 0.0)), c.a) : c; }\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy), sz = textureSize(t, 0) - 1;\n"
+               "  float ss = pc.a.y, sr = pc.a.z;\n"
+               "  int r = int(ceil(ss * 2.0));\n"
+               "  vec4 c0 = load(p), num = vec4(0.0), den = vec4(0.0);\n"
+               "  for (int dy = -r; dy <= r; dy++)\n"
+               "    for (int dx = -r; dx <= r; dx++) {\n"
+               "      vec4 c = load(clamp(p + ivec2(dx, dy), ivec2(0), sz)), d = c - c0;\n"
+               "      vec4 w = exp(-float(dx * dx + dy * dy) / (2.0 * ss * ss)) * exp(-(d * d) / (2.0 * sr * sr));\n"
+               "      num += w * c;\n"
+               "      den += w;\n"
+               "    }\n"
+               "  vec4 v = num / den;\n"
+               "  o = pc.a.x > 0.5 ? vec4(dec(v.rgb), v.a) : v;\n"
+               "}\n";
+    }
     if (!strcmp(name, "rcas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
@@ -1153,12 +1221,28 @@ static const char *builtin_src(const char *name, int *stage) {
         "  return n.x * pc.m0 + n.y * pc.m1 + d * pc.m2 + pc.m3;\n"
         "}\n"
         "vec3 wpos(vec2 uv, float d) { vec4 p = wpos4(uv, d); return p.xyz / p.w; }\n";
-    if (!strcmp(name, "gtao.frag")) {  // t0 = the scene depth; out .r = visibility (1 = open)
+    // gtao_h.frag: the march's taps from gtao_down.frag's half-size depth (t2) - a 4x smaller image for the scattered
+    // reads, the same as SSGI's (exec.c gtao_before_lighting, LARECOMP_GTAO_HALF); pc.prm.y (unused by the march): its
+    // last texel written (x * 2048 + y), where the frame's part ends. The point and its normal still read the full-size
+    // depth (and t1, the G-buffer's normals, when cam.w > 0).
+    if (!strcmp(name, "gtao.frag") || !strcmp(name, "gtao_h.frag")) {  // t0 = the scene depth; out .r = visibility (1 = open)
         *stage = STAGE_FRAGMENT;
-        static char *src;
+        bool half = name[5] == 'h';
+        static char *srcs[2];
+        char *src = srcs[half];
         if (!src) {
             static const char body[] =
                 "vec3 pos_at(vec2 uv) { return wpos(uv, depth_at(t0, uv)); }\n"
+                "#ifdef GTAO_HALF\n"
+                "vec3 pos_far(vec2 u) {\n"
+                "  int v = int(pc.prm.y);\n"
+                "  ivec2 lim = min(ivec2(v >> 11, v & 2047), ivec2(pc.sz.xy) - 1);\n"
+                "  ivec2 ip = clamp(ivec2(u * pc.sz.xy), ivec2(0), lim);\n"
+                "  return wpos((vec2(ip) * 2.0 + 0.5) / pc.sz.zw, texelFetch(t2, ip, 0).r);\n"  // (the full-size texel it holds)
+                "}\n"
+                "#else\n"
+                "vec3 pos_far(vec2 u) { return pos_at(u); }\n"
+                "#endif\n"
                 "float ign(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }\n"
                 "float facos(float x) { float r = -0.156583 * abs(x) + HALF_PI; r *= sqrt(1.0 - abs(x)); return x >= 0.0 ? r : PI - r; }\n"
                 "void main() {\n"
@@ -1177,12 +1261,27 @@ static const char *builtin_src(const char *name, int *stage) {
                 "  vec3 dx = length(Pr - P) < length(P - Pl) ? Pr - P : P - Pl;\n"
                 "  vec3 dy = length(Pd - P) < length(P - Pu) ? Pd - P : P - Pu;\n"
                 "  vec3 N = normalize(cross(dy, dx));\n"
+                // cam.w > 0: t1 is the G-buffer's normals - the game's own, smooth across a character's polygons (the
+                // depth's are flat per polygon: on faces and bodies close up the AO changed at each polygon's edge, in
+                // stripes). World space, octahedral, 12 bits each: x = R * 16 + G's high nibble, y = G's low nibble *
+                // 256 + B (as the lighting shader decodes them)
+                "  if (pc.cam.w > 0.0) {\n"
+                "    uvec3 g = uvec3(texelFetch(t1, clamp(ivec2(uv * pc.sz.zw), ivec2(0), ivec2(pc.sz.zw) - 1), 0).rgb * 255.0 + 0.5);\n"
+                "    vec2 e = vec2(float(g.r * 16u + (g.g >> 4)), float((g.g & 15u) * 256u + g.b)) / 4095.0 * 2.0 - 1.0;\n"
+                "    vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));\n"
+                "    if (n.z < 0.0) n.xy = (1.0 - abs(e.yx)) * vec2(e.x >= 0.0 ? 1.0 : -1.0, e.y >= 0.0 ? 1.0 : -1.0);\n"
+                "    if (dot(n, n) > 1e-6) { n = normalize(n); if (dot(n, V) > 0.0) N = n; }\n"  // (facing away: keep the depth's)
+                "  }\n"
                 "  if (dot(N, V) < 0.0) N = -N;\n"
                 "  if (pc.prj.z == 2.0) { o = vec4(N * 0.5 + 0.5, 1.0); return; }\n"  // (debug: the normals)
                 "  if (pc.prj.z == 3.0) { o = vec4(vec3(fract(dist / 5.0)), 1.0); return; }\n"  // (debug: 5 m bands)
                 "  float radius = pc.prm.x;\n"
                 "  vec2 rUV = 0.5 * radius / (dist * pc.prj.xy);\n"  // (the radius in uv at that distance)
                 "  if (rUV.x * pc.sz.x < 1.0) { o = vec4(1.0); return; }\n"
+                // |cam.w|: the widest the radius gets on screen (a fraction of its width). Close up - a face in a
+                // conversation - 1.5 m spans more than the screen, and the few steps spread over it left blotches
+                "  float rk = min(1.0, abs(pc.cam.w) / rUV.x);\n"
+                "  rUV *= rk; radius *= rk;\n"
                 "  float falloffRange = 0.615 * radius, falloffFrom = radius * (1.0 - 0.615);\n"
                 "  float falloffMul = -1.0 / falloffRange, falloffAdd = falloffFrom / falloffRange + 1.0;\n"
                 "  float n0 = ign(gl_FragCoord.xy + pc.prm.w * 5.588238), n1 = ign(gl_FragCoord.yx * 1.37 + 17.0 + pc.prm.w * 3.1);\n"
@@ -1209,7 +1308,7 @@ static const char *builtin_src(const char *name, int *stage) {
                 "      float t = (float(j) + fract(n1 + float(j) * 0.618034)) / float(STEPS);\n"
                 "      t = t * t;\n"
                 "      vec2 off = dir * (rUV * t + 1.0 / pc.sz.xy);\n"
-                "      vec3 d0 = pos_at(uv + off) - P, d1 = pos_at(uv - off) - P;\n"
+                "      vec3 d0 = pos_far(uv + off) - P, d1 = pos_far(uv - off) - P;\n"
                 // (XeGTAO's thin occluder compensation: a sample far in front of the point - a grass blade, a railing -
                 // counts as farther away along the view axis, so it occludes less: thin things aren't solid walls)
                 "      float l0 = length(d0 + V * dot(d0, V) * 2.0), l1 = length(d1 + V * dot(d1, V) * 2.0);\n"
@@ -1229,6 +1328,22 @@ static const char *builtin_src(const char *name, int *stage) {
                 "  vis = clamp(vis / float(SLICES), 0.0, 1.0);\n"
                 "  vis = pow(vis, 1.6);\n"  // (XeGTAO's final power, softened: the game's lighting is soft already)
                 "  o = vec4(vis, 0.0, 0.0, 1.0);\n"
+                "}\n";
+            const char *defs = half ? "#define GTAO_HALF 1\nlayout(set = 0, binding = 2) uniform sampler2D t2;\n" : "";
+            size_t n = strlen(gtao_common) + strlen(defs) + strlen(body) + 1;
+            src = malloc(n);
+            snprintf(src, n, "%s%s%s", gtao_common, defs, body);
+            srcs[half] = src;
+        }
+        return src;
+    }
+    if (!strcmp(name, "gtao_down.frag")) {  // t0 = the scene depth: half size, each 2x2's top-left depth (R32F)
+        *stage = STAGE_FRAGMENT;
+        static char *src;
+        if (!src) {
+            static const char body[] =
+                "void main() {\n"
+                "  o = vec4(texelFetch(t0, clamp(ivec2(gl_FragCoord.xy) * 2, ivec2(0), ivec2(pc.sz.zw) - 1), 0).r);\n"
                 "}\n";
             size_t n = strlen(gtao_common) + strlen(body) + 1;
             src = malloc(n);
@@ -1302,9 +1417,14 @@ static const char *builtin_src(const char *name, int *stage) {
     // (cos-weighted: the band between the old and the new horizon, cos a_old - cos a_new) - one bounce of the game's
     // light from what is on screen. Sky (no depth) and things past the reach give nothing: the game's own ambient
     // light covers them. Out .rgb: the cos-weighted mean incoming light (x the albedo: the light it reflects).
-    if (!strcmp(name, "ssgi.frag")) {
+    // ssgi_h.frag: the march's taps from ssgi_down.frag's half-size image (t2: rgb the lit colour, a the depth) - one
+    // fetch per tap, from a 4x smaller image, instead of two from the full-size depth and lit image (exec.c ssgi_apply,
+    // LARECOMP_SSGI_HALF). The point itself and its normal still read the full-size depth.
+    if (!strcmp(name, "ssgi.frag") || !strcmp(name, "ssgi_h.frag")) {
         *stage = STAGE_FRAGMENT;
-        static char *src;
+        bool half = name[5] == 'h';
+        static char *srcs[2];
+        char *src = srcs[half];
         if (!src) {
             static const char body[] =
                 "vec3 pos_at(vec2 uv) { return wpos(uv, depth_at(t0, uv)); }\n"
@@ -1342,8 +1462,16 @@ static const char *builtin_src(const char *name, int *stage) {
                 "        t = t * t;\n"
                 "        vec2 su = uv + float(side) * dir * (rUV * t + 2.0 / pc.sz.xy);\n"
                 "        if (any(lessThan(su, vec2(0.0))) || any(greaterThan(su, vec2(1.0)))) break;\n"
+                "#ifdef SSGI_HALF\n"
+                "        if (su.x > pc.prm.w || su.y > pc.prj.z) break;\n"  // (past the frame's part: ssgi_down left it unwritten)
+                "        ivec2 ip = clamp(ivec2(su * pc.sz.xy), ivec2(0), ivec2(pc.sz.xy) - 1);\n"
+                "        vec4 hq = texelFetch(t2, ip, 0);\n"
+                "        float sd = hq.a;\n"
+                "        vec4 Q4 = wpos4((vec2(ip) * 2.0 + 0.5) / pc.sz.zw, sd);\n"  // (the full-size texel it holds)
+                "#else\n"
                 "        float sd = depth_at(t0, su);\n"
                 "        vec4 Q4 = wpos4(su, sd);\n"
+                "#endif\n"
                 "        if (abs(Q4.w) < 1e-7) continue;\n"
                 "        vec3 dq = Q4.xyz / Q4.w - P;\n"
                 "        float l = length(dq);\n"
@@ -1352,12 +1480,35 @@ static const char *builtin_src(const char *name, int *stage) {
                 "        if (e <= hs) continue;\n"
                 "        float band = sqrt(max(1.0 - hs * hs, 0.0)) - sqrt(max(1.0 - e * e, 0.0));\n"
                 "        float fall = 1.0 - l / radius;\n"
+                "#ifdef SSGI_HALF\n"
+                "        sum += hq.rgb * band * fall;\n"
+                "#else\n"
                 "        sum += textureLod(t1, su, 0.0).rgb * band * fall;\n"
+                "#endif\n"
                 "        hs = e;\n"
                 "      }\n"
                 "    }\n"
                 "  }\n"
                 "  o = vec4(sum / float(2 * SLICES), 1.0);\n"
+                "}\n";
+            static const char half_defs[] = "#define SSGI_HALF 1\nlayout(set = 0, binding = 2) uniform sampler2D t2;\n";
+            size_t n = strlen(gtao_common) + strlen(half_defs) + strlen(body) + 1;
+            src = malloc(n);
+            snprintf(src, n, "%s%s%s", gtao_common, half ? half_defs : "", body);
+            srcs[half] = src;
+        }
+        return src;
+    }
+    if (!strcmp(name, "ssgi_down.frag")) {  // t0 = the scene depth, t1 = the lit image: half size, rgb colour (2x2 mean) + a depth
+        *stage = STAGE_FRAGMENT;
+        static char *src;
+        if (!src) {
+            static const char body[] =
+                "void main() {\n"
+                "  ivec2 ip = ivec2(gl_FragCoord.xy);\n"
+                "  float d = texelFetch(t0, clamp(ip * 2, ivec2(0), ivec2(pc.sz.zw) - 1), 0).r;\n"
+                "  vec3 c = textureLod(t1, (vec2(ip) * 2.0 + 1.0) / pc.sz.zw, 0.0).rgb;\n"  // (bilinear at the 2x2's corner: their mean)
+                "  o = vec4(c, d);\n"
                 "}\n";
             size_t n = strlen(gtao_common) + strlen(body) + 1;
             src = malloc(n);
@@ -1492,6 +1643,14 @@ static const char *builtin_src(const char *name, int *stage) {
                 "  if (!(dn > db + 1e-7)) discard;\n"  // (no water here: reversed depth, the nearer the larger)
                 "  mat4 vp = inverse(mat4(pc.m0, pc.m1, pc.m2, pc.m3));\n"
                 "  vec3 P = wpos(uv, dn);\n"
+                // (window panes are drawn just like water, and being upright they'd be all mirror to the straight-up normal
+                // below: only what faces up or down gets a reflection. Each axis takes its nearer neighbour, so an edge
+                // doesn't tilt it)
+                "  vec2 px = 1.0 / pc.sz.zw, ex = vec2(px.x, 0.0), ey = vec2(0.0, px.y);\n"
+                "  vec3 Xa = P - wpos(uv - ex, depth_at(t0, uv - ex)), Xb = wpos(uv + ex, depth_at(t0, uv + ex)) - P;\n"
+                "  vec3 Ya = P - wpos(uv - ey, depth_at(t0, uv - ey)), Yb = wpos(uv + ey, depth_at(t0, uv + ey)) - P;\n"
+                "  vec3 Ng = cross(length(Xa) < length(Xb) ? Xa : Xb, length(Ya) < length(Yb) ? Ya : Yb);\n"
+                "  if (abs(Ng.y) < 0.7 * length(Ng)) discard;\n"
                 "  vec3 V = normalize(pc.cam.xyz - P);\n"
                 // (Z-A's water is level: straight up - the depth's own slope left thin lines at its triangles' seams -
                 // tilted by gentle moving ripples, prm.w the time)
@@ -1750,6 +1909,52 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (i >= pc.n) return;\n"
                "  uint v = f[pc.src + i], w = o[pc.src + i];\n"
                "  if (v != w && (pc.cpu_wins == 0u || h[pc.dst + i] == w)) h[pc.dst + i] = v;\n"
+               "}\n";
+    }
+    // (exec.c snap_merge_back) a storing dispatch's writes into a storage snapshot, back to the original - all three in
+    // the guest heap: the words the dispatch changed (copy vs its pristine image) that the CPU didn't rewrite meanwhile
+    // (the original still the image's), and the image follows them, so the next dispatch's changes are told the same way
+    if (!strcmp(name, "snap_merge.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 256) in;\n"
+               "layout(std430, set = 0, binding = 0) buffer H { uint h[]; };\n"
+               "layout(push_constant) uniform P { uint copy; uint pristine; uint dst; uint n; } pc;\n"
+               "void main() {\n"
+               "  uint i = gl_GlobalInvocationID.x;\n"
+               "  if (i >= pc.n) return;\n"
+               "  uint v = h[pc.copy + i], w = h[pc.pristine + i];\n"
+               "  if (v != w && h[pc.dst + i] == w) { h[pc.dst + i] = v; h[pc.pristine + i] = v; }\n"
+               "}\n";
+    }
+    // (exec.c ia_refresh) GPU-filled indirect draw parameters copied out of the guest heap (g) into private records, the
+    // draw size bounded. s holds pc.cap slots: pc.cap records of 5 words, then pc.cap source word offsets into the heap,
+    // then pc.cap caps {count, instances} the draws' translation writes; the first pc.n slots are in use. pc.work bounds
+    // count x instances - a block the game had already rewritten (GPU overlap) asked for a billion instances and the
+    // Steam Deck's ring timed out (5 s) with no page fault.
+    if (!strcmp(name, "ind_private.comp")) {  // (exec.c ia_refresh) sn: the submit-time snapshot of the first snap_n slots
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 64) in;\n"
+               "layout(std430, set = 0, binding = 0) readonly buffer G { uint g[]; };\n"
+               "layout(std430, set = 0, binding = 1) buffer S { uint s[]; };\n"
+               "layout(std430, set = 0, binding = 2) readonly buffer N { uint sn[]; };\n"
+               "layout(push_constant) uniform P { uint n; uint work; uint cap; uint flags; uint snap_n; } pc;\n"
+               "void main() {\n"
+               "  uint i = gl_GlobalInvocationID.x;\n"
+               "  if (i >= pc.n) return;\n"
+               "  uint src = s[pc.cap * 5u + i], d = i * 5u, c = pc.cap * 6u + i * 2u;\n"
+               "  uint v[5] = uint[5](g[src], g[src + 1u], g[src + 2u], g[src + 3u], g[src + 4u]);\n"
+               "  if (i < pc.snap_n) {\n"
+               "    uint dg = pc.cap * 8u;\n"  // (diagnostics: words the GPU sees other than the game had at submission)
+               "    for (uint w = 0u; w < 5u; w++) if (v[w] != sn[i * 5u + w]) atomicAdd(s[dg + w], 1u);\n"
+               "    atomicAdd(s[dg + 5u], 1u);\n"
+               "    if ((pc.flags & 1u) != 0u) { v[0] = sn[i * 5u]; v[2] = sn[i * 5u + 2u]; v[3] = sn[i * 5u + 3u]; v[4] = sn[i * 5u + 4u]; }\n"
+               "  }\n"
+               "  uint count = min(v[0], s[c]), inst = min(v[1], s[c + 1u]);\n"
+               "  if (count > 0u && inst > pc.work / count) inst = pc.work / count;\n"
+               "  s[d] = count; s[d + 1u] = inst;\n"
+               "  s[d + 2u] = v[2]; s[d + 3u] = v[3]; s[d + 4u] = v[4];\n"
                "}\n";
     }
     return NULL;

@@ -14,7 +14,7 @@ Needs: a distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 
 On Linux 6.7 or newer the renderer also gets page write tracking (userfaultfd + PAGEMAP_SCAN, as Windows' write watch):
 its vertex cache, and textures re-checked only where the game wrote. Older kernels run without it (the log says
 `[plat] no page write tracking: ...`); `LARECOMP_WRITE_TRACKING=0` turns it off.
-The start screen asks for the folder with your own game files and sets them up.
+The start screen asks for the folder with your own game files and sets them up (extracted `exefs` + `romfs`, `.xci` / `.nsp` with `prod.keys`, or a `.nup` without keys).
 
 Everything the app writes lives in `~/.local/share/lasrecomp` (`$XDG_DATA_HOME/lasrecomp`): game files (`extracted/`),
 saves, seeds, settings (`larecomp.ini`), shader caches, imported fonts. Started without a terminal the log is
@@ -31,6 +31,19 @@ Steam with Steam Input on, the game sees Steam's virtual Xbox controller (Xbox p
 
 If the AppImage won't start with a FUSE error, install your distribution's `fuse3` package, or run it with
 `APPIMAGE_EXTRACT_AND_RUN=1`. On a Steam Deck, put `APPIMAGE_EXTRACT_AND_RUN=1 %command%` in the game's launch options.
+
+### FSR 4.1.2 temporal upscaling (optional, Linux)
+
+F1 > Video > Temporal anti-aliasing > **AMD FSR 4.1.2** runs AMD's FSR 4.1.2 through a user-supplied Linux provider,
+`libamd_fidelityfx_upscaler_vk.so`, with its `fsr4-assets/` folder. Put both next to `lasrecomp` (or set
+`LARECOMP_FSR4_PATH` to the `.so` or its folder). The provider is not part of this repository: it is built from the
+owner's FidelityFX SDK 2.4.0 copy and the signed AMD binaries/assets are not redistributed here.
+
+The GPU must expose `VK_KHR_cooperative_matrix` and `VK_EXT_shader_float8` (RDNA4; the RX 9070 XT works). The device
+features are enabled on the first start when FSR 4 is selected. If the provider is missing or the GPU lacks the
+features, the game falls back to FSR 2 (FSR 3.1 on Windows) and logs why. `LARECOMP_FSR4=0` disables the request; `=1` requests it
+without changing the saved setting. FSR 4 currently receives neutral depth (the provider cannot use PokeZ's D32S8
+depth directly), so depth-based disocclusion is left to the model's color/motion-vector path.
 
 ## Building from source
 Ubuntu / Debian packages (other distributions: the same libraries under their names). SDL3 must be 3.4 or newer
@@ -152,6 +165,12 @@ Switches: `LARECOMP_VK_CS_SUBGROUP=0` leaves compute to the driver's 64-lane wav
 `vkQueueSubmit2`). `perf record -t <render thread>` sees user space only (perf_event_paranoid=2); the `[vk] t=` log line's
 `submit` ms shows the kernel time inside the submit ioctl.
 
+The Switch 2 Edition (`.nup`) has a larger asset set that reaches below the top 256 MB of that window. On a discrete AMD
+GPU with the edition's upgrade add-on present (`extracted/aoc/0100f43008c45001.bin`), the runtime imports a 1 GB window
+instead: the shorter window left those textures reading as zero, which made the world and all of the game's text black
+while the HUD art still drew. The whole 3.2 GB window costs too much on amdgpu (about 11 fps in Lumiose against 30 at
+1 GB on an RX 9070 XT). `LARECOMP_VK_GMEM_WINDOW=<MB>` overrides either default (`0`: all).
+
 ## ZA Recomp on Linux (native, x86-64)
 Experimental. ZA Recomp builds and runs natively on Linux x86-64 (no Wine / Proton) and can be packaged as an
 AppImage. Most of what makes that possible was already here, from LAS Recomp: the Linux platform layer
@@ -250,3 +269,15 @@ player's own packages (base game + update).
 - The start screen in a tiny bitmap font: run a dev build from the repo root (its resources are looked up from the
   starting folder; the AppImage keeps them next to the executable).
 - A black screenshot in a test run: a fade between scenes (the log shows about one draw per frame there).
+
+### AMD RDNA4 and Mesa 27.0-devel
+
+RADV 27 initializes its PS epilog cache (`device->ps_epilogs`) only when a dynamic-state extension feature bit is set.
+Extended dynamic state 1 is **core** in Vulkan 1.3, so a Vulkan 1.3 application can use it without enabling the
+promoted extension's feature bit. Mesa 27.0-devel's RADV then left the cache uninitialized and the first 3-vertex draw
+crashed in `radv_shader_part_cache_get()` (GFX1201, Radeon RX 9070).
+
+The renderer enables the promoted `VK_EXT_extended_dynamic_state` feature on RADV Vulkan 1.3 devices; the commands stay
+the core ones. Other 1.3 drivers keep their previous feature chain. Mesa 26.2.6 (stable) and current mesa-git both run
+the game. The driver-side fix is to initialize `ps_epilogs` unconditionally (or for `VK_API_VERSION_1_3`); a local Mesa
+build with that change runs the original, unpatched binary too.

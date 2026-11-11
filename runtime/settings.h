@@ -33,8 +33,10 @@ enum { GPU_DYN_VERTEX = 0 /* LARECOMP_VK_DYN_VERTEX */, GPU_OVERLAP /* LARECOMP_
 // the GPU's PCI vendor (Vulkan: device.c, before any feature is decided; 0: not known) and a feature's state: its
 // LARECOMP_* variable, else F1 > Compatibility, else on (robust access 2: off on AMD GPUs, #39)
 extern unsigned g_gpu_vendor;
+extern bool g_gpu_dozen;  // (vulkan/device.c) the device is Dozen: DirectX 12 underneath
 bool gpu_feature_on(int feature, const char *env);
 enum { GPU_AUTO = 0, GPU_ON = 1, GPU_OFF = 2 };
+enum { TAA_GAME = 0, TAA_FSR2 = 1, TAA_DLAA = 2, TAA_FSR3 = 3, TAA_FSR4 = 4 };  // (Settings.taa)
 enum { TIMER_POS_LEFT = 0, TIMER_POS_RIGHT = 1 };  // the run timer's corner (bottom left / right)
 enum { CHAOS_LETTERS_OFF = 0, CHAOS_LETTERS_EXPLORED = 1, CHAOS_LETTERS_MAP = 2 /* explored, all with the Map */ };
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
@@ -53,8 +55,13 @@ typedef struct {
     bool upscaler_auto;  // never chosen: the default for this GPU (settings_resolve_defaults); saved as "auto"
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
     int sharpen;         // SHARPEN_*: sharpening of the image in the window (Vulkan)
-    bool taa;            // Pokémon Z-A: AMD FSR 2's temporal anti-aliasing in place of the game's own (vulkan/exec.c fsr2_copy)
+    int taa;             // Pokémon Z-A: TAA_*: AMD FSR 2's, FSR 3.1's or NVIDIA DLAA's temporal anti-aliasing in place of the game's
+                         // own (vulkan/exec.c fsr2_copy, vulkan/fsr3.cpp, vulkan/dlaa.c)
+    int taa_render;      // with it: the scene's share of the resolution in percent, 50-100 (F1: 67 / 59 / 50, FSR upscales it; 100: anti-aliasing only)
     int gpu_compat[GPU_COMPAT_N];  // GPU_AUTO / GPU_ON / GPU_OFF per GPU_* feature (Compatibility)
+    char gpu_name[256];  // Graphics card: the Vulkan device to run on, by name ("": Auto; vulkan/device.c pick_device)
+    bool dx12;           // Graphics API (Windows): DirectX 12 through the shipped Dozen (Mesa's Vulkan on Direct3D 12,
+                         // dx12/ next to the exe) instead of the GPU's Vulkan driver (vulkan/device.c ui_window_init)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;
@@ -82,6 +89,7 @@ typedef struct {
     bool water_depth;    // water: deeper is darker and bluer (from its real depth), in the same pass
     bool water_caustics; // water: moving light patterns on the floor under it
     bool water_vivid;    // water: a more turquoise, slightly glowing look (stylized; off: the game's colours)
+    int tex_hd_cache_mb;    // HD pack images kept in memory once read (MB; 0: none): vulkan/textures.c hd_pending_process
     bool tex_hd, tex_dump;  // HD texture packs (textures/hd) on; dump the game's textures (textures/dump): vulkan/textures.c
     int shadow_res;    // 1-4: shadow maps drawn at that many times the game's size, from the next start (vulkan/textures.c);
                        // SHADOW_RES_HALF / _3Q: 50% / 75% of it (a phone: their pass is about half its GPU's frame)
@@ -99,6 +107,8 @@ typedef struct {
     int mouse_camera;    // MOUSE_CAM_*: how the mouse turns the camera (runtime/hle/input.c)
     float mouse_sens;    // mouse camera speed, 1 = default
     int rstick_snap;     // degrees: a right stick this close to an axis is put on it (0 = off): runtime/hle/input.c
+    int lstick_deadzone; // percent of the left stick's travel read as rest (0 = off, the stick goes raw): runtime/hle/input.c
+    int lstick_outer;    // percent of its travel from which the left stick reads as full (a pad's diagonals stop short)
     bool blur_removal;   // no tilt-shift blur at the top / bottom of the screen
     bool hide_hero_icon; // no Hero Mode icon on the HUD
     bool mirror_mode;    // the world mirrored left to right (Gameplay tab): renderers + runtime/hle/input.c
@@ -145,11 +155,25 @@ typedef struct {
     bool fps40;       // Z-A only: one and two world steps in turn, each shown that long on the 60 Hz display - 40 fps
                       // at the right speed (runtime/hle/framepace.c rt_za_frame_cfg)
     bool frame_gen;   // at 30 fps, an image made between each two frames: shown at 60 (vulkan/exec.c vk_fg_make)
+    bool frame_dt;    // Pokémon Z-A: the world's step from a wall-clock accumulator (runtime/hle/framepace.c
+                      // rt_za_frame_dt) - the same game speed at any frame rate. Off: the game's own step (slow motion
+                      // below 60 fps). On by default; LARECOMP_FRAME_DT=0 / 1 overrides it at load.
+    bool smooth_anim; // Pokémon Z-A 2.0.2: distant characters animate every frame (runtime/hle/framepace.c
+                      // rt_za_smooth_anim). On by default; LARECOMP_SMOOTH_ANIM=0 / 1 overrides it at load.
+    bool full_detail; // Pokémon Z-A: every model at its full detail at any distance (cache/maxlod, made from the
+                      // player's game files by zaprompts --maxlod: runtime/ui/launcher.mm launcher_maxlod_kick;
+                      // layered by runtime/services/fs.c). Off by default (GPU time); from the next start. #190
+    int draw_dist;    // Pokémon Z-A: the world's LOD / culling distances in percent (100: the game's; 150, 200, 300):
+                      // cache/drawdist, made from the player's files by zaprompts --drawdist (runtime/ui/launcher.mm
+                      // launcher_drawdist_kick), layered by runtime/services/fs.c. From the next start. #190
     int ui_lang;      // UI_LANG_*: the start screen's language (runtime/ui/launcher.mm); auto = the system's
     // mods/ folders (runtime/services/fs.c layers them): '|' between names. order: first wins where two replace the
     // same file (folders not listed come after, by name); off: not loaded. Edited on the start screen's Mods page.
     char mods_order[1024];
     char mods_off[1024];
+    // the mods whose code runs (exefs: subsdk programs, .pchtxt patches - runtime/codemods.c, runtime/gamebuild.c):
+    // off unless listed, each turned on after a warning on the Mods page (LARECOMP_CODE_MODS=1: all of them)
+    char mods_code_on[1024];
 } Settings;
 
 
@@ -163,11 +187,13 @@ bool settings_ui_portuguese(void);
 #define UI_TR(en, pt) (settings_ui_portuguese() ? (pt) : (en))
 // name is one of list's '|'-separated entries
 bool settings_list_has(const char *list, const char *name);
+bool settings_mod_code_on(const char *name);  // mods/<name>'s code runs (Mods page; LARECOMP_CODE_MODS=1: all)
 
 extern Settings g_settings;
 
 void settings_load(void);
 void settings_save(void);
+extern bool g_settings_fresh;  // no settings file at load: a first start (runtime/hle/bindings.c bind_pad_first_start)
 // At device init: the defaults that depend on the GPU. integrated (Vulkan: an integrated GPU; never on macOS): plain
 // bilinear upscaling instead of the sharp upscaler, whose pass at the window's size costs as much as the game's frame
 // there (UHD 770: FSR 1 + SMAA 8 ms of GPU per frame at 1080p, 20 ms at 4K), and Dynamic resolution instead of Match

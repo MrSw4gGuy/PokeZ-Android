@@ -231,6 +231,31 @@ static void recompute_pad(void) {
         rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX);
         ry = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
     }
+    // Left stick dead zone + steadiness (pad only): the stick went to the game raw, and the game picks walk or run from
+    // its length, so a pad whose stick wobbles by a few hundred around that threshold flipped walk <-> run every frame.
+    // A radial dead zone (lstick_deadzone, percent, default 10, 0 = off) is cut off and the rest rescaled to the full
+    // range; a pad's stick often stops short of full travel on the diagonals (85-90%) and never reached the game's run
+    // threshold, so from lstick_outer (default 90) up it reads as full. Then a length that moved less than ~2% from the
+    // last one keeps the last (the direction always follows), so noise can't carry it back and forth over the
+    // threshold. Keyboard and d-pad values are not touched.
+    if (pad && !host_test) {
+        static double last_m;
+        int dz_pct = g_settings.lstick_deadzone, out_pct = g_settings.lstick_outer;
+        if (out_pct < dz_pct + 10) out_pct = dz_pct + 10;
+        if (dz_pct > 0) {
+            double x = pad_lx, y = pad_ly, m = sqrt(x * x + y * y), dz = 32767.0 * dz_pct / 100, outer = 32767.0 * out_pct / 100;
+            if (m <= dz) m = 0;
+            else {
+                double n = (m - dz) / (outer - dz) * 32767.0;  // (the length, rescaled)
+                if (n > 32767) n = 32767;
+                if (fabs(n - last_m) < 650 && n < 32000) n = last_m;  // (near full tilt it still reaches the end)
+                x *= n / m, y *= n / m;
+                m = n;
+            }
+            last_m = m;
+            pad_lx = (int32_t)lround(m ? x : 0), pad_ly = (int32_t)lround(m ? y : 0);
+        }
+    }
     // rstick_snap: a stick pushed sideways also reads a little up or down (an Xbox One pad: 4 degrees on average, up
     // to 12), and the camera tilts with it. That close to an axis the stick is put on the axis; the angles in between
     // are spread over the rest, so nothing jumps at the edge. The length is kept.
@@ -491,13 +516,39 @@ void input_mouse_release(SDL_Window *w) {
     mouse_acc_x = mouse_acc_y = 0;
     LOG("[input] mouse free (start screen)\n");
 }
+// The game reads one controller: the one the player is using (#455: a two-port adapter is two gamepads, and the
+// working controller may be in port 2). Every connected gamepad is open, so its events arrive; a button press on
+// another one makes it the game's, and so does a stick or trigger pushed well past drift while the game's own is at
+// rest (a noisy idle stick can't take it from a player who's playing). The light and rumble go with it.
+static bool pad_at_rest(void) {
+    int32_t lx = pad_lx, ly = pad_ly, rx = pad_rx, ry = pad_ry;
+    return !pad_buttons && abs(lx) < 8000 && abs(ly) < 8000 && abs(rx) < 8000 && abs(ry) < 8000;
+}
+static void use_pad(SDL_JoystickID id, const char *why) {
+    SDL_Gamepad *g = SDL_GetGamepadFromID(id);
+    if (!g || g == pad) return;
+    if (pad) {
+        led_restore("controller changed");
+        SDL_RumbleGamepad(pad, 0, 0, 0);
+        rumble_last_lo = rumble_last_hi = 0, rumble_warned = false;  // (the next poll starts it on the new one)
+    }
+    pad = g;
+    LOG("[input] gamepad: %s%s\n", SDL_GetGamepadName(pad), why);
+    note_family();
+    recompute_pad();
+}
+static void open_pad(SDL_JoystickID id) {
+    if (!SDL_GetGamepadFromID(id)) SDL_OpenGamepad(id);
+    if (!pad) use_pad(id, "");
+}
+
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
     if (!scanned) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        for (int i = 0; ids && i < n; i++) open_pad(ids[i]);
         SDL_free(ids);
     }
     switch (e->type) {
@@ -519,19 +570,32 @@ void input_handle_event(const SDL_Event *e) {
         break;
     }
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        open_pad(e->gdevice.which);
         break;
-    case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+    case SDL_EVENT_GAMEPAD_REMOVED: {
+        SDL_Gamepad *g = SDL_GetGamepadFromID(e->gdevice.which);
+        if (g && g == pad) {
             SDL_RumbleGamepad(pad, 0, 0, 0);
-            SDL_CloseGamepad(pad); pad = NULL; note_family();
+            pad = NULL;
             led_forget();  // (gone: it shows its own colour when it comes back)
             rumble_clear(); rumble_last_lo = rumble_last_hi = 0; rumble_warned = false;
         }
+        if (g) SDL_CloseGamepad(g);
+        if (!pad) {  // another one still connected takes over
+            int n = 0;
+            SDL_JoystickID *ids = SDL_GetGamepads(&n);
+            for (int i = 0; ids && i < n && !pad; i++)
+                if (ids[i] != e->gdevice.which) open_pad(ids[i]);
+            SDL_free(ids);
+            note_family();
+        }
         recompute_pad();
         break;
+    }
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
         if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) touch_overlay_pad_used();  // (a controller in hand: the overlay hides)
+        if (e->gbutton.down && e->gbutton.which != TEST_DEVICE && !host_test) use_pad(e->gbutton.which, " (switched)");
+        if (pad && e->gbutton.which != TEST_DEVICE && e->gbutton.which != SDL_GetGamepadID(pad)) break;  // (another pad)
         if (!host_test || e->gbutton.which == TEST_DEVICE) {  // (the press as the event has it, before reading the pad)
             uint64_t b = pad_bits(e->gbutton.button);
             note_press(e->gbutton.down ? b : 0, e->gbutton.down ? 0 : b);
@@ -540,6 +604,8 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
         if (abs(e->gaxis.value) > 12000) touch_overlay_pad_used();  // (stick drift stays below)
+        if (!host_test && abs(e->gaxis.value) > 24000 && pad_at_rest()) use_pad(e->gaxis.which, " (switched)");
+        if (pad && e->gaxis.which != SDL_GetGamepadID(pad)) break;  // (another pad's stick: not the game's)
         if ((e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) &&
             !host_test) {  // (the triggers as buttons: past half way)
             static bool trig[2];

@@ -86,7 +86,16 @@ static void self_controller(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
     switch (req->cmd) {
     case 0: LOG("[am] application requested exit\n"); exit(0);
-    case 9: resp->copy_handles[resp->ncopy++] = new_event(); break;
+    case 9: {  // GetLibraryAppletLaunchableEvent: signalled - applets can start (nn::applet::CreateLibraryApplet
+        // waits on it first: unsignalled, the game froze the first time it wanted to show an error dialog)
+        uint32_t w, r;
+        KEvent *e = kernel_create_event_pair(&w, &r);
+        pthread_mutex_lock(&g_klock);
+        kernel_signal(e);
+        pthread_mutex_unlock(&g_klock);
+        resp->copy_handles[resp->ncopy++] = r;
+        break;
+    }
     case 40: OUT(uint64_t, 0) = 1; resp_size(resp, 8); break;  // CreateManagedDisplayLayer
     case 69: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;
     default: UNHANDLED("ISelfController");
@@ -108,6 +117,7 @@ static void generic_ok(Service *s, IpcReq *req, IpcResp *resp) {
 
 // ------------------------------------------------------------------ IStorage / IStorageAccessor
 typedef struct { uint8_t *data; uint64_t size; } AmStorage;
+static AmStorage *g_last_storage;  // (the last storage the game wrote: the one it pushes to an applet next)
 
 static void storage_accessor(Service *s, IpcReq *req, IpcResp *resp) {
     AmStorage *st = s->state;
@@ -119,6 +129,7 @@ static void storage_accessor(Service *s, IpcReq *req, IpcResp *resp) {
         uint64_t n = a->size;
         if ((uint64_t)off + n > st->size) n = st->size - (uint64_t)off;
         memcpy(st->data + off, (void *)(uintptr_t)a->addr, n);
+        g_last_storage = st;
         break;
     }
     case 11: {  // Read(offset, B)
@@ -147,6 +158,118 @@ static Service *new_am_storage(const void *data, uint64_t size) {
 }
 
 extern const uint8_t g_user_id[16];
+
+// ------------------------------------------------------------------ ILibraryAppletCreator / ILibraryAppletAccessor
+// System applets the game starts (the error dialog: nn::err::ShowApplicationError and the like; swkbd is hooked at its
+// own function, runtime/hle/swkbd.c). The creator only answered "ok" with no object, so the game waited forever for
+// an applet that never ran: the game froze for good the first time it wanted to show an error dialog (a
+// communication error, for one). Now the applet runs and finishes at once, as if the player had pressed OK: its state
+// event is signalled, it has no output, and its input (the error's arguments) is logged.
+static const char *applet_name(uint32_t id) {
+    switch (id) {
+    case 0x0a: return "auth";
+    case 0x0b: return "amiibo";
+    case 0x0c: return "controller";
+    case 0x0d: return "data erase";
+    case 0x0e: return "error";
+    case 0x0f: return "net connect";
+    case 0x10: return "player select";
+    case 0x11: return "keyboard";
+    case 0x12: return "Mii edit";
+    case 0x13: return "web";
+    case 0x14: return "shop";
+    case 0x15: return "photo viewer";
+    case 0x16: return "settings";
+    case 0x17: return "web (offline)";
+    case 0x18: return "login share";
+    case 0x19: return "wifi web auth";
+    case 0x1a: return "my page";
+    default: return "?";
+    }
+}
+// The browser applets (web, shop, offline web) hand back how they were left, as the console's do: Pokemon Z-A's
+// "Downloadable Content Available" on the title screen (Minus, without the DLC) opens the shop on its add-on content
+// page (?scene=aocs&mode=mini), then pops that answer - with none, it aborted at once (#194: "the game stopped at one
+// of its own checks"). Their answer here: WebCommonReturnValue (exit reason u32, pad, last URL [0x1000], its length
+// u64) with exit reason 0, the close button - the player left the shop without buying.
+static bool applet_is_web(uint32_t id) { return id == 0x13 || id == 0x14 || id == 0x17; }
+typedef struct { uint32_t id; KEvent *state_ev; uint32_t state_r; bool started, out_popped; } AmApplet;
+static void applet_accessor(Service *s, IpcReq *req, IpcResp *resp) {
+    AmApplet *a = s->state;
+    switch (req->cmd) {
+    case 0:  // GetAppletStateChangedEvent: signalled once it has run (Start)
+        resp->copy_handles[resp->ncopy++] = a->state_r;
+        break;
+    case 1:  // IsCompleted
+        OUT(uint8_t, 0) = a->started;
+        resp_size(resp, 1);
+        break;
+    case 10:  // Start: done at once
+        a->started = true;
+        LOG("[am] %s applet (0x%02x): finished at once (as if dismissed)\n", applet_name(a->id), a->id);
+        pthread_mutex_lock(&g_klock);
+        kernel_signal(a->state_ev);
+        pthread_mutex_unlock(&g_klock);
+        break;
+    case 30:  // GetResult: fine
+        break;
+    case 100: case 103: {  // PushInData / PushInteractiveInData: the arguments, logged (the error applet's code)
+        AmStorage *st = g_last_storage;
+        if (st && st->size >= 16) {
+            char hex[3 * 48 + 1] = "";
+            for (uint64_t i = 0; i < st->size && i < 48; i++) snprintf(hex + 3 * i, 4, "%02x ", st->data[i]);
+            LOG("[am] %s applet input (%llu bytes): %s\n", applet_name(a->id), (unsigned long long)st->size, hex);
+        }
+        break;
+    }
+    case 101:  // PopOutData: the browser applets' answer (once, after Start), else nothing
+        if (applet_is_web(a->id) && a->started && !a->out_popped) {
+            static uint8_t ret[0x1010];  // (WebCommonReturnValue: all zero = exit reason 0, the close button; no URL)
+            a->out_popped = true;
+            LOG("[am] %s applet: answers \"closed by the player\" (%u bytes)\n", applet_name(a->id), (unsigned)sizeof ret);
+            ipc_return_object(resp, new_am_storage(ret, sizeof ret));
+        } else {
+            resp->result = AM_NO_DATA;
+        }
+        break;
+    case 104:  // PopInteractiveOutData: nothing
+        resp->result = AM_NO_DATA;
+        break;
+    case 105: {  // GetPopOutDataEvent: signalled when there is an answer (the browser applets', at Start)
+        uint32_t w, r;
+        KEvent *ev = kernel_create_event_pair(&w, &r);
+        if (applet_is_web(a->id)) {
+            pthread_mutex_lock(&g_klock);
+            kernel_signal(ev);
+            pthread_mutex_unlock(&g_klock);
+        }
+        resp->copy_handles[resp->ncopy++] = r;
+        break;
+    }
+    case 106:  // GetPopInteractiveOutDataEvent: never
+        resp->copy_handles[resp->ncopy++] = new_event();
+        break;
+    default: LOG("[am] ILibraryAppletAccessor (%s) cmd %u (ok)\n", applet_name(a->id), req->cmd);
+    }
+}
+static void library_applet_creator(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    switch (req->cmd) {
+    case 0: {  // CreateLibraryApplet(applet id, mode)
+        AmApplet *a = calloc(1, sizeof *a);
+        a->id = IN(uint32_t, 0);
+        uint32_t w;
+        a->state_ev = kernel_create_event_pair(&w, &a->state_r);
+        LOG("[am] the game starts the %s applet (0x%02x, mode %u)\n", applet_name(a->id), a->id, IN(uint32_t, 4));
+        ipc_return_object(resp, service_new("ILibraryAppletAccessor", applet_accessor, a));
+        break;
+    }
+    case 10: case 11: case 12:  // CreateStorage(size) / CreateTransferMemoryStorage / CreateHandleStorage
+        ipc_return_object(resp, new_am_storage(NULL, IN(uint64_t, 0) ? IN(uint64_t, 0) : 0x10));
+        break;
+    default: UNHANDLED("ILibraryAppletCreator");
+    }
+}
 
 static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
@@ -187,7 +310,7 @@ static void application_proxy(Service *s, IpcReq *req, IpcResp *resp) {
         {3, "IAudioController", generic_ok},
         {4, "IDisplayController", generic_ok},
         {10, "IProcessWindingController", generic_ok},
-        {11, "ILibraryAppletCreator", generic_ok},
+        {11, "ILibraryAppletCreator", library_applet_creator},
         {20, "IApplicationFunctions", application_functions},
         {1000, "IDebugFunctions", generic_ok},
     };
@@ -241,7 +364,11 @@ static void lm_logger(Service *s, IpcReq *req, IpcResp *resp) {
         p += len;
     }
     if (n) LOG("[lm] %s\n", line);
-    if (n && strstr(line, "OODLE ERROR")) rt_game_data_bad = true;  // (the crash dialog: the abort that follows isn't a timing race, #89)
+    if (n && strstr(line, "OODLE ERROR")) {
+        extern void fs_log_recent_reads(void);
+        if (!rt_game_data_bad) fs_log_recent_reads();  // (once: which file, and are its bytes our copy's, #173)
+        rt_game_data_bad = true;
+    }  // (the crash dialog: the abort that follows isn't a timing race, #89)
 }
 
 SERVICE("lm", lm) {

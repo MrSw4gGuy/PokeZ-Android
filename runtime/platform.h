@@ -106,6 +106,9 @@ bool plat_exe_path(char *buf, size_t size);
 void plat_os_name(char *buf, size_t size);  // "Windows 10.0.19045", "Ubuntu 24.04 LTS (6.8.0)", "macOS 15.1" (the log)
 void plat_exec(char *const argv[]);  // replace the process (NULL = same command line); returns only on failure
 bool plat_relaunch(void);  // (Windows) start this program again, detached; the caller then exits
+#ifdef _WIN32
+const char *plat_wine_version(void);  // Wine's version when this Windows build runs under Wine / Proton, else NULL
+#endif
 #if defined(_WIN32) || defined(__linux__)
 void plat_terminate(void);  // end the process now, skipping DLL teardown (exit status 0)
 #endif
@@ -115,8 +118,18 @@ typedef intptr_t PlatProc;  // 0 = failed to start
 PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log);
 int plat_proc_wait(PlatProc p, bool block);  // exit code, or -1 while still running (block = false)
 #define PLAT_PROC_SIGNALED 256               // + N: ended by signal N instead of exiting (not on Windows)
+#define PLAT_PROC_FAST_FAIL 512              // Windows: ended by a security check (0xC0000409, e.g. Control Flow Guard)
+#ifdef _WIN32
+// plat_spawn with Control Flow Guard off for the child (the generator: unicorn's longjmp fails CFG's check, #337).
+// *error: 0 = started that way; else why not (then it was started normally, or not at all if that failed too)
+PlatProc plat_spawn_no_cfg(const char *const argv[], const char *log_path, bool append_log, unsigned long *error);
+#endif
 void plat_proc_kill(PlatProc p);             // end it and what it started (then it's gone: no wait)
 bool plat_remove_tree(const char *dir);      // rm -rf
+// path is a link or another entry that isn't a plain file or folder: a symlink, a device, a FIFO (POSIX: lstat, not
+// followed); a junction or symlink (Windows: a reparse point, not a cloud placeholder). plat_remove_tree removes the
+// link itself, never what it points to.
+bool plat_is_link(const char *path);
 // A game file opened the way the console's file systems allow: it can be renamed or deleted while open (Windows:
 // shared delete access). flags: O_RDONLY / O_RDWR, O_CREAT, O_EXCL; errno set on failure. Rename: fails if the target
 // exists (EEXIST), as the console's does.

@@ -23,6 +23,7 @@
 #include "../romfs_build.h"
 #include "../input_bind.h"
 #include "../xbox_attack_layout.h"
+#include "mod_layout.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -124,8 +125,14 @@ static void base_open(void) {
     bool folder = stat(path, &sb) == 0 || (!image && stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode));
     if (folder && romfs_layout(g_romfs_dir, &g_base, why, sizeof why)) {
         LOG("[fs] romfs: %d files served from %s\n", g_base.nfiles, g_romfs_dir);
+        // (Pokémon Z-A: the data index's size tells the data's version - #121 #138 crashed on 1.0.0 code at its first
+        // scene, a 6 GiB list read from data, on any GPU: a folder extracted elsewhere, maybe from another version.
+        // 2.0.0's is 9877520 bytes)
+        snprintf(path, sizeof path, "%s/arc/data.trpfd", g_romfs_dir);
+        if (stat(path, &sb) == 0) LOG("[fs] romfs: arc/data.trpfd %lld bytes (a folder extracted by another tool)\n", (long long)sb.st_size);
     } else {
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // (an older version's image)
+        if (stat(path, &sb) == 0) LOG("[fs] romfs: %s.bin, %lld bytes\n", g_romfs_dir, (long long)sb.st_size);
         g_base_fd = open(path, O_RDONLY);
         if (g_base_fd < 0) FATAL("cannot read the game data in %s %s(set up the game files on the start screen)\n",
                                  g_romfs_dir, why);
@@ -226,11 +233,14 @@ static int rom_cmp(const void *a, const void *b) {
 static void rom_dir_path(const uint8_t *dmeta, uint32_t dsize, uint32_t dir, char *out, size_t cap) {
     char parts[16][256];
     int n = 0;
-    while (dir != 0 && dir < dsize && n < 16) {  // root (offset 0) has an empty name
+    // (every read inside the table: a damaged or crafted romfs.bin - an entry near its end, a name length past it - read
+    // beyond the copy of the directory table before)
+    while (dir != 0 && dsize >= 0x18 && dir <= dsize - 0x18 && n < 16) {  // root (offset 0) has an empty name
         uint32_t parent, namelen;
         memcpy(&parent, dmeta + dir, 4);
         memcpy(&namelen, dmeta + dir + 0x14, 4);
         if (namelen > 255) namelen = 255;
+        if (namelen > dsize - dir - 0x18) namelen = dsize - dir - 0x18;
         memcpy(parts[n], dmeta + dir + 0x18, namelen);
         parts[n][namelen] = 0;
         n++;
@@ -247,7 +257,7 @@ static void rom_dir_path(const uint8_t *dmeta, uint32_t dsize, uint32_t dir, cha
 // Pokémon Z-A keeps its files in packs (arc/data.trpfs) listed by arc/data.trpfd, and reads a file from the RomFS
 // only when the list doesn't have it: so the game's data.trpfd is served without the layered files' entries
 // (trpfd_unlist). A mod's own data.trpfd is never used (it's made for the mod's game version).
-static char layer_root[17][1100];  // seed + optional Xbox presentation + 15 user mods
+static char layer_root[19][1100];  // seed + optional Xbox presentation + 15 user mods + full-detail models + draw distance
 static int nlayers = -1;
 static bool trinity;  // the RomFS has arc/data.trpfd
 static uint8_t *xbox_arc;
@@ -298,6 +308,56 @@ static bool xbox_layer_prepare(void) {
     return true;
 }
 
+// F1 > Full-detail models (#190): cache/maxlod/romfs, every model's mesh slots on its full mesh (tools/za/lod_mod.py,
+// made by zaprompts --maxlod from the player's own files: runtime/ui/launcher.mm launcher_maxlod_kick). The last layer:
+// a player's mod with the same model wins. Only for the game it was made from: cache/maxlod/.made holds that game's
+// data.trpfs size (each version's differs), checked against the RomFS served now.
+// F1 > Draw distance (#190): cache/drawdist/romfs, the scene parts holding the world's trinity_ModelLodSetting /
+// trinity_ModelCullingSetting tables with their distances scaled (tools/za/draw_dist.py via zaprompts --drawdist).
+// .made: the data.trpfs size and the factor in percent - both must match this game and the setting.
+bool g_drawdist_on;
+static void drawdist_layer(void) {
+    if (g_settings.draw_dist == 100) return;
+    unsigned long long made = 0;
+    int pct = 0;
+    FILE *f = fopen("cache/drawdist/.made", "rb");
+    if (!f) { LOG("[fs] draw distance %d%%: not made yet (cache/drawdist.log)\n", g_settings.draw_dist); return; }
+    if (fscanf(f, "%llu %d", &made, &pct) != 2) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made || pct != g_settings.draw_dist) {
+        LOG("[fs] draw distance %d%%: made for another game version or distance (%llu, %d%%): off until made again\n",
+            g_settings.draw_dist, made, pct);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/drawdist/romfs", sizeof *layer_root);
+    g_drawdist_on = true;
+    LOG("[fs] draw distance: %d%% (cache/drawdist)\n", pct);
+}
+
+bool g_maxlod_on;  // (this session serves cache/maxlod: F1 says so)
+static void maxlod_layer(void) {
+    if (!g_settings.full_detail) return;
+    unsigned long long made = 0;
+    FILE *f = fopen("cache/maxlod/.made", "rb");
+    if (!f) { LOG("[fs] full-detail models: not made yet (cache/maxlod.log)\n"); return; }
+    if (fscanf(f, "%llu", &made) != 1) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made) {
+        LOG("[fs] full-detail models: made for another game version (data.trpfs %llu, now %llu): off until made again\n",
+            made, pack ? (unsigned long long)pack->size : 0ull);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/maxlod/romfs", sizeof *layer_root);
+    g_maxlod_on = true;
+    LOG("[fs] full-detail models: on (cache/maxlod)\n");
+}
+
 static int name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
 // mods_order's place (unlisted: after every listed one), then the name
 static int mod_rank(const char *name) {
@@ -324,25 +384,30 @@ static void layer_init(void) {
     const char *seed = rando_seed_dir();
     if (seed) snprintf(layer_root[nlayers++], sizeof *layer_root, "%s/romfs", seed);
     DIR *d = opendir("mods");
-    if (!d) return;
+    if (!d) { maxlod_layer(); drawdist_layer(); return; }  // (no mods folder: ours still)
     char names[15][256];
     int n = 0;
     settings_load();  // (the start screen's Mods page: mods_off, mods_order)
     for (struct dirent *e; (e = readdir(d)) && n < 15;) {
         if (e->d_name[0] == '.' || e->d_name[0] == '_') continue;
         if (settings_list_has(g_settings.mods_off, e->d_name)) { LOG("[fs] mod %s: off\n", e->d_name); continue; }
-        char p[1100];
-        struct stat sb;
-        snprintf(p, sizeof p, "mods/%s/romfs", e->d_name);
-        if (!stat(p, &sb) && S_ISDIR(sb.st_mode)) strlcpy(names[n++], e->d_name, sizeof *names);
+        char p[1100], romfs[1100];
+        snprintf(p, sizeof p, "mods/%s", e->d_name);
+        // (the code isn't run: the files are, and many code mods carry their own romfs)
+        if (mod_has_code(p) && !settings_mod_code_on(e->d_name)) LOG("[fs] mod %s: has code (exefs), turned off\n", e->d_name);
+        if (mod_romfs_dir(p, romfs, sizeof romfs)) strlcpy(names[n++], e->d_name, sizeof *names);
     }
     closedir(d);
     qsort(names, n, sizeof *names, mod_cmp);
     for (int i = 0; i < n; i++) {
-        snprintf(layer_root[nlayers++], sizeof *layer_root, "mods/%s/romfs", names[i]);
-        LOG("[fs] mod: %s\n", names[i]);
+        char p[1100];
+        snprintf(p, sizeof p, "mods/%s", names[i]);
+        mod_romfs_dir(p, layer_root[nlayers], sizeof *layer_root);  // (mods/<name>/romfs, or the Switch / Ryujinx layout)
+        LOG("[fs] mod: %s (%s)\n", names[i], layer_root[nlayers++]);
         rt_mods_on++;
     }
+    maxlod_layer();
+    drawdist_layer();
 }
 
 static bool layer_file(const char *path, char *out, size_t cap) {
@@ -621,7 +686,7 @@ static void prompt_patch(void) {
     char path[128];
     snprintf(path, sizeof path, "textures/prompts/%s/romfs.patch", set);
     FILE *f = fopen(path, "rb");
-    if (!f) return;
+    if (!f) { LOG("[fs] button prompts: no %s (the start screen makes it: the game's own icon fonts)\n", path); return; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -671,8 +736,14 @@ static void rom_index(void) {
     // header: size, dir hash (off,size), dir meta (off,size), file hash (off,size), file meta (off,size), data off
     uint64_t doff = h[3], dsz = h[4], foff = h[7], fsz = h[8];
     rom_data_off = h[9];
-    uint8_t *dmeta = malloc(dsz), *fmeta = malloc(fsz);
-    if (base_pread(dmeta, dsz, doff) != (ssize_t)dsz || base_pread(fmeta, fsz, foff) != (ssize_t)fsz) return;
+    // (sizes from the file's own header: a damaged one asking for GBs fails the allocation instead of reading into NULL)
+    uint8_t *dmeta = dsz <= (256u << 20) ? malloc(dsz) : NULL, *fmeta = fsz <= (256u << 20) ? malloc(fsz) : NULL;
+    if (!dmeta || !fmeta || base_pread(dmeta, dsz, doff) != (ssize_t)dsz || base_pread(fmeta, fsz, foff) != (ssize_t)fsz) {
+        LOG("[fs] romfs.bin: unreadable directory / file tables (dir %llu bytes, files %llu bytes)\n",
+            (unsigned long long)dsz, (unsigned long long)fsz);
+        free(dmeta); free(fmeta);
+        return;
+    }
     int cap = 4096;
     rom_files = malloc(sizeof(RomFile) * cap);
     for (uint64_t o = 0; o + 0x20 <= fsz;) {
@@ -685,6 +756,7 @@ static void rom_index(void) {
         char dir[1024], name[256];
         rom_dir_path(dmeta, (uint32_t)dsz, parent, dir, sizeof dir);
         uint32_t nl = namelen > 255 ? 255 : namelen;
+        if (nl > fsz - o - 0x20) nl = (uint32_t)(fsz - o - 0x20);  // (a name past the table's end: cut at it)
         memcpy(name, fmeta + o + 0x20, nl);
         name[nl] = 0;
         if (rom_nfiles == cap) { cap *= 2; rom_files = realloc(rom_files, sizeof(RomFile) * cap); }
@@ -812,6 +884,158 @@ const char *romfs_file_at(uint64_t off) { return romfs_file_base(off, NULL); }
 
 void romfs_file_read_hook(const char *path);
 
+// The last RomFS reads, for fs_log_recent_reads: #173, "OODLE ERROR : LZ corruption" leaving the lab on 2.0.0. Its
+// first log (a66aa03: the bytes read again from disk) matched our copy of 2.0.0 in all 8 reads it got out before the
+// game's abort cut it short, so the file is sound. Each read now keeps a hash of the bytes as handed to the game, at
+// once (FNV-1a 64 over 8-byte words, ~4 GB/s), and the list is written before anything slow: a hash that differs from
+// the disk's (and our copy's) is a read gone wrong; all the same is data the game's own code then got wrong
+#define RECENT_READS 24
+static struct { uint64_t off, size, addr, hash; int64_t got; } recent_reads[RECENT_READS];
+static unsigned recent_n;
+static pthread_mutex_t recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t fnv_words(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0xCBF29CE484222645ull, w;
+    uint64_t k = 0;
+    for (; k + 8 <= n; k += 8) { memcpy(&w, p + k, 8); h = (h ^ w) * 0x100000001B3ull; }
+    for (; k < n; k++) h = (h ^ p[k]) * 0x100000001B3ull;
+    return h;
+}
+static void recent_read_note(uint64_t off, uint64_t size, const uint8_t *dst, ssize_t got) {
+    uint64_t h = got > 0 ? fnv_words(dst, (uint64_t)got) : 0;
+    pthread_mutex_lock(&recent_lock);
+    unsigned i = recent_n++ % RECENT_READS;
+    recent_reads[i].off = off, recent_reads[i].size = size, recent_reads[i].addr = (uint64_t)(uintptr_t)dst;
+    recent_reads[i].hash = h, recent_reads[i].got = got;
+    pthread_mutex_unlock(&recent_lock);
+}
+// The game's one OodleLZ_Decompress call for its archive reads (FileLoaderFromArchive: f_7001a9bd38 on 2.0.0,
+// f_7001a9b718 on 2.0.2 - serial, threadPhase 3, with a 512 KB decoder memory kept in the thread's TLS), through
+// tools/za_patches.py OODLE_CALL: a decode that returns 0 for data whose bytes are right is decoded again. #173 #206
+// (Windows 11 build 26300 only): the bytes read were the file's own and still intact in memory, yet the decode
+// failed while two of the game's worker threads crashed together - something else wrote into the decoder's state at
+// that moment, and the same bytes decode fine here every time. A retry gets a clean run instead of the svcBreak that
+// ended the session. The arguments (x0-x7 and the 6 on the stack: sp + 0 .. 0x2f) are restored for each try.
+// #233 (v0.1.21, Windows 11 26200, RTX 2080 S): both retries of the same block (71548 bytes from 33445, as #223)
+// failed too - so what went wrong stays wrong between tries: the compressed bytes themselves, or the decoder memory.
+// Each retry now runs with decoder memory of its own (the 12th argument, sp + 0x18: a fresh host block - guest
+// addresses are host addresses), and when the compressed bytes changed during the failed decode (hashed before it)
+// and they came in one of the last RomFS reads, they are read from the disk again first.
+// LARECOMP_OODLE_RETRY=<n> tries after the first (default 2, 0 off). Log: "[oodle] decode failed ... retry n: ok".
+// the compressed bytes at [src, src + n) inside one of the last reads: read again from the RomFS (1), else 0
+static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size);
+void rt_za_oodle_call(Cpu *c, uint64_t target) {
+    static int tries = -1;
+    if (tries < 0) { const char *e = getenv("LARECOMP_OODLE_RETRY"); tries = e ? atoi(e) : 2; }
+    GuestFn fn = dispatch_lookup(target);
+    uint64_t x[8], st[6], lr = c->x[30];
+    memcpy(x, c->x, sizeof x);
+    for (int i = 0; i < 6; i++) st[i] = LD64(c->sp + 8 * (uint64_t)i);
+    bool hashed = tries > 0 && x[0] && x[1] && x[1] <= (64u << 20);
+    uint64_t h0 = hashed ? fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]) : 0;
+    fn(c);
+    {   // LARECOMP_TEST_OODLE_FAIL=<n> (test): every n-th decode reads as failed once - the retry path, on real data
+        static long every = -1, calls;
+        if (every < 0) { const char *e = getenv("LARECOMP_TEST_OODLE_FAIL"); every = e ? atol(e) : 0; }
+        if (every > 0 && ++calls % every == 0) LOG("[oodle] test: decode %ld made to fail\n", calls), c->x[0] = 0;
+    }
+    uint8_t *own = NULL, *own_raw = NULL;  // (the retries' decoder memory: 64-byte aligned, as the game's)
+    uint64_t mem_size = st[4];
+    if (c->x[0] == 0 && x[3] != 0 && tries > 0 && st[3] && mem_size && mem_size <= (64u << 20)) {
+        own_raw = malloc((size_t)mem_size + 64);
+        if (own_raw) own = (uint8_t *)(((uintptr_t)own_raw + 63) & ~(uintptr_t)63), memset(own, 0, (size_t)mem_size);
+    }
+    for (int t = 1; t <= tries && c->x[0] == 0 && x[3] != 0; t++) {
+        char what[160] = "not hashed";
+        if (hashed) {
+            uint64_t h1 = fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]);
+            if (h1 == h0) snprintf(what, sizeof what, "compressed bytes unchanged");
+            else {
+                char rd[120] = "";
+                int r = recent_read_restore(x[0], x[1], rd, sizeof rd);
+                snprintf(what, sizeof what, "compressed bytes CHANGED during the decode, %s", rd);
+                if (r) h0 = fnv_words((const uint8_t *)(uintptr_t)x[0], x[1]);
+            }
+        }
+        LOG("[oodle] decode failed (%llu bytes from %llu at %llx; %s; decoder memory %llx +%llx): retry %d%s\n",
+            (unsigned long long)x[3], (unsigned long long)x[1], (unsigned long long)x[0], what,
+            (unsigned long long)st[3], (unsigned long long)mem_size, t, own ? " with decoder memory of its own" : "");
+        memcpy(c->x, x, sizeof x);
+        for (int i = 0; i < 6; i++) ST64(c->sp + 8 * (uint64_t)i, i == 3 && own ? (uint64_t)(uintptr_t)own : st[i]);
+        c->x[30] = lr;
+        fn(c);
+        if (c->x[0] != 0) {
+            LOG("[oodle] retry %d: ok (%llu bytes)\n", t, (unsigned long long)c->x[0]);
+            rt_game_data_bad = false;  // (the data was fine after all: a crash later isn't about it)
+        }
+    }
+    if (own) ST64(c->sp + 0x18, st[3]);  // (the caller's own argument back)
+    free(own_raw);
+}
+
+static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size) {
+    pthread_mutex_lock(&recent_lock);
+    unsigned k = recent_n < RECENT_READS ? recent_n : RECENT_READS;
+    typeof(recent_reads[0]) r[RECENT_READS];
+    for (unsigned i = 0; i < k; i++) r[i] = recent_reads[(recent_n - k + i) % RECENT_READS];
+    pthread_mutex_unlock(&recent_lock);
+    for (int i = (int)k - 1; i >= 0; i--) {  // (the newest read holding them)
+        if (r[i].got <= 0 || src < r[i].addr || src + n > r[i].addr + (uint64_t)r[i].got) continue;
+        uint64_t off = r[i].off + (src - r[i].addr);
+        ssize_t got = romfs_read((uint8_t *)(uintptr_t)src, n, off);
+        snprintf(what, what_size, "read again from the RomFS at %llx (%lld of %llu bytes)", (unsigned long long)off,
+                 (long long)got, (unsigned long long)n);
+        return got == (ssize_t)n;
+    }
+    snprintf(what, what_size, "not in the last %u RomFS reads", k);
+    return 0;
+}
+
+void fs_log_recent_reads(void) {  // (services/am.c: the game's decompressor said its data is damaged)
+    pthread_mutex_lock(&recent_lock);
+    unsigned n = recent_n < RECENT_READS ? recent_n : RECENT_READS;
+    typeof(recent_reads[0]) r[RECENT_READS];
+    for (unsigned i = 0; i < n; i++) r[i] = recent_reads[(recent_n - n + i) % RECENT_READS];
+    pthread_mutex_unlock(&recent_lock);
+    LOG("[fs] the last %u RomFS reads before the damaged data (file, offset in it, size, bytes read if short, FNV-1a 64 "
+        "by 8-byte words of the bytes handed to the game; romfs.bin %llu bytes):\n", n, (unsigned long long)base_size());
+    for (unsigned i = 0; i < n; i++) {  // (first, all at once: the game aborts soon after its error)
+        uint64_t base = 0;
+        const char *path = romfs_file_base(r[i].off, &base);
+        char sh[48] = "";
+        if ((uint64_t)r[i].got != r[i].size) snprintf(sh, sizeof sh, " (SHORT READ: %lld)", (long long)r[i].got);
+        LOG("[fs]   %s +%llx %llx%s %016llx\n", path ? path : "?", (unsigned long long)(r[i].off - base),
+            (unsigned long long)r[i].size, sh, (unsigned long long)r[i].hash);
+    }
+    uint8_t *buf = NULL;  // (then the same bytes read again from disk: another hash = the first read went wrong)
+    for (unsigned i = n; i-- > 0;) {
+        uint64_t sz = r[i].got > 0 ? (uint64_t)r[i].got : 0;
+        if (sz > (64ull << 20) || !(buf = realloc(buf, sz ? sz : 1)) || romfs_read(buf, sz, r[i].off) != (ssize_t)sz) continue;
+        uint64_t h = fnv_words(buf, sz);
+        LOG("[fs]   read again +%llx (image): %s\n", (unsigned long long)r[i].off,
+            h == r[i].hash ? "the same" : "DIFFERENT - the read the game got was wrong");
+    }
+    free(buf);
+    // (#206 #173: every read "the same", and the compressed bytes at the decompressor's entry matched the disk too, yet
+    // the game's Oodle decoder failed - on two PCs, both Windows 11 build 26300, never here on Windows 10 with the same
+    // save, data and game code. So also: is each buffer the game read into still mapped, and does it still hold what
+    // was read - a page decommitted or overwritten under the decoder (memory) vs everything intact (a race between the
+    // game's threads, or the decoder's own computation). A page that isn't committed isn't touched: reading it would
+    // commit a zero page and change what we look at.)
+    extern int kernel_live_threads(void);
+    LOG("[fs] the game's buffers now (last reads first; %d guest threads running):\n", kernel_live_threads());
+    for (unsigned i = n, k = 0; i-- > 0 && k < 8; k++) {
+        uint64_t a = r[i].addr, sz = r[i].got > 0 ? (uint64_t)r[i].got : 0;
+        char s0[160] = "?", s1[160] = "?";
+        bool known0 = plat_page_state(a, s0, sizeof s0), known1 = sz && plat_page_state(a + sz - 1, s1, sizeof s1);
+        bool readable = !known0 || (strstr(s0, "committed") && (!known1 || strstr(s1, "committed")));
+        const char *now = !sz ? "nothing read" : !readable ? "NOT COMMITTED - not read (left as it is)"
+                        : fnv_words((const uint8_t *)(uintptr_t)a, sz) == r[i].hash ? "still as read"
+                        : "CHANGED since the read (overwritten, or reused for something else)";
+        LOG("[fs]   +%llx at %llx (%llx bytes): first page %s; last page %s; contents %s\n", (unsigned long long)r[i].off,
+            (unsigned long long)a, (unsigned long long)sz, known0 ? s0 : "state unknown here", known1 ? s1 : "-", now);
+    }
+}
+
 // ------------------------------------------------------------------ IStorage (raw RomFS image)
 typedef struct { uint64_t size; int fd; } Storage;  // (fd: add-on content, plain_storage - the RomFS image reads through base_pread)
 
@@ -826,6 +1050,12 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         uint64_t t0 = plat_now_ns();
         ssize_t n = romfs_read((uint8_t *)(uintptr_t)b->addr, size, off);
         uint64_t t1 = plat_now_ns();
+        recent_read_note(off, size, (const uint8_t *)(uintptr_t)b->addr, n);
+        {   // (test) LARECOMP_FS_RECENT_AT=<n>: fs_log_recent_reads after the n-th read, as on the game's Oodle error
+            static long at = -1;
+            if (at < 0) at = getenv("LARECOMP_FS_RECENT_AT") ? atol(getenv("LARECOMP_FS_RECENT_AT")) : 0;
+            if (at > 0 && recent_n == (unsigned)at) fs_log_recent_reads();
+        }
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         {   // (test) LARECOMP_FS_MBPS=<MB/s>: each read takes as long as at that speed (the console's storage: tens of MB/s;
             // ours is instant, which may expose races in the game's streaming)

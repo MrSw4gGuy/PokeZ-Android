@@ -10,7 +10,8 @@
 #include "game_addresses.h"
 
 typedef struct { const uint64_t *addrs; const GuestFn *fns; uint64_t count, lo, hi; } FnTable;
-static FnTable tables[2];
+static FnTable tables[6];  // main, sdk, code mods' (dispatch_add_table; runtime/modlib.h MAX_CODE_MODS)
+static int ntables;
 
 // HLE stubs live at fake addresses HLE_BASE + 16*i
 #define MAX_HLE 4096
@@ -64,6 +65,14 @@ const char *hle_name_at(uint64_t pc) {
     return i < hle_count ? hle_slots[i].name : NULL;
 }
 
+// A host-implemented function's slot runs fn from now on (a code mod hooked it: runtime/hle/codehooks_rt.c): the
+// function it ran before, NULL if no slot has that name. (Its HLE path isn't cached: the next call sees it.)
+HostFn hle_swap_impl(const char *name, HostFn fn) {
+    for (int i = 0; i < hle_count; i++)
+        if (!strcmp(hle_slots[i].name, name)) { HostFn was = hle_slots[i].fn; hle_slots[i].fn = fn; return was; }
+    return NULL;
+}
+
 void hle_override(uint64_t addr, HostFn fn, const char *name) {
     if (override_count == MAX_OVERRIDE) FATAL("too many overrides\n");
     overrides[override_count].addr = addr;
@@ -100,6 +109,7 @@ uint64_t guest_sym(const char *name) {
 
 static uint64_t hle_next = HLE_HEAP;
 RT_ON_RESET(hle_heap_reset) { hle_next = HLE_HEAP; }  // (guest memory, wiped by the reboot)
+RT_ON_RESET(hle_override_reset) { override_count = 0; }  // (code mods' trampolines only: they hook again each boot)
 
 void *hle_alloc(uint64_t size) {
     static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
@@ -118,10 +128,17 @@ void dispatch_init(void) {  // (after gamelib_load)
     uint64_t nm = *g->main_count, ns = *g->sdk_count;
     tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, g->main_addrs[0], g->main_addrs[nm - 1]};
     tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, g->sdk_addrs[0], g->sdk_addrs[ns - 1]};
+    ntables = 2;  // (a reboot: the code mods add theirs again, runtime/codemods.c)
+}
+
+bool dispatch_add_table(const uint64_t *addrs, const GuestFn *fns, uint64_t count) {
+    if (ntables == (int)(sizeof tables / sizeof *tables) || !count) return false;
+    tables[ntables++] = (FnTable){addrs, fns, count, addrs[0], addrs[count - 1]};
+    return true;
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
-    for (int t = 0; t < 2; t++) {
+    for (int t = 0; t < ntables; t++) {
         FnTable *ft = &tables[t];
         if (addr < ft->lo || addr > ft->hi) continue;
         uint64_t lo = 0, hi = ft->count;
@@ -151,7 +168,7 @@ RtJmp *rt_setjmp_site(Cpu *c, uint64_t ret) {
     return j;
 }
 
-// Pokemon Z-A, main 8A1C86C437394B69: two start-up steps that the game only reaches through pointers, on different
+// Pokemon Z-A, main 8A1C86C437394B69 (2.0.0; 2.0.2 below): two start-up steps that the game only reaches through pointers, on different
 // threads. f_7000ac2a2c stores a delegate in the object at 0x7006109cc0 (+0xc0), but silently does nothing if that object
 // isn't ready yet (its flag at +0x140); f_7000bbb0dc then calls the delegate (f_7000bbb174) without checking it. So a step
 // that came too early ends much later in "no function at 0 (lr=7000bbb1ac)": #101 #111, both on a slow first start, both
@@ -159,23 +176,47 @@ RtJmp *rt_setjmp_site(Cpu *c, uint64_t ret) {
 // Skipping the empty delegate is no way out (the game then stays on an empty screen for good), so each step waits for
 // what it needs, within reason. The "[boot]" lines tell which case a report was. LARECOMP_BOOT_DELEGATE_WAIT=0: no waits.
 // LARECOMP_TEST_OBJECT_LATE=<ms>: the object seems not ready at the first step for that long (with no waits: the crash).
-#define BOOT_DELEGATE_OBJ GUEST_REBASE(0x7006109cc0ull)  // (desktop addresses, moved with the window: rt.h)
-#define BOOT_DELEGATE_SET GUEST_REBASE(0x7000ac2a2cull)
-#define BOOT_DELEGATE_USE GUEST_REBASE(0x7000bbb0dcull)
+// The same two steps on 2.0.2 (main B1F12FD919EAE86A): #157's "accessing 0" at lr 7000bb9d9c is f_7000bb9d64+0x38, the
+// twin of 2.0.0's f_7000bbb174+0x38. Found by matching the functions (immediates masked: 20 of 20 / 19 of 20 words)
+// and the object's adrp+add in both the store and the call - the code around them is the same, so are the offsets.
+// #220 (2.0.0, i9-13900KF + RTX 4090): the call came first and the store never came in 30 s - the main thread was the
+// one waiting, and the store evidently needs it to go on, so the wait itself held the store back; after it, the same
+// "no function at 0" (and, killed during the wait, "PLAY does nothing"). So the call waits only a little
+// (LARECOMP_BOOT_DELEGATE_WAIT_MS, default 2000: a store that is merely late, as #101 #111), then runs its step
+// without the delegate - everything else it starts goes on - and the delegate's own call (f_7000bbb174 / f_7000bb9d64,
+// the step's last call: + 0x98, the same in both builds) waits for the store and is made by the store's thread right
+// after it stores. LARECOMP_BOOT_DELEGATE_DEFER=0: the old 30 s wait. LARECOMP_TEST_STORE_LATE=<ms> (test): the store
+// waits that long before storing, so the call comes first.
+typedef struct { uint8_t id[8]; uint64_t obj, set, use; } BootDelegate;
+static const BootDelegate boot_delegates[] = {
+    {{0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69}, 0x7006109cc0ull, 0x7000ac2a2cull, 0x7000bbb0dcull},  // 2.0.0
+    {{0xB1, 0xF1, 0x2F, 0xD9, 0x19, 0xEA, 0xE8, 0x6A}, 0x700610ecc0ull, 0x7000ac321cull, 0x7000bb9cccull},  // 2.0.2
+};
+static const BootDelegate *g_bd;  // (this game's entry: boot_delegate_build)
+// (a step call that went on without its delegate: running it, or its delegate's call waiting for the store)
+enum { BD_NONE, BD_RUNNING, BD_DEFERRED };
+static int g_bd_state;
+static pthread_mutex_t g_bd_lock = PTHREAD_MUTEX_INITIALIZER;
+#define BOOT_DELEGATE_OBJ GUEST_REBASE(g_bd->obj)  // (desktop addresses, moved with the window: rt.h)
+#define BOOT_DELEGATE_SET GUEST_REBASE(g_bd->set)
+#define BOOT_DELEGATE_USE GUEST_REBASE(g_bd->use)
 #define BOOT_OBJ_READY ((volatile uint32_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x140))
 #define BOOT_OBJ_DONE ((volatile uint8_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x100))
 #define BOOT_OBJ_FN ((volatile uint64_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0xc0 + 0x20))
 static bool boot_delegate_build(void) {
-    static const uint8_t id[8] = {0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69};
-    return !g_game_is_la && !memcmp(g_main_build_id, id, sizeof id);
+    if (g_game_is_la) return false;
+    if (!g_bd)
+        for (size_t i = 0; i < sizeof boot_delegates / sizeof *boot_delegates; i++)
+            if (!memcmp(g_main_build_id, boot_delegates[i].id, 8)) g_bd = &boot_delegates[i];
+    return g_bd != NULL;
 }
 static bool boot_wait_on(void) {
     const char *e = getenv("LARECOMP_BOOT_DELEGATE_WAIT");
     return !(e && !atoi(e));
 }
-static void boot_wait(const char *what, volatile uint32_t *r32, volatile uint64_t *r64) {
+static void boot_wait(const char *what, volatile uint32_t *r32, volatile uint64_t *r64, uint64_t max_ns) {
     uint64_t t0 = plat_now_ns();
-    while (!(r32 ? *r32 != 0 : *r64 != 0) && plat_now_ns() - t0 < 30000000000ull) plat_sleep_until_ns(plat_now_ns() + 1000000);
+    while (!(r32 ? *r32 != 0 : *r64 != 0) && plat_now_ns() - t0 < max_ns) plat_sleep_until_ns(plat_now_ns() + 1000000);
     LOG("[boot] %s %s after %.0f ms\n", what, (r32 ? *r32 != 0 : *r64 != 0) ? "came" : "still missing", (double)(plat_now_ns() - t0) / 1e6);
 }
 static void *boot_object_back(void *arg) {
@@ -193,19 +234,63 @@ static void boot_delegate_set(Cpu *c) {
         pthread_detach(t);
     }
     LOG("[boot] step store: object ready %u, delegate %llx\n", *BOOT_OBJ_READY, (unsigned long long)*BOOT_OBJ_FN);
-    if (!*BOOT_OBJ_READY && boot_wait_on()) boot_wait("the object", BOOT_OBJ_READY, NULL);
+    if (!*BOOT_OBJ_READY && boot_wait_on()) boot_wait("the object", BOOT_OBJ_READY, NULL, 30000000000ull);
+    const char *sl = getenv("LARECOMP_TEST_STORE_LATE");
+    if (sl) plat_sleep_until_ns(plat_now_ns() + (uint64_t)atoll(sl) * 1000000);
     dispatch_lookup(BOOT_DELEGATE_SET)(c);
+    // (a call that went on without the delegate: its delegate's call is made here, now that it is stored)
+    pthread_mutex_lock(&g_bd_lock);
+    bool run = g_bd_state == BD_DEFERRED && *BOOT_OBJ_FN;
+    if (run) g_bd_state = BD_NONE;
+    pthread_mutex_unlock(&g_bd_lock);
+    if (run) {
+        uint64_t ret = c->x[0];  // (the store's own result, 1)
+        LOG("[boot] the delegate stored after its step: called now, on the storing thread\n");
+        c->x[0] = BOOT_DELEGATE_OBJ;
+        dispatch_lookup(BOOT_DELEGATE_USE + 0x98)(c);
+        c->x[0] = ret;
+    }
 }
 static void boot_delegate_use(Cpu *c) {
     LOG("[boot] step call: object ready %u, delegate %llx, done %u\n", *BOOT_OBJ_READY, (unsigned long long)*BOOT_OBJ_FN, *BOOT_OBJ_DONE);
-    if (!*BOOT_OBJ_DONE && !*BOOT_OBJ_FN && boot_wait_on()) boot_wait("the delegate", NULL, BOOT_OBJ_FN);
+    const char *df = getenv("LARECOMP_BOOT_DELEGATE_DEFER"), *wm = getenv("LARECOMP_BOOT_DELEGATE_WAIT_MS");
+    bool defer = !(df && !atoi(df)) && dispatch_lookup(BOOT_DELEGATE_USE + 0x98);
+    uint64_t wait_ns = defer ? (uint64_t)(wm ? atoll(wm) : 2000) * 1000000 : 30000000000ull;
+    if (!*BOOT_OBJ_DONE && !*BOOT_OBJ_FN && boot_wait_on()) boot_wait("the delegate", NULL, BOOT_OBJ_FN, wait_ns);
+    // (LARECOMP_TEST_DELEGATE_LATE=1, test: the delegate reads as not stored here - the step without it, then its call)
+    bool pretend = getenv("LARECOMP_TEST_DELEGATE_LATE") != NULL;
+    pthread_mutex_lock(&g_bd_lock);
+    bool later = defer && !*BOOT_OBJ_DONE && (!*BOOT_OBJ_FN || pretend);
+    if (later) g_bd_state = BD_RUNNING;
+    pthread_mutex_unlock(&g_bd_lock);
+    if (!later) { dispatch_lookup(BOOT_DELEGATE_USE)(c); return; }
+    // the step without its delegate's call: that call returns at once while the object reads "done"
+    LOG("[boot] the delegate isn't stored yet: the step goes on, its call waits for the store (#220)\n");
+    *BOOT_OBJ_DONE = 1;
     dispatch_lookup(BOOT_DELEGATE_USE)(c);
+    *BOOT_OBJ_DONE = 0;
+    pthread_mutex_lock(&g_bd_lock);
+    bool now = *BOOT_OBJ_FN != 0;  // (stored while the step ran: called here)
+    g_bd_state = now ? BD_NONE : BD_DEFERRED;
+    pthread_mutex_unlock(&g_bd_lock);
+    if (now) {
+        LOG("[boot] the delegate was stored during the step: called now\n");
+        c->x[0] = BOOT_DELEGATE_OBJ;
+        dispatch_lookup(BOOT_DELEGATE_USE + 0x98)(c);
+    }
+}
+
+static bool mod_blank(uint64_t pc) {  // (inside a code mod, and its image's word there is 0: nothing written yet)
+    for (int i = 2; i < g_nmodules; i++)
+        if (pc >= g_modules[i].base && pc < g_modules[i].base + g_modules[i].size)
+            return *(const volatile uint32_t *)(uintptr_t)pc == 0;
+    return false;
 }
 
 __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
-    if (pc == BOOT_DELEGATE_SET && boot_delegate_build()) return boot_delegate_set;
-    if (pc == BOOT_DELEGATE_USE && boot_delegate_build()) return boot_delegate_use;
+    if (boot_delegate_build() && pc == BOOT_DELEGATE_SET) return boot_delegate_set;
+    if (boot_delegate_build() && pc == BOOT_DELEGATE_USE) return boot_delegate_use;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
         int i = (int)((pc - HLE_BASE) / 16);
@@ -218,9 +303,20 @@ __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
     for (int i = 0; i < override_count; i++)
         if (overrides[i].addr == pc) return overrides[i].fn;
     GuestFn f = dispatch_lookup(pc);
-    if (!f) {
+    // (a code mod's pool still zero in its image - a trampoline written only through a view - may be lifted as an
+    // all-zero function, udf #0: taken for a miss, and never cached, so a later hook pass's override is still seen)
+    bool blank = f && g_nmodules > 2 && mod_blank(pc);
+    if (!f || blank) {
         for (int i = 0; i < NJMP; i++)  // a guest longjmp returning to its setjmp
             if (jmps[i].buf && jmps[i].ret == pc && jmps[i].sp == c->sp) longjmp(jmps[i].host, 1);
+        if (g_nmodules > 2) {  // a code mod's trampoline written after the last hook pass, through a view it keeps mapped
+            extern void hooks_capture(void);  // (exlaunch's pool: Lumiose Online's first "call the original")
+            hooks_capture();
+            for (int i = 0; i < override_count; i++)
+                if (overrides[i].addr == pc) return overrides[i].fn;
+            extern void hooks_explain(uint64_t pc);
+            hooks_explain(pc);
+        }
         uint64_t off;
         const char *s = loader_symbol_at(c->x[30], &off);
 #ifdef _WIN32
@@ -271,10 +367,11 @@ const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
     static uint64_t n;
     static __thread char name[32];
     if (!byhost) {
-        uint64_t total = tables[0].count + tables[1].count, k = 0;
+        uint64_t total = 0, k = 0;
+        for (int t = 0; t < ntables; t++) total += tables[t].count;
         uint64_t (*v)[2] = malloc(total * sizeof *v);
         if (!v) return NULL;
-        for (int t = 0; t < 2; t++)
+        for (int t = 0; t < ntables; t++)
             for (uint64_t i = 0; i < tables[t].count; i++) {
                 v[k][0] = (uint64_t)(uintptr_t)tables[t].fns[i];
                 v[k++][1] = tables[t].addrs[i];

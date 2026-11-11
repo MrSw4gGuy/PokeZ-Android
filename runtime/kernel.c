@@ -132,24 +132,71 @@ uint64_t kernel_phys_largest(uint64_t *addr) {
     pthread_mutex_unlock(&g_mlock);
     return best;
 }
+// Guest memory the runtime keeps for itself right after a physical memory region: the Vulkan backend's storage copies
+// (64 MB; exec.c gwin_pick: Pokémon Z-A has no heap for the ring to follow, and shaders reach a copy only inside the window
+// they address). Z-A's pool ends at 0x7740000000 and nothing of its own is ever mapped above it (2600 mappings over a
+// session on the Deck, 2026-11-01: all at 0x7400000000-0x7485000000); a physical mapping into the range is refused
+// all the same (LimitReached, which the game expects when memory runs out).
+static uint64_t phys_ring_lo, phys_ring_hi;
+uint64_t kernel_phys_ring(uint64_t after, uint64_t size) {
+    pthread_mutex_lock(&g_mlock);
+    bool ok = after >= ALIAS_BASE && after + size <= ALIAS_BASE + ALIAS_SIZE && !phys_ring_hi;
+    for (int i = 0; i < nregions && ok; i++)
+        if (regions[i].addr < after + size && after < regions[i].addr + regions[i].size) ok = false;
+    if (ok) {
+        plat_commit(after, size);
+        phys_ring_lo = after, phys_ring_hi = after + size;
+    }
+    pthread_mutex_unlock(&g_mlock);
+    return ok ? after : 0;
+}
+// An in-place reboot decommits the whole guest range (main.c teardown) but the ring stays the runtime's: committed again
+// here. Without it the next boot's window import covered 64 MB of reserved-only pages, AMD's driver refused it
+// (VK_ERROR_INVALID_EXTERNAL_HANDLE, "guest heap import failed") and every shader read of game memory returned zero for
+// the rest of the session: characters not drawn after "return to the start screen" (#157).
+void kernel_phys_ring_recommit(void) {
+    pthread_mutex_lock(&g_mlock);
+    char st[160] = "";
+    if (phys_ring_hi) {
+        plat_page_state(phys_ring_lo, st, sizeof st);
+        plat_commit(phys_ring_lo, phys_ring_hi - phys_ring_lo);
+    }
+    pthread_mutex_unlock(&g_mlock);
+    if (phys_ring_hi) LOG("[reboot] storage copies' ring %llx +%llu MB committed again (was %s)\n", (unsigned long long)phys_ring_lo,
+                          (unsigned long long)((phys_ring_hi - phys_ring_lo) >> 20), st[0] ? st : "?");
+}
+
 // Writable guest data regions (heap, mapped/physical memory, module .data): for debug/runtime memory scans.
 int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
     int n = 0;
     pthread_mutex_lock(&g_mlock);
     for (int i = 0; i < nregions && n < max; i++)
-        if ((regions[i].perm & 2) && regions[i].type != 0xB && regions[i].type != 0xC) {
+        if ((regions[i].perm & 2) && regions[i].type != 0xB && regions[i].type != 0xC && regions[i].addr >= GUEST_LO) {  // (rtld's stand-in: kernel_init)
             addr[n] = regions[i].addr; size[n] = regions[i].size; n++;
         }
     pthread_mutex_unlock(&g_mlock);
     return n;
 }
 
-static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
+static void region_insert(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
     if (nregions == 1024) FATAL("too many regions\n");
-    plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
     int i = nregions++;
     while (i > 0 && regions[i - 1].addr > addr) { regions[i] = regions[i - 1]; i--; }
     regions[i] = (Region){addr, size, type, perm};
+}
+static void region_add(uint64_t addr, uint64_t size, uint32_t type, uint32_t perm) {
+    plat_commit(addr, size);  // back it before the OS writes there (Windows: file reads into the heap)
+    region_insert(addr, size, type, perm);
+}
+
+static CodeAlias code_alias[MAX_CODE_ALIAS];
+static int ncode_alias;
+int kernel_code_aliases(CodeAlias *out, int max) {
+    pthread_mutex_lock(&g_mlock);
+    int n = ncode_alias < max ? ncode_alias : max;
+    memcpy(out, code_alias, n * sizeof *out);
+    pthread_mutex_unlock(&g_mlock);
+    return n;
 }
 
 // The SDK picks a random free address, then maps there: another thread can take it in between. The console refuses the
@@ -270,8 +317,14 @@ static void query_memory(uint64_t addr, uint64_t out) {
         }
         prev_end = r->addr + r->size;
     }
-    info[0] = prev_end;
-    info[1] = (1ull << 39) - prev_end;
+    if (addr >= (1ull << 39)) {  // past the address space: Inaccessible up to 2^64, as the console answers - a walk of
+        info[0] = 1ull << 39;     // the whole map (exlaunch's FindModules) ends when the next address wraps to 0; it
+        info[1] = 0 - (1ull << 39);  // looped forever on the free range below repeated
+        info[2] = 0x10;
+    } else {
+        info[0] = prev_end;
+        info[1] = (1ull << 39) - prev_end;
+    }
     memcpy((void *)out, info, 0x28);
 }
 
@@ -1006,6 +1059,11 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 23: v = 1; break;  // IsApplication
         case 26: v = 1; break;  // IsSvcPermitted
         case 27: case 28: v = 0; break;  // IoRegionHint, AliasRegionExtraSize (18.0.0+: SDK 19 games ask)
+        case 65001: {  // Mesosphere's MesosphereCurrentProcess: a real handle of this process (code mods ask, for
+            static KObject proc = {KOBJ_PROCESS, 1, false};  // svcMapProcessMemory; exlaunch's IPC trick only if refused)
+            v = kernel_new_handle(&proc);
+            break;
+        }
         default: r = R_INVALID_ENUM; LOG("[kernel] GetInfo unknown id %u/%llu\n", id0, x[3]);
         }
         x[0] = r;
@@ -1023,14 +1081,25 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
             x[0] = R_LIMIT_REACHED;
             break;
         }
+        if (phys_ring_hi && x[0] < phys_ring_hi && phys_ring_lo < x[0] + x[1]) {  // (kernel_phys_ring: the runtime's)
+            pthread_mutex_unlock(&g_mlock);
+            static int nlog;
+            if (nlog++ < 4) LOG("[kernel] MapPhysicalMemory %llx +%llx: into the runtime's storage copies - LimitReached\n", x[0], x[1]);
+            x[0] = R_LIMIT_REACHED;
+            break;
+        }
 #ifdef __ANDROID__
         {   // Pokémon Z-A maps all its free memory as one pool (~3.2 GB): the top 256 MB of it - the window of shader
             // global memory on an integrated GPU (exec.c gmem_window_get) - is made memory the GPU shares while it is
-            // still fresh (platform/android.c plat_gpu_share: Qualcomm's driver can't import it by pointer)
-            const uint64_t share = 256ull << 20;
+            // still fresh (platform/android.c plat_gpu_share: Qualcomm's driver can't import it by pointer). The shared
+            // memory reaches 64 MB past the pool's end too: the storage copies' ring (exec.c gwin_pick, GWIN_RING;
+            // kernel_phys_ring) goes there, and the shaders' window then runs from 256 MB below the pool's end to the
+            // ring's end - one AHardwareBuffer has to hold all of it (exec.c ahb_import)
+            const uint64_t share = 256ull << 20, ring = 64ull << 20;
             if (x[1] >= (1ull << 30) && phys_new_bytes(x[0], x[1]) == x[1]) {
                 phys_map(x[0], x[1]);
-                plat_gpu_share(x[0] + ((x[1] - share) & ~0xFFFFFull), share);
+                uint64_t lo = x[0] + ((x[1] - share) & ~0xFFFFFull), hi = x[0] + ((x[1] + 0xFFFF) & ~0xFFFFull) + ring;
+                plat_gpu_share(lo, hi - lo);
             } else phys_map(x[0], x[1]);
         }
 #else
@@ -1055,6 +1124,43 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         x[1] = kernel_new_handle(ev);
         x[2] = kernel_new_handle(ev);
         if (ENV("LARECOMP_PROF_SVC")) LOG("[evt] guest w=%llx r=%llx lr=%llx\n", (unsigned long long)x[1], (unsigned long long)x[2], (unsigned long long)x[30]);
+        break;
+    }
+    case 0x74: {  // MapProcessMemory(dst, process, src, size): a code mod's writable view of code (kernel.h CodeAlias)
+        pthread_mutex_lock(&g_klock);  // (the handle table, as CloseHandle changes it; let go before g_mlock below)
+        KObject *o = (uint32_t)x[1] == PSEUDO_PROCESS ? NULL : handle_get((uint32_t)x[1]);
+        bool process = (uint32_t)x[1] == PSEUDO_PROCESS || (o && o->type == KOBJ_PROCESS);
+        pthread_mutex_unlock(&g_klock);
+        if (!process) { x[0] = R_INVALID_HANDLE; break; }
+        pthread_mutex_lock(&g_mlock);
+        if (ncode_alias == MAX_CODE_ALIAS || region_taken(x[0], x[3], "MapProcessMemory")) {
+            pthread_mutex_unlock(&g_mlock);
+            x[0] = R_INVALID_CURRENT_MEMORY;
+            break;
+        }
+        region_add(x[0], x[3], 0xB, 3);
+        memcpy((void *)x[0], (void *)x[2], x[3]);
+        code_alias[ncode_alias++] = (CodeAlias){x[0], x[2], x[3]};
+        pthread_mutex_unlock(&g_mlock);
+        LOG("[kernel] MapProcessMemory %llx <- %llx +%llx (lr %llx)\n", x[0], x[2], x[3], x[30]);
+        x[0] = R_OK;
+        break;
+    }
+    case 0x61: case 0x6F: {  // BreakDebugProcess, GetSystemInfo: a code mod (Hakkun's debug tools) asks; refused
+        static int nlog;
+        if (nlog++ < 4) LOG("[kernel] svc 0x%x (a code mod's, lr %llx): refused\n", imm, x[30]);
+        x[0] = R_INVALID_ENUM;
+        break;
+    }
+    case 0x75: {  // UnmapProcessMemory(dst, process, src, size): what was written there taken first
+        extern void hooks_capture(void);
+        hooks_capture();
+        pthread_mutex_lock(&g_mlock);
+        for (int i = 0; i < ncode_alias; i++)
+            if (code_alias[i].dst == x[0]) { code_alias[i] = code_alias[--ncode_alias]; break; }
+        region_remove(x[0]);
+        pthread_mutex_unlock(&g_mlock);
+        x[0] = R_OK;
         break;
     }
     default:
@@ -1224,6 +1330,7 @@ void kernel_reset(void) {
     g_syncwaiters = NULL;
     memset(handles, 0, sizeof handles);
     nregions = 0;
+    ncode_alias = 0;  // (a code mod's views: its next boot maps them again)
     heap_size = 0;
     tls_next = TLS_BASE;
     next_thread_id = 0x50;
@@ -1269,11 +1376,25 @@ void kernel_init(void) {
     }
     // Reserve the heap, alias, stack, and TLS regions.
     region_add(TLS_BASE, TLS_SIZE, 0xC, 3);
+    // The runtime's own guest ranges, never Free to QueryMemory: Hakkun (a code mod) maps its writable views at random
+    // pages it finds Free in the ASLR region (GetInfo 12/13: the whole guest window). Not committed here: HLE_HEAP is
+    // hle_alloc's, the stub range holds fake addresses.
+    // Only with code mods: the game alone keeps the map it always had.
+    if (g_nmodules > 2) {
+        region_insert(HLE_BASE, HLE_SIZE, 0x3, 5);
+        region_insert(HLE_HEAP, HLE_HEAP_SIZE, 0xC, 3);  // (0xC: left out of kernel_data_regions' scans, as TLS)
+    }
     for (int i = 0; i < g_nmodules; i++) {
         Module *m = &g_modules[i];
         region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
         region_add(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
         region_add(m->base + m->data_off, m->size - m->data_off, 4, 3);
+    }
+    if (g_rtld.base && g_nmodules > 2) {  // (below the guest window, already mapped: loader_map_rtld; a reboot keeps it)
+        Module *m = &g_rtld;
+        region_insert(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
+        region_insert(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
+        region_insert(m->base + m->data_off, m->size - m->data_off, 4, 3);
     }
 }
 

@@ -23,6 +23,8 @@ const char *const g_screen_filters[N_SCREEN_FILTERS] = {"Off", "Game Boy", "Game
 static const char *const k_screen_filter_keys[N_SCREEN_FILTERS] = {"off", "gameboy", "gameboy_color", "grayscale"};  // (else: off)
 
 unsigned g_gpu_vendor;
+bool g_gpu_dozen;
+bool g_settings_fresh;  // (settings_load found no settings file: a first start)
 bool gpu_feature_on(int feature, const char *env) {
     const char *e = env ? getenv(env) : NULL;
     if (e && *e) return atoi(e) != 0;
@@ -34,6 +36,13 @@ bool gpu_feature_on(int feature, const char *env) {
     // own memory, Focus Blast on an RX 9060 XT every time: #63; #92) came from a run that prepared them, and the same
     // player's runs without them, a long one too, never faulted. (The pipelines are then built as the game first uses
     // them: a short hitch the first time an effect shows.)
+    // DirectX 12 through Dozen: prepared, on AMD too (the faults above are AMD's Vulkan driver, which Dozen doesn't use).
+    // Its compiles are slow (SPIR-V -> DXIL -> the driver's: 10.2 s for 186 pipelines in one session's battles, up to
+    // 732 ms a frame, and draws whose pipeline is still building are skipped - the scenery blinked out and back), so
+    // built as the game used them they made every battle move hitch. Prepared: 0.46 s at the start with its pipeline
+    // cache warm (2950 pipelines, RTX 4060 Ti; the first start after switching builds them all once). (The early failures
+    // in its shader compiler were the 512 MB storage-buffer limit, since bound in windows: 2 of 2988 fail now.)
+    if (g_gpu_dozen && feature == GPU_SHADER_PREP) return true;
     return !(g_gpu_vendor == 0x1002 && (feature == GPU_ROBUST2 || feature == GPU_SHADER_PREP));
 }
 
@@ -56,7 +65,12 @@ Settings g_settings = {
 #endif
     .show_fps = false,
     .fps60_lock = true,  // ("Drop to 30 fps when needed" off unless the player turns it on)
+    .smooth_anim = true,  // (Pokémon Z-A 2.0.2: distant characters animate every frame)
+    .draw_dist = 100,  // (the game's own draw distances: #190's option off)
+    .frame_dt = true,    // (Pokémon Z-A: the world step from a wall-clock accumulator - the same speed at any frame rate)
     .tex_hd = true,
+    .tex_hd_cache_mb = 512,
+    .taa_render = 100,
 #ifdef __ANDROID__
     // (a phone: the cascades' depth pass was about half the GPU's frame; at 50% an empty station holds 60 fps where the
     // game's size held 53 - its shadow edges a little coarser)
@@ -76,6 +90,8 @@ Settings g_settings = {
     .diff_damage = 1.0f,
     .mouse_camera = MOUSE_CAM_CAPTURED,
     .mouse_sens = 1.0f,
+    .lstick_deadzone = 10,
+    .lstick_outer = 90,
     .walk_speed = 1.0f,
     .walk_speed_dungeons = false,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
@@ -148,6 +164,8 @@ const char *settings_language_name(void) {
 
 int g_default_upscaler = UPSCALE_SHARP;
 static const char *const sharpen_names[SHARPEN_N] = {"auto", "off", "low", "medium", "high"};  // (the ini)
+static const char *const taa_names[] = {"game", "fsr2", "dlaa", "fsr3", "fsr4"};  // (the ini, TAA_*)
+#define TAA_N (int)(sizeof taa_names / sizeof *taa_names)
 int g_default_res_mode = RES_MATCH;
 bool g_gpu_integrated;
 
@@ -273,12 +291,21 @@ bool settings_video_matches_recommended(void) {
            g_settings.fps60_lock == r->fps60 && g_settings.aniso16 == r->aniso16;
 }
 
+// LARECOMP_FRAME_DT=0 / 1: a test override of the frame_dt setting. Applied to g_settings at load, so F1 shows (and can
+// change) the value it set; not read again after that.
+static void settings_env_overrides(void) {
+    const char *e = getenv("LARECOMP_FRAME_DT");
+    if (e && *e) g_settings.frame_dt = atoi(e) != 0;
+    e = getenv("LARECOMP_SMOOTH_ANIM");  // (same: a test override of smooth_anim)
+    if (e && *e) g_settings.smooth_anim = atoi(e) != 0;
+}
+
 void settings_load(void) {
     static bool loaded;
     if (loaded) return;
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
-    if (!f) return;
+    if (!f) { g_settings_fresh = true; settings_env_overrides(); return; }
     char line[1200];
     bool tip_key = false, aspect_key = false, video_key = false;
     while (fgets(line, sizeof line, f)) {
@@ -294,6 +321,7 @@ void settings_load(void) {
         // (the start screen's keys: an empty value is valid - no mods off, no order)
         if (!strcmp(key, "mods_order")) { strlcpy(g_settings.mods_order, val, sizeof g_settings.mods_order); continue; }
         if (!strcmp(key, "mods_off")) { strlcpy(g_settings.mods_off, val, sizeof g_settings.mods_off); continue; }
+        if (!strcmp(key, "mods_code_on")) { strlcpy(g_settings.mods_code_on, val, sizeof g_settings.mods_code_on); continue; }
         if (!strcmp(key, "launcher_language")) {
             g_settings.ui_lang = !strcmp(val, "pt") ? UI_LANG_PT : !strcmp(val, "en") ? UI_LANG_EN : UI_LANG_AUTO;
             continue;
@@ -309,10 +337,16 @@ void settings_load(void) {
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
         else if (!strcmp(key, "fps40")) g_settings.fps40 = atoi(val) != 0;
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) != 0;
+        else if (!strcmp(key, "frame_dt")) g_settings.frame_dt = atoi(val) != 0;
+        else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
+        else if (!strcmp(key, "full_detail_models")) g_settings.full_detail = atoi(val) != 0;
+        else if (!strcmp(key, "draw_distance")) g_settings.draw_dist = atoi(val);
         else if (!strcmp(key, "hdr")) g_settings.hdr = atoi(val) != 0;
         else if (!strcmp(key, "hdr_peak_nits")) { int n = atoi(val); g_settings.hdr_peak = n < 200 ? 200 : n > 10000 ? 10000 : n; }
         else if (!strcmp(key, "hdr_paper_white_nits")) { int n = atoi(val); g_settings.hdr_paper = n < 80 ? 80 : n > 500 ? 500 : n; }
         else if (!strcmp(key, "present_mode")) g_settings.present_fifo = !strcmp(val, "fifo");
+        else if (!strcmp(key, "graphics_card")) strlcpy(g_settings.gpu_name, val, sizeof g_settings.gpu_name);
+        else if (!strcmp(key, "graphics_api")) g_settings.dx12 = !strcmp(val, "dx12");
         else if (!strncmp(key, "gpu_", 4)) {  // Compatibility: gpu_dynamic_vertex / gpu_overlap / ... = auto|on|off
             static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
             "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};
@@ -328,6 +362,7 @@ void settings_load(void) {
             g_settings.shadow_res = v > 0.4 && v < 0.6 ? SHADOW_RES_HALF : v > 0.6 && v < 0.9 ? SHADOW_RES_3Q
                                   : v < 1 ? 1 : v > 4 ? 4 : (int)v;
         }
+        else if (!strcmp(key, "tex_hd_cache_mb")) { int v = atoi(val); g_settings.tex_hd_cache_mb = v < 0 ? 0 : v > 8192 ? 8192 : v; }
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "shadow_distance")) g_settings.shadow_distance = (atoi(val) >= SHADOW_DISTANCE_FULL && atoi(val) <= SHADOW_DISTANCE_OFF) ? atoi(val) : SHADOW_DISTANCE_FULL;
         else if (!strcmp(key, "thermal_profile")) g_settings.thermal_profile = atoi(val) == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
@@ -369,7 +404,11 @@ void settings_load(void) {
         else if (!strcmp(key, "sharpening")) {
             for (int i = 0; i < SHARPEN_N; i++) if (!strcmp(val, sharpen_names[i])) g_settings.sharpen = i;
         }
-        else if (!strcmp(key, "temporal_aa")) g_settings.taa = !strcmp(val, "fsr2");
+        else if (!strcmp(key, "temporal_aa")) {
+            g_settings.taa = TAA_GAME;
+            for (int i = 0; i < TAA_N; i++) if (!strcmp(val, taa_names[i])) g_settings.taa = i;
+        }
+        else if (!strcmp(key, "temporal_aa_render")) { int v = atoi(val); g_settings.taa_render = v >= 50 && v <= 100 ? v : 100; }
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) != 0;
@@ -382,6 +421,8 @@ void settings_load(void) {
         else if (!strcmp(key, "mouse_camera")) g_settings.mouse_camera = !strcmp(val, "off") ? MOUSE_CAM_OFF : !strcmp(val, "hold") ? MOUSE_CAM_HOLD : MOUSE_CAM_CAPTURED;
         else if (!strcmp(key, "mouse_sens")) g_settings.mouse_sens = (float)atof(val);
         else if (!strcmp(key, "rstick_snap")) { int d = atoi(val); g_settings.rstick_snap = d < 0 ? 0 : d > 30 ? 30 : d; }
+        else if (!strcmp(key, "lstick_deadzone")) g_settings.lstick_deadzone = atoi(val);
+        else if (!strcmp(key, "lstick_outer")) g_settings.lstick_outer = atoi(val);
         else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
         else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
@@ -443,7 +484,11 @@ void settings_load(void) {
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     if (!(g_settings.mouse_sens >= 0.1f && g_settings.mouse_sens <= 5)) g_settings.mouse_sens = 1.0f;
+    if (g_settings.lstick_deadzone < 0 || g_settings.lstick_deadzone > 30) g_settings.lstick_deadzone = 10;
+    if (g_settings.lstick_outer < 70 || g_settings.lstick_outer > 100) g_settings.lstick_outer = 90;
     if (g_settings.rumble_strength < 25 || g_settings.rumble_strength > 100) g_settings.rumble_strength = 100;
+    if (g_settings.draw_dist != 150 && g_settings.draw_dist != 200 && g_settings.draw_dist != 300) g_settings.draw_dist = 100;
+    settings_env_overrides();
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -461,11 +506,17 @@ void settings_save(void) {
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
     fprintf(f, "fps40 = %d\n", g_settings.fps40);
     fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
+    fprintf(f, "frame_dt = %d\n", g_settings.frame_dt);
+    fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);
+    fprintf(f, "full_detail_models = %d\n", g_settings.full_detail);
+    fprintf(f, "draw_distance = %d\n", g_settings.draw_dist);
     fprintf(f, "aniso16 = %d\n", g_settings.aniso16);
     fprintf(f, "hdr = %d\n", g_settings.hdr);
     fprintf(f, "hdr_peak_nits = %d\n", g_settings.hdr_peak);
     fprintf(f, "hdr_paper_white_nits = %d\n", g_settings.hdr_paper);
     fprintf(f, "present_mode = %s\n", g_settings.present_fifo ? "fifo" : "mailbox");
+    fprintf(f, "graphics_card = %s\n", g_settings.gpu_name);  // (empty: Auto)
+    fprintf(f, "graphics_api = %s\n", g_settings.dx12 ? "dx12" : "vulkan");
     {
         static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
             "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};
@@ -475,6 +526,7 @@ void settings_save(void) {
     fprintf(f, "operation_mode = %s\n", g_settings.opmode == 2 ? "handheld" : g_settings.opmode == 1 ? "docked" : "auto");
     fprintf(f, "dynamic_res = %s\n", g_settings.game_drs ? "game" : "off");
     fprintf(f, "tex_hd = %d\n", g_settings.tex_hd);
+    fprintf(f, "tex_hd_cache_mb = %d\n", g_settings.tex_hd_cache_mb);
     if (g_settings.shadow_res == SHADOW_RES_HALF || g_settings.shadow_res == SHADOW_RES_3Q)
         fprintf(f, "shadow_resolution = %s\n", g_settings.shadow_res == SHADOW_RES_HALF ? "0.5" : "0.75");
     else fprintf(f, "shadow_resolution = %d\n", g_settings.shadow_res);
@@ -500,7 +552,8 @@ void settings_save(void) {
                                    g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : g_settings.upscaler == UPSCALE_SGSR ? "sgsr" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     fprintf(f, "sharpening = %s\n", sharpen_names[g_settings.sharpen >= 0 && g_settings.sharpen < SHARPEN_N ? g_settings.sharpen : 0]);
-    fprintf(f, "temporal_aa = %s\n", g_settings.taa ? "fsr2" : "game");
+    fprintf(f, "temporal_aa = %s\n", taa_names[g_settings.taa >= 0 && g_settings.taa < TAA_N ? g_settings.taa : TAA_GAME]);
+    fprintf(f, "temporal_aa_render = %d\n", g_settings.taa_render);
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
@@ -514,6 +567,7 @@ void settings_save(void) {
     fprintf(f, "controller_light = %d\n", g_settings.controller_light);
     fprintf(f, "background_input = %d\n", g_settings.bg_input);
     fprintf(f, "rstick_snap = %d\n", g_settings.rstick_snap);
+    fprintf(f, "lstick_deadzone = %d\nlstick_outer = %d\n", g_settings.lstick_deadzone, g_settings.lstick_outer);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);
     static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation", "keyboard", "steamdeck"};
@@ -558,7 +612,8 @@ void settings_save(void) {
     if (g_settings.rando_options[0]) fprintf(f, "rando_options = %s\n", g_settings.rando_options);
     static const char *const ui_lang[] = {"auto", "en", "pt"};
     fprintf(f, "launcher_language = %s\n", ui_lang[g_settings.ui_lang <= UI_LANG_PT ? g_settings.ui_lang : 0]);
-    fprintf(f, "mods_order = %s\nmods_off = %s\n", g_settings.mods_order, g_settings.mods_off);
+    fprintf(f, "mods_order = %s\nmods_off = %s\nmods_code_on = %s\n", g_settings.mods_order, g_settings.mods_off,
+            g_settings.mods_code_on);
     fclose(f);
 }
 
@@ -606,6 +661,13 @@ bool settings_list_has(const char *list, const char *name) {
         p = bar ? bar + 1 : NULL;
     }
     return false;
+}
+
+// mods/<name>'s code runs: the mod is on and its code was turned on (the Mods page), or LARECOMP_CODE_MODS=1 (all)
+bool settings_mod_code_on(const char *name) {
+    if (settings_list_has(g_settings.mods_off, name)) return false;
+    const char *e = getenv("LARECOMP_CODE_MODS");
+    return (e && !strcmp(e, "1")) || settings_list_has(g_settings.mods_code_on, name);
 }
 
 /// True on a Steam Deck (DMI vendor "Valve"): "Auto" button icons then use the Deck's own names (L1 R1 L2 R2 L3 R3).
