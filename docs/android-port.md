@@ -103,10 +103,25 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
   traduzido é lento (despejar o GLSL dos VS do G-buffer: leitura dos atributos e dos buffers de constantes na memória
   do AHB?). Simplificar malhas no runtime (meshoptimizer, só índices novos) fica para depois, se os vértices ainda
   pesarem.
-- **Driver Vulkan próprio (Turnip)**: `LARECOMP_VK_DRIVER=<arquivo>` no `env.txt` carrega o driver de
-  `files/drivers/` (copiado para o armazenamento interno) pelo libadrenotools (`third_party/libadrenotools`, BSD-2;
-  `build_adrenotools.sh`). Para isso o `libmain.so` define os próprios comandos `vk*` (`tools/gen_vk_shim.py`, sem
-  `-lvulkan`) e cria a superfície com `vkCreateAndroidSurfaceKHR`. Sem a variável, nada muda (driver da Qualcomm).
+- **Driver Vulkan próprio (Turnip ou qualquer outro)**: F1 › Vídeo › **Driver da GPU** (também nas Configurações da
+  tela inicial). "Importar driver" aceita um `.zip` no formato que os emuladores usam (`meta.json` com `name` e
+  `libraryName`, mais o `.so`; ex.: AdrenoToolsDrivers do K11MCH1) ou um `.so` avulso; vira `files/drivers/<nome>/`.
+  Um `.so` solto em `files/drivers/` também aparece na lista. A escolha fica no ini (`vk_driver`) e vale ao abrir o app
+  (a tela inicial já desenha com o driver); na tela inicial há "Reiniciar o app agora" (`plat_restart_app`, JNI).
+  O driver escolhido é copiado para o armazenamento interno e carregado pelo libadrenotools (`third_party/libadrenotools`,
+  BSD-2; `build_adrenotools.sh`); tudo em `runtime/platform/android_vk.c`. **Proteção:** enquanto a GPU não sobe com
+  ele, o ini guarda `vk_driver_trial`; se o processo morrer antes (`ui_window_init` não chegou a `plat_vk_driver_up`),
+  a abertura seguinte volta ao driver do sistema e o menu avisa. `LARECOMP_VK_DRIVER=<nome>` (ou `system`) no `env.txt`
+  passa por cima da escolha, sem tentativa. O menu avisa quando o driver em uso não tem quad control (íris em
+  quadradinhos), e a mensagem de erro (`crash_explain.c`) cita o driver escolhido em vez de "atualize o driver da
+  NVIDIA". Testado em 2026-11-11: `.so` avulso (turnip39), pacote com `meta.json`, `.zip` comprimido pelo seletor,
+  reinício pelo botão e a volta automática (Turnip 24.1, sem suporte ao Adreno 830: `FATAL: no Vulkan device`).
+- **Janela devolvida pelo Android** (`device.c android_surface_follow`): quando outra atividade cobre o app (seletor
+  de arquivos, tela inicial do Android), o SDL zera `SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER` e põe uma janela nova na
+  volta. Antes disso a superfície Vulkan ficava perdida (`acquire failed: -1000000000`, tela preta até fechar o app,
+  nos dois drivers). Agora `vk_frame_begin` não desenha sem janela e recria superfície + swapchain quando ela muda ou
+  quando um acquire devolve `VK_ERROR_SURFACE_LOST_KHR`. Para isso o `libmain.so` define os próprios comandos `vk*`
+  (`tools/gen_vk_shim.py`, sem `-lvulkan`) e cria a superfície com `vkCreateAndroidSurfaceKHR`.
   No Turnip, o semáforo de linha do tempo é emulado pelo Mesa: as esperas seguravam o lock que cada envio precisa
   (simpleperf: `vk_sync_timeline_alloc_point → mtx_lock`), e até um `vkGetFenceStatus` de fence ainda não sinalizada
   ficava ~3 ms no kernel. Por isso, no Turnip, cada envio sinaliza uma fence de um anel (`vk.h vk_wait_timeline`,

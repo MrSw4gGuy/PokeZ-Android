@@ -347,6 +347,8 @@ void settings_load(void) {
         else if (!strcmp(key, "present_mode")) g_settings.present_fifo = !strcmp(val, "fifo");
         else if (!strcmp(key, "graphics_card")) strlcpy(g_settings.gpu_name, val, sizeof g_settings.gpu_name);
         else if (!strcmp(key, "graphics_api")) g_settings.dx12 = !strcmp(val, "dx12");
+        else if (!strcmp(key, "vk_driver")) strlcpy(g_settings.vk_driver, val, sizeof g_settings.vk_driver);
+        else if (!strcmp(key, "vk_driver_trial")) strlcpy(g_settings.vk_driver_trial, val, sizeof g_settings.vk_driver_trial);
         else if (!strncmp(key, "gpu_", 4)) {  // Compatibility: gpu_dynamic_vertex / gpu_overlap / ... = auto|on|off
             static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
             "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};
@@ -517,6 +519,10 @@ void settings_save(void) {
     fprintf(f, "present_mode = %s\n", g_settings.present_fifo ? "fifo" : "mailbox");
     fprintf(f, "graphics_card = %s\n", g_settings.gpu_name);  // (empty: Auto)
     fprintf(f, "graphics_api = %s\n", g_settings.dx12 ? "dx12" : "vulkan");
+#ifdef __ANDROID__
+    fprintf(f, "vk_driver = %s\n", g_settings.vk_driver);  // (empty: the system's)
+    if (g_settings.vk_driver_trial[0]) fprintf(f, "vk_driver_trial = %s\n", g_settings.vk_driver_trial);
+#endif
     {
         static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
             "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};

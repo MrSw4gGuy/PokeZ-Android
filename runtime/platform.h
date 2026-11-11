@@ -82,6 +82,19 @@ void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
 // The rate the window's content is made at (an SDL_Window; fps 0: no preference): the display's adaptive refresh
 // follows it instead of guessing from the presents
 void plat_frame_rate_hint(void *sdl_window, float fps);
+// The app closes and opens again at its start screen (a new process: what a GPU driver change needs - android.c)
+void plat_restart_app(void);
+// GPU drivers (runtime/platform/android_vk.c): the packages in <data root>/drivers/, by name (max of them); the one the
+// running process loaded (NULL: the system's); the chosen one it didn't run on (NULL: none; the last start died on it,
+// or it didn't load); a .zip package (AdrenoToolsDrivers' meta.json layout) or a bare .so added from a picked file or
+// content:// URI (msg: its name, or why not); a package deleted; the device and swapchain are up (its trial passed)
+int plat_vk_drivers(char names[][96], int max);
+const char *plat_vk_driver_loaded(void);
+const char *plat_vk_driver_failed(void);
+bool plat_vk_driver_trial(void);  // the loaded one is still on trial: the GPU isn't up on it yet (crash_explain.c)
+bool plat_vk_driver_import(const char *src, char *msg, size_t n);
+bool plat_vk_driver_remove(const char *name);
+void plat_vk_driver_up(void);
 #else
 static inline void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) { (void)work_ns, (void)target_ns; }
 static inline void plat_frame_rate_hint(void *sdl_window, float fps) { (void)sdl_window, (void)fps; }

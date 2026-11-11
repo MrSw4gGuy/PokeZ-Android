@@ -133,7 +133,8 @@ SHADERC  ?= -lshaderc_shared
 # by tools/linux/android-port/build_adrenotools.sh into ADRENOTOOLS.
 ADRENOTOOLS ?= build/android/adrenotools
 LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale $(SHADERC) \
-            $(ADRENOTOOLS)/libadrenotools.a $(ADRENOTOOLS)/lib/linkernsbypass/liblinkernsbypass.a -ldl -llog -landroid -lnativewindow -lm
+            $(ADRENOTOOLS)/libadrenotools.a $(ADRENOTOOLS)/lib/linkernsbypass/liblinkernsbypass.a -ldl -llog -landroid -lnativewindow -lm \
+            -lz  # (the system's zlib: driver .zip packages imported from the menu - runtime/platform/android_vk.c)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC))) $(B)/rt/vk_shim.o
 VK_HDR   := $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/vulkan

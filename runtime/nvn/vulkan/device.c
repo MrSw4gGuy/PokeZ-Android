@@ -342,6 +342,9 @@ static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
 static bool g_intel_rp;  // (pick_device: this Intel driver runs on render passes)
 static char g_gpu_names[8][VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];  // the Vulkan 1.2 GPUs (no software ones), for the menu (vk_gpu_names)
 static int g_gpu_n;
+static char g_driver_desc[VK_MAX_DRIVER_NAME_SIZE + VK_MAX_DRIVER_INFO_SIZE + 2];  // (the menu's GPU driver row: vk_driver_desc)
+const char *vk_driver_desc(void) { return g_driver_desc; }  // the running driver: name and version ("": not known yet)
+bool vk_driver_quad_control(void) { return g_vk.quad_control; }  // (no quad control: Z-A's iris shows squares - exec.c)
 int vk_gpu_names(const char **names, int max) {
     int n = g_gpu_n < max ? g_gpu_n : max;
     for (int i = 0; i < n; i++) names[i] = g_gpu_names[i];
@@ -1071,6 +1074,9 @@ static void create_device(void) {
         LOG("[vk] driver %s %s; graphics pipeline library: %s; vertex input dynamic state: %s; extended dynamic state 3: %s\n",
             drv.driverName, drv.driverInfo, gpl, vids_ext ? (have_vids.vertexInputDynamicState ? "yes" : "no") : "no extension",
             eds3);
+        // (the info's first line: Qualcomm's goes on with its build date, compiler and branch, a line each)
+        snprintf(g_driver_desc, sizeof g_driver_desc, "%s %.*s", drv.driverName, (int)strcspn(drv.driverInfo, "\r\n"),
+                 drv.driverInfo);
         const char *e = getenv("LARECOMP_VK_TIMELINE_FENCES");  // (vk.h vk_wait_timeline)
         g_vk.timeline_fences = e && *e ? atoi(e) != 0 : drv.driverID == VK_DRIVER_ID_MESA_TURNIP;
         if (g_vk.timeline_fences) LOG("[vk] submissions tracked by fences, not the timeline (its waits hold its signals)\n");
@@ -1456,6 +1462,21 @@ static VkPresentModeKHR present_mode(void) {
 static bool hdr_blocked;  // (create_swapchain: Android pre-rotation has no HDR pass)
 static bool hdr_wanted(void) { return g_vk.hdr_capable && g_settings.hdr && !ENV("LARECOMP_NO_HDR") && !hdr_blocked; }
 
+// the views and images made around the window's images (create_swapchain), before those go
+static void swapchain_views_free(void) {
+    for (uint32_t i = 0; i < g_vk.sc_count; i++) {
+        vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
+        if (g_vk.sdr_mem[i]) vmaDestroyImage(g_vk.vma, g_vk.sc_images[i], g_vk.sdr_mem[i]), g_vk.sdr_mem[i] = VK_NULL_HANDLE;
+        if (g_vk.hdr_views[i]) vkDestroyImageView(g_vk.dev, g_vk.hdr_views[i], NULL), g_vk.hdr_views[i] = VK_NULL_HANDLE;
+    }
+    g_vk.sc_count = 0;
+    if (g_vk.hdr_base) {
+        vkDestroyImageView(g_vk.dev, g_vk.hdr_base_view, NULL);
+        vmaDestroyImage(g_vk.vma, g_vk.hdr_base, g_vk.hdr_base_mem);
+        g_vk.hdr_base = VK_NULL_HANDLE;
+    }
+}
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -1559,16 +1580,7 @@ static void create_swapchain(void) {
             : g_vk.hdr_capable && !rotate ? " (HDR available)" : "");
     if (rotate) LOG(", turned %u degrees into %ux%u (pre-rotation: the compositor turns nothing)", rotate, wext.width, wext.height);
     LOG("\n");
-    for (uint32_t i = 0; i < g_vk.sc_count; i++) {
-        vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
-        if (g_vk.sdr_mem[i]) vmaDestroyImage(g_vk.vma, g_vk.sc_images[i], g_vk.sdr_mem[i]), g_vk.sdr_mem[i] = VK_NULL_HANDLE;
-        if (g_vk.hdr_views[i]) vkDestroyImageView(g_vk.dev, g_vk.hdr_views[i], NULL), g_vk.hdr_views[i] = VK_NULL_HANDLE;
-    }
-    if (g_vk.hdr_base) {
-        vkDestroyImageView(g_vk.dev, g_vk.hdr_base_view, NULL);
-        vmaDestroyImage(g_vk.vma, g_vk.hdr_base, g_vk.hdr_base_mem);
-        g_vk.hdr_base = VK_NULL_HANDLE;
-    }
+    swapchain_views_free();
     if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
     g_vk.hdr = hdr;
     g_vk.hdr_format = wf.format;
@@ -1621,6 +1633,46 @@ static void recreate_swapchain(void) {
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
 }
+
+#ifdef __ANDROID__
+// Android takes the app's window away while another activity covers it (the system file picker of F1 > Import a
+// driver, the start screen's mod / save / font imports, the home screen) and hands a new one back: the surface made for
+// the old one is lost - VK_ERROR_SURFACE_LOST_KHR at every acquire, a black screen until the app was closed (on
+// Qualcomm's driver and Turnip alike, 2026-11-11). vk_frame_begin follows the window SDL has now: none (in the
+// background) draws nothing; another one, or a surface an acquire called lost, gets a new surface and swapchain.
+static void *g_surface_window;  // the ANativeWindow g_vk.surface was made for
+static bool g_surface_lost;     // (an acquire said so: made again even for the same window)
+static void *android_window(void) {
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+}
+static VkResult android_surface_make(void) {
+    ANativeWindow *nw = android_window();
+    VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = nw};
+    VkResult r = nw ? vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, &g_vk.surface) : VK_ERROR_INITIALIZATION_FAILED;
+    g_surface_window = nw, g_surface_lost = r != VK_SUCCESS;
+    return r;
+}
+static bool android_surface_follow(void) {
+    void *nw = android_window();
+    if (!nw) return false;
+    if (nw == g_surface_window && !g_surface_lost && g_vk.surface) return true;
+    atomic_fetch_add(&g_window_stalls, 1);
+    rec_drain();  // (as recreate_swapchain: nothing queued or in flight uses the old swapchain)
+    rec_wait_late();
+    vkDeviceWaitIdle(g_vk.dev);
+    // (a new surface can't take the old swapchain as its oldSwapchain - that must be the same native window's - so
+    // everything of the old goes first)
+    swapchain_views_free();
+    if (g_vk.swapchain) vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL), g_vk.swapchain = VK_NULL_HANDLE;
+    if (g_vk.surface) vkDestroySurfaceKHR(g_vk.inst, g_vk.surface, NULL), g_vk.surface = VK_NULL_HANDLE;
+    bool lost = g_surface_lost;
+    VkResult r = android_surface_make();
+    LOG("[vk] window %s: new surface (%d)\n", lost ? "lost its surface" : "given back by Android", r);
+    if (r != VK_SUCCESS) return false;
+    create_swapchain();
+    return g_vk.swapchain != VK_NULL_HANDLE;
+}
+#endif
 
 // Time this thread spends waiting here - for a frame slot's GPU work, a window image, the presentation engine -
 // counts as idle for the frame pacer (pace.c), like the game's own waits: in FIFO (exclusive fullscreen
@@ -1676,6 +1728,9 @@ bool vk_frame_begin(const float clear[4]) {
     // The last present (the recorder's, record.c) must be done before the swapchain is used again - acquire and present
     // on the same swapchain are not allowed at the same time - and it may have asked for a new swapchain
     WAITING(rec_wait_presents(rec_presents_queued()));
+#ifdef __ANDROID__
+    if (!android_surface_follow()) return false;  // (in the background: no window to draw in yet)
+#endif
     if (rec_present_recreate()) recreate_swapchain();
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
     else if (g_vk.hdr != hdr_wanted()) recreate_swapchain();  // (HDR switched)
@@ -1712,6 +1767,9 @@ bool vk_frame_begin(const float clear[4]) {
                                           &cur_frame.image));
         rec_swapchain_unlock();
     }
+#ifdef __ANDROID__
+    if (r == VK_ERROR_SURFACE_LOST_KHR) g_surface_lost = true;  // (the next frame makes a new one: android_surface_follow)
+#endif
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
     cur_frame.id++;
@@ -2854,10 +2912,8 @@ void ui_window_init(void) {
 #ifdef __ANDROID__
     {   // made by our own loader (runtime/platform/android_vk.c), not SDL's: SDL calls the system's libvulkan.so, which
         // knows nothing of an instance made through a custom driver's loader (LARECOMP_VK_DRIVER)
-        ANativeWindow *nw = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
-        VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = nw};
-        VkResult r = nw ? vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, &g_vk.surface) : VK_ERROR_INITIALIZATION_FAILED;
-        if (r != VK_SUCCESS) FATAL("vkCreateAndroidSurfaceKHR: %d (window %p)\n", r, (void *)nw);
+        VkResult r = android_surface_make();
+        if (r != VK_SUCCESS) FATAL("vkCreateAndroidSurfaceKHR: %d (window %p)\n", r, android_window());
     }
 #else
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
@@ -2874,6 +2930,9 @@ void ui_window_init(void) {
     vk_exec_init();
     vk_shaders_init();
     if (chosen[0] || dx12_chosen) settings_save();
+#ifdef __ANDROID__
+    plat_vk_driver_up();  // (a chosen GPU driver passed its trial: runtime/platform/android_vk.c)
+#endif
 }
 
 SDL_Window *ui_window(void) { return window; }

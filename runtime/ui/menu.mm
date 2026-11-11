@@ -35,6 +35,12 @@ extern "C" void *vk_overlay_begin(void *window_cmd);
 extern "C" void vk_overlay_end(void *window_cmd, void *cmd);
 extern "C" int vk_hdr_state(void);  // device.c: 0 the display isn't in HDR mode, 1 it is, 2 HDR output on
 extern "C" int vk_gpu_names(const char **names, int max);  // device.c: the Vulkan 1.2 GPUs (the Graphics card row)
+#ifdef __ANDROID__
+extern "C" const char *vk_driver_desc(void);  // device.c: the running driver, as it names itself (the GPU driver row)
+extern "C" bool vk_driver_quad_control(void);  // device.c: it has quad control (the eyes' iris fix needs it)
+extern "C" SDL_Window *ui_window(void);       // device.c: the window (the driver import's file picker)
+#include "../platform.h"
+#endif
 #endif
 
 extern "C" {
@@ -524,6 +530,129 @@ extern "C" void renderer_get_scale(float *sx, float *sy);
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
 
+#ifdef __ANDROID__
+// GPU driver (runtime/platform/android_vk.c): the system's, or a package from <data root>/drivers/ loaded through
+// libadrenotools - a newer Turnip, or any driver a player brings that this app doesn't ship. Taken when the app starts
+// (the start screen already draws on it), so a change offers a restart there; in game it waits for the next start.
+// Import: the system's file picker (a .zip as emulators share them, with meta.json, or a bare .so), read on a thread.
+static pthread_mutex_t g_drv_lock = PTHREAD_MUTEX_INITIALIZER;
+static std::string g_drv_pick, g_drv_msg;  // (the picked file; the import's outcome: a driver's name, or why not)
+static bool g_drv_failed, g_drv_done;
+static std::atomic<bool> g_drv_busy{false};
+static void *drv_import_thread(void *) {
+    pthread_mutex_lock(&g_drv_lock);
+    std::string pick = g_drv_pick;
+    pthread_mutex_unlock(&g_drv_lock);
+    char msg[256];
+    bool ok = plat_vk_driver_import(pick.c_str(), msg, sizeof msg);
+    pthread_mutex_lock(&g_drv_lock);
+    g_drv_msg = msg, g_drv_failed = !ok, g_drv_done = true;
+    pthread_mutex_unlock(&g_drv_lock);
+    g_drv_busy = false;
+    return NULL;
+}
+static void SDLCALL drv_picked(void *, const char *const *files, int) {  // (SDL's dialog thread / Android's UI thread)
+    if (!files || !files[0] || g_drv_busy.exchange(true)) return;
+    pthread_mutex_lock(&g_drv_lock);
+    g_drv_pick = files[0];
+    pthread_mutex_unlock(&g_drv_lock);
+    pthread_t t;
+    if (pthread_create(&t, NULL, drv_import_thread, NULL) == 0) pthread_detach(t);
+    else g_drv_busy = false;
+}
+static void gpu_driver_rows(bool in_game) {
+    static char names[32][96];
+    static int n = -1;
+    pthread_mutex_lock(&g_drv_lock);
+    if (g_drv_done) {  // (an import finished: the list again, and a new driver becomes the choice)
+        g_drv_done = false, n = -1;
+        if (!g_drv_failed) snprintf(g_settings.vk_driver, sizeof g_settings.vk_driver, "%s", g_drv_msg.c_str()), settings_save();
+    }
+    std::string msg = g_drv_msg;
+    bool failed = g_drv_failed;
+    pthread_mutex_unlock(&g_drv_lock);
+    if (n < 0) n = plat_vk_drivers(names, 32);
+    const char *opts[33] = {TR("System's", "Do sistema")};
+    int sel = 0;
+    for (int i = 0; i < n; i++) {
+        opts[i + 1] = names[i];
+        if (!strcmp(names[i], g_settings.vk_driver)) sel = i + 1;
+    }
+    if (opt_choice(TR("GPU driver", "Driver da GPU"), &sel, opts, n + 1, 0,
+                   TR("The Vulkan driver the game draws with. System's: the phone's own (Qualcomm's on a Snapdragon). "
+                      "Others: drivers you added with \"Import a driver\" below - e.g. Turnip, Mesa's open driver for "
+                      "Adreno GPUs, which takes less GPU time here but is less tested (known bugs: the README) - kept in "
+                      "the drivers folder of the app's files. A driver that "
+                      "can't start the GPU sends the next start back to the system's. Applies when the app starts again.",
+                      "O driver Vulkan com que o jogo desenha. Do sistema: o do próprio celular (o da Qualcomm num "
+                      "Snapdragon). Os outros: drivers que você adicionou em \"Importar driver\" abaixo - por exemplo o "
+                      "Turnip, o driver aberto do Mesa para GPUs Adreno, que gasta menos tempo de GPU aqui, mas é menos "
+                      "testado (bugs conhecidos: o README) - guardados na pasta drivers dos arquivos do app. Um driver que não consegue iniciar a GPU faz a próxima "
+                      "abertura voltar ao do sistema. Vale quando o app abrir de novo."))) {
+        snprintf(g_settings.vk_driver, sizeof g_settings.vk_driver, "%s", sel ? names[sel - 1] : "");
+        settings_save();
+    }
+    const char *loaded = plat_vk_driver_loaded(), *dead = plat_vk_driver_failed();
+    ImGui::PushTextWrapPos(0);  // (the status lines below wrap at the pane's edge: driver names run long)
+    if (*vk_driver_desc()) {
+        ImGui::TextDisabled(TR("In use: %s%s", "Em uso: %s%s"), vk_driver_desc(),
+                            loaded ? "" : TR(" (system's)", " (do sistema)"));
+        // (Pokémon Z-A's iris is drawn in full quads only with the driver's quad control - vulkan/exec.c; Turnip v39 and
+        // PurpleVK T30 have none, 2026-11-11: asked of the driver, so one that gains it loses the note)
+        if (!vk_driver_quad_control())  // (not gated on g_game_is_la: it stays 1 on the start screen)
+            ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                               TR("This driver has no quad control: the eyes' iris shows small squares.",
+                                  "Este driver não tem quad control: a íris dos olhos aparece em quadradinhos."));
+    }
+    if (dead)
+        ImGui::TextColored(ImVec4(0.93f, 0.36f, 0.33f, 1), TR("The driver \"%s\" didn't start: the system's is in use.",
+                                                             "O driver \"%s\" não iniciou: o do sistema está em uso."), dead);
+    if (strcmp(g_settings.vk_driver, loaded ? loaded : "") != 0) {  // (chosen, not running yet)
+        ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                           in_game ? TR("The new driver applies the next time the app opens.",
+                                        "O novo driver vale na próxima vez que o app abrir.")
+                                   : TR("The new driver applies when the app opens again.",
+                                        "O novo driver vale quando o app abrir de novo."));
+    }
+    ImGui::PopTextWrapPos();
+    if (strcmp(g_settings.vk_driver, loaded ? loaded : "") != 0) {
+        if (!in_game && opt_button(TR("Restart the app now", "Reiniciar o app agora"),
+                                   TR("Closes the app and opens it again at the start screen, with the chosen driver.",
+                                      "Fecha o app e abre de novo na tela inicial, com o driver escolhido.")))
+            settings_save(), plat_restart_app();
+    }
+    if (g_drv_busy) opt_disable_next();
+    if (opt_action(TR("Import a driver", "Importar driver"), g_drv_busy ? TR("Reading...", "Lendo...") : "...",
+                   TR("Adds a driver from a file: a .zip package as emulators use them (a meta.json and the driver's "
+                      ".so inside, e.g. the Turnip releases of K11MCH1's AdrenoToolsDrivers on GitHub) or a bare .so "
+                      "built for Android. It becomes the chosen driver. A driver "
+                      "runs inside the app like its own code: only use ones from people you trust.",
+                      "Adiciona um driver de um arquivo: um pacote .zip como os emuladores usam (com meta.json e o .so "
+                      "do driver dentro, por exemplo as versões do Turnip do AdrenoToolsDrivers do K11MCH1 no GitHub) "
+                      "ou um .so avulso feito para Android. Ele vira o driver "
+                      "escolhido. Um driver roda dentro do app como código dele: use só os de quem você confia.")))
+        SDL_ShowOpenFileDialog(drv_picked, NULL, ui_window(), NULL, 0, NULL, false);  // (no filter: Android's picker
+                                                                                  // filters by MIME type, and a .so has none)
+    if (!msg.empty() && !g_drv_busy) {
+        if (failed) ImGui::TextColored(ImVec4(0.93f, 0.36f, 0.33f, 1), TR("Not imported: %s", "Não importado: %s"), msg.c_str());
+        else ImGui::TextColored(ImVec4(0.42f, 0.83f, 0.52f, 1), TR("Imported: %s", "Importado: %s"), msg.c_str());
+    }
+    if (sel && opt_button(TR("Delete this driver", "Apagar este driver"),
+                          TR("Deletes the chosen driver from the drivers folder and goes back to the system's. To use it "
+                             "again, import it again.",
+                             "Apaga o driver escolhido da pasta drivers e volta ao do sistema. Para usar de novo, é só "
+                             "importar outra vez."))) {
+        plat_vk_driver_remove(names[sel - 1]);
+        g_settings.vk_driver[0] = 0;
+        settings_save();
+        n = -1;
+        pthread_mutex_lock(&g_drv_lock);
+        g_drv_msg.clear();
+        pthread_mutex_unlock(&g_drv_lock);
+    }
+}
+#endif
+
 static void tab_display(bool in_game) {
     float scale = ImGui::GetFontSize() / 34;
     bool la = g_game_is_la && menu_la_tabs;  // (Link's Awakening's own rows)
@@ -546,6 +675,9 @@ static void tab_display(bool in_game) {
             g_settings.video_rec = VREC_ASK;  // (the next start offers the video settings recommended for that GPU)
         }
     }
+#endif
+#ifdef __ANDROID__
+    gpu_driver_rows(in_game);
 #endif
 #ifdef _WIN32
     {   // Graphics API (vulkan/device.c ui_window_init): DirectX 12 through the shipped Dozen

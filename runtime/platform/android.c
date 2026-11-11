@@ -8,6 +8,7 @@
 #include <android/hardware_buffer.h>
 #include <android/log.h>
 #include <android/thermal.h>
+#include <jni.h>
 #include <math.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -275,6 +276,44 @@ void plat_frame_rate_hint(void *sdl_window, float fps) {
     int r = set(nw, fps, fps > 0 ? 1 : 0);
     fprintf(stderr, "[display] frame rate asked: %.0f%s (%d)\n", fps, fps > 0 ? " fps" : " (no preference)", r);
     cur = fps;
+}
+
+// ---- restart (platform.h plat_restart_app): a GPU driver is chosen once a process, before the start screen draws on
+// it (android_vk.c), so a new one needs a new process. The activity starts itself again as a fresh task
+// (Intent.makeRestartActivityTask of its launch intent, while it is still in front: no background-start limits), then
+// this process ends; Android brings up a new one for that pending start. JNI through SDL's env and activity.
+void plat_restart_app(void) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    bool ok = false;
+    if (env && act) {
+        jclass ac = (*env)->GetObjectClass(env, act);
+        jobject pm = (*env)->CallObjectMethod(env, act, (*env)->GetMethodID(env, ac, "getPackageManager",
+                                                                            "()Landroid/content/pm/PackageManager;"));
+        jobject pkg = (*env)->CallObjectMethod(env, act, (*env)->GetMethodID(env, ac, "getPackageName", "()Ljava/lang/String;"));
+        jobject launch = NULL;
+        if (pm && pkg) {
+            jclass pc = (*env)->GetObjectClass(env, pm);
+            launch = (*env)->CallObjectMethod(env, pm, (*env)->GetMethodID(env, pc, "getLaunchIntentForPackage",
+                                                                           "(Ljava/lang/String;)Landroid/content/Intent;"), pkg);
+        }
+        jclass ic = (*env)->FindClass(env, "android/content/Intent");
+        if (launch && ic) {
+            jobject comp = (*env)->CallObjectMethod(env, launch, (*env)->GetMethodID(env, ic, "getComponent",
+                                                                                     "()Landroid/content/ComponentName;"));
+            jmethodID mk = (*env)->GetStaticMethodID(env, ic, "makeRestartActivityTask",
+                                                     "(Landroid/content/ComponentName;)Landroid/content/Intent;");
+            jobject again = comp ? (*env)->CallStaticObjectMethod(env, ic, mk, comp) : NULL;
+            if (again) {
+                (*env)->CallVoidMethod(env, act, (*env)->GetMethodID(env, ac, "startActivity", "(Landroid/content/Intent;)V"), again);
+                ok = !(*env)->ExceptionCheck(env);
+            }
+        }
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    }
+    fprintf(stderr, "[app] restart%s\n", ok ? "" : ": the activity couldn't be started again, closing only");
+    fflush(NULL);
+    _exit(0);  // (no atexit handlers: the GPU device and its threads go with the process)
 }
 
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)

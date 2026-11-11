@@ -62,6 +62,10 @@ typedef struct {
     char gpu_name[256];  // Graphics card: the Vulkan device to run on, by name ("": Auto; vulkan/device.c pick_device)
     bool dx12;           // Graphics API (Windows): DirectX 12 through the shipped Dozen (Mesa's Vulkan on Direct3D 12,
                          // dx12/ next to the exe) instead of the GPU's Vulkan driver (vulkan/device.c ui_window_init)
+    char vk_driver[96];  // GPU driver (Android): a package in <data root>/drivers/ loaded through libadrenotools ("": the
+                         // system's; platform/android_vk.c), applied when the app starts
+    char vk_driver_trial[96];  // the driver a start is trying: still set at the next start = that start died bringing
+                               // the GPU up with it, so it went back to the system's (vulkan/device.c ui_window_init)
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;

@@ -132,6 +132,20 @@ time the phone warms up (down to about 45%). In **Settings > Video**:
   controller; Android's keyboard doesn't come up.
 - **Anti-aliasing**: *SMAA* smooths jagged edges, at a small cost.
 
+### GPU drivers
+
+**Settings > Video > GPU driver** picks the Vulkan driver: *System's* (Qualcomm's, the default) or one you added.
+**Import a driver** takes a `.zip` in the package format Android emulators use (a `meta.json` and the driver's `.so`,
+e.g. the Turnip releases of [K11MCH1's AdrenoToolsDrivers](https://github.com/K11MCH1/AdrenoToolsDrivers)) or a bare
+`.so`; drivers are kept in `Android/data/org.recomp.za/files/drivers/`, where you can also drop a `.so` by hand. A new
+driver applies when the app opens again (**Restart the app now** on the start screen). If a driver can't start the
+GPU, the next start goes back to the system's by itself and the menu says so. Loaded through
+[libadrenotools](https://github.com/bylaws/libadrenotools).
+
+Turnip (Mesa's open driver for Adreno) takes about half the GPU time of Qualcomm's in the heaviest pass here, but
+v39 and PurpleVK T30 have no quad control (the iris shows squares; the menu says so) and stop in Lumiose more often
+(see the known bugs). A driver runs inside the app like its own code: only use ones from people you trust.
+
 ## Saves
 
 Saves are the game's own files, kept in `Android/data/org.recomp.za/files/save/save_0/` on the phone. They are the same

@@ -66,6 +66,14 @@ static bool in_gpu_driver(uint64_t pc) {
         if (contains_nocase(m, drivers[i])) return true;
     return false;
 }
+#ifdef __ANDROID__
+// a crash inside the GPU driver the player chose: its library is loaded from the app's gpu_drivers folder
+// (runtime/platform/android_vk.c driver_copy), under whatever name its package gave it
+static bool in_custom_driver(uint64_t pc) {
+    char m[512];
+    return pc && plat_module_name(pc, m, sizeof m) && strstr(m, "/gpu_drivers/");
+}
+#endif
 
 // A crash in our DirectX 12 (Dozen: vulkan_dzn.dll), not while compiling a pipeline (that one is recovered, #93):
 // the settings say Vulkan from the next start. #172: an RTX 4050 Laptop on DirectX 12 crashed in vulkan_dzn on the
@@ -158,6 +166,19 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
         snprintf(head, sizeof head, "The game stopped at one of its own checks");
         snprintf(what, sizeof what, "Start it again: this happens now and then while the game starts, and the next "
                  "start is normally fine. If it keeps happening at the same place, it's a bug in %s. %s", app, report);
+#ifdef __ANDROID__
+    } else if (plat_vk_driver_loaded() && (in_custom_driver(g_pc) || in_gpu_driver(g_pc) || has("VK_") || has("Vulkan"))) {
+        // (a driver the player chose - runtime/platform/android_vk.c: not "update your NVIDIA driver". On trial: it
+        // never got the GPU up, and the next start is on the system's by itself; past it: their choice to undo)
+        snprintf(head, sizeof head, "The GPU driver \"%s\" failed", plat_vk_driver_loaded());
+        if (plat_vk_driver_trial())
+            snprintf(what, sizeof what, "It's the driver chosen in F1 > Video > GPU driver, and it couldn't start the GPU "
+                     "on this phone, so the next start uses the system's driver. Open the app again.");
+        else
+            snprintf(what, sizeof what, "It's the driver chosen in F1 > Video > GPU driver. Open the app again and choose "
+                     "the system's driver (or another one) there: nothing is lost, up to your last save or autosave. %s",
+                     report);
+#endif
     } else if (in_gpu_driver(g_pc) && dozen_crash_to_vulkan()) {
         snprintf(head, sizeof head, "DirectX 12 crashed");
         snprintf(what, sizeof what, "The DirectX 12 mode (F1 > Display > Graphics API) crashed on this PC, so the next "

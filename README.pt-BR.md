@@ -135,6 +135,22 @@ celular esquenta (até cerca de 45%). Em **Configurações > Vídeo**:
   toque ou controle; o teclado do Android não aparece.
 - **Anti-aliasing**: *SMAA* suaviza as bordas serrilhadas, com um custo pequeno.
 
+### Drivers da GPU
+
+**Configurações > Vídeo > Driver da GPU** escolhe o driver Vulkan: *Do sistema* (o da Qualcomm, o padrão) ou um que
+você adicionou. **Importar driver** aceita um `.zip` no formato de pacote que os emuladores de Android usam (um
+`meta.json` e o `.so` do driver; por exemplo, as versões do Turnip do
+[AdrenoToolsDrivers do K11MCH1](https://github.com/K11MCH1/AdrenoToolsDrivers)) ou um `.so` avulso. Os drivers ficam em
+`Android/data/org.recomp.za/files/drivers/`, onde também dá para colocar um `.so` à mão. Um driver novo vale quando o
+app abre de novo (**Reiniciar o app agora**, na tela inicial). Se um driver não consegue iniciar a GPU, a próxima
+abertura volta sozinha ao do sistema e o menu avisa. Carregado pelo
+[libadrenotools](https://github.com/bylaws/libadrenotools).
+
+O Turnip (o driver aberto do Mesa para Adreno) gasta cerca de metade do tempo de GPU do da Qualcomm no passe mais
+pesado daqui, mas o v39 e o PurpleVK T30 não têm quad control (a íris aparece em quadradinhos; o menu avisa) e param
+em Lumiose com mais frequência (veja os bugs conhecidos). Um driver roda dentro do app como código dele: use só os de
+quem você confia.
+
 ## Saves
 
 Os saves são os arquivos do próprio jogo, em `Android/data/org.recomp.za/files/save/save_0/` no celular. São os mesmos
