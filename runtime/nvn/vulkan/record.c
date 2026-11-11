@@ -44,6 +44,9 @@
 #include "record.h"
 
 #include <pthread.h>
+#ifndef _WIN32
+#include <dlfcn.h>  // (dladdr: LARECOMP_REC_SLOW)
+#endif
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,6 +164,30 @@ static void commit(void) {
 static inline void *after(const void *args, size_t args_size) { return (uint8_t *)args + AL16(args_size); }
 
 // ---- the thread
+// (diagnostic) LARECOMP_REC_SLOW=1: the packets that took over 0.2 ms, summed by their run function and logged every
+// 2 s with its name - which Vulkan call the recorder waits in (Turnip: a wait in the kernel below calls simpleperf
+// could not unwind)
+static int slow_on = -1;
+static struct { void (*fn)(const void *); uint64_t ns, n; } slow_tab[16];
+static uint64_t slow_t0;
+static void slow_note(void (*fn)(const void *), uint64_t dt) {
+    for (int i = 0; i < 16; i++)
+        if (slow_tab[i].fn == fn || !slow_tab[i].fn) { slow_tab[i].fn = fn, slow_tab[i].ns += dt, slow_tab[i].n++; break; }
+    uint64_t now = NOW();
+    if (!slow_t0) slow_t0 = now;
+    if (now - slow_t0 < 2000000000ull) return;
+    slow_t0 = now;
+    for (int i = 0; i < 16 && slow_tab[i].fn; i++) {
+        const char *name = "?";
+#ifndef _WIN32
+        Dl_info di = {0};
+        if (dladdr((void *)slow_tab[i].fn, &di) && di.dli_sname) name = di.dli_sname;
+#endif
+        LOG("[rec] slow %-28s %p %4llux %7.1f ms\n", name, (void *)slow_tab[i].fn, (unsigned long long)slow_tab[i].n,
+            slow_tab[i].ns / 1e6);
+    }
+    memset(slow_tab, 0, sizeof slow_tab);
+}
 static void *run(void *arg) {
     (void)arg;
     plat_thread_perf_core(PLAT_PERF_RENDER);  // (Windows hybrid CPUs: the performance cores, as the render thread)
@@ -179,7 +206,10 @@ static void *run(void *arg) {
         uint64_t t0 = prof ? NOW() : 0;
         while (t != h) {
             const PktHdr *p = (const PktHdr *)(ring + (t & (ring_cap - 1)));
+            if (slow_on < 0) slow_on = getenv("LARECOMP_REC_SLOW") && atoi(getenv("LARECOMP_REC_SLOW"));
+            uint64_t ts = slow_on ? NOW() : 0;
             if (p->fn && !atomic_load_explicit(&quitting, memory_order_relaxed)) p->fn(p + 1);  // (rec_quit: dropped)
+            if (slow_on && p->fn && NOW() - ts > 200000) slow_note(p->fn, NOW() - ts);
             t += p->size;
             atomic_store_explicit(&tail, t, memory_order_release);
         }
@@ -566,10 +596,19 @@ static void submit_run(const void *p) {
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = a->ncb, .pCommandBufferInfos = a->cbs,
                         .signalSemaphoreInfoCount = a->nsig, .pSignalSemaphoreInfos = a->sig,
                         .waitSemaphoreInfoCount = a->nwait, .pWaitSemaphoreInfos = &a->wait};
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphoreSubmitInfo sig[2];
+    if (g_vk.timeline_fences) {  // (vk.h vk_wait_timeline: the ring's fence in place of the timeline's signal)
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < a->nsig; i++)
+            if (a->sig[i].semaphore != g_vk.timeline) sig[n++] = a->sig[i];
+        si.signalSemaphoreInfoCount = n, si.pSignalSemaphoreInfos = sig;
+        fence = vk_timeline_fence(a->seq);
+    }
     uint64_t t0 = NOW();
     rq_watch("vkQueueSubmit2", a->seq);  // (a hang dump names it)
     pthread_mutex_lock(&queue_mu);
-    VkResult r = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vkQueueSubmit2(g_vk.queue, 1, &si, fence);
     pthread_mutex_unlock(&queue_mu);
     rq_watch(NULL, 0);
     uint64_t dt = NOW() - t0;
@@ -659,9 +698,7 @@ static void *late_main(void *arg) {
         while (!late_have) pthread_cond_wait(&late_cv, &late_mu);
         PresentArgs a = late_a;
         pthread_mutex_unlock(&late_mu);
-        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                                  .pValues = &a.after};
-        vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);  // (a device loss shows up in the next present)
+        vk_wait_timeline(a.after, 200000000ull);  // (a device loss shows up in the next present)
         uint64_t t = NOW();
         if (a.gid) {
             // On the display's refresh grid: the compositor shows the in-between image (present gid - 1) on the first
@@ -703,9 +740,7 @@ static void present_run(const void *p) {
     const PresentArgs *a = p;
     if (!a->after || on <= 0) {
         if (a->after) {  // (no recorder: this thread waits)
-            VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
-                                      .pSemaphores = &g_vk.timeline, .pValues = &a->after};
-            vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);
+            vk_wait_timeline(a->after, 200000000ull);
             PresentArgs b = *a;
             b.after = 0;  // (counted by present_now)
             if (b.gid) b.desired = NOW() + b.delay;

@@ -589,7 +589,7 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
         for (int comp = 0; comp < 4; comp++) if (mask & (1u << comp)) comps[n++] = comp;
         char v[4][16];
         for (int i = 0; i < 4; i++) { if (i < n) sprintf(v[i], "t[%d]", comps[i]); else strcpy(v[i], "0.0f"); }
-        const char *pk = c->glsl ? "      r%d = packHalf2x16(vec2(%s, %s));\n" : "      r%d = as_type<uint>(half2(half(%s), half(%s)));\n";
+        const char *pk = c->glsl ? "      r%d = ph2(vec2(%s, %s));\n" : "      r%d = as_type<uint>(half2(half(%s), half(%s)));\n";
         if (d0 != RZ) { c->reg_used[d0] = 1; sp(&c->body, pk, d0, v[0], v[1]); }
         if (d1 != RZ) { c->reg_used[d1] = 1; sp(&c->body, pk, d1, v[2], v[3]); }
         sp(&c->body, "    }\n");
@@ -1403,21 +1403,27 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5c68000000000000ull, 0xfff8000000000000ull) || OPM(0x4c68000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3868000000000000ull, 0xfef8000000000000ull)) {  // FMUL
         static const char *const scale[] = {"", " * 0.5f", " * 0.25f", " * 0.125f", " * 8.0f", " * 4.0f", " * 2.0f", ""};
-        sprintf(t, "(%s * %s%s)", F(R(a)), NA(F(B(true)), bits(w, 48, 1), false), scale[bits(w, 41, 3)]);
+        int fmz = bits(w, 44, 2) >= 2;  // (.FMZ: glsl_prelude fmz_mul)
+        sprintf(t, fmz ? "(fmz_mul(%s, %s)%s)" : "(%s * %s%s)", F(R(a)), NA(F(B(true)), bits(w, 48, 1), false),
+                scale[bits(w, 41, 3)]);
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
     } else if (OPM(0x1e00000000000000ull, 0xff00000000000000ull)) {  // FMUL32I
-        sprintf(t, "(%s * as_type<float>(0x%08xu))", F(R(a)), (uint32_t)bits(w, 20, 32));
+        int fmz = bits(w, 53, 2) >= 2;
+        sprintf(t, fmz ? "fmz_mul(%s, as_type<float>(0x%08xu))" : "(%s * as_type<float>(0x%08xu))", F(R(a)),
+                (uint32_t)bits(w, 20, 32));
         set_reg(c, d, FRES(t, bits(w, 55, 1)));
     } else if (OPM(0x5980000000000000ull, 0xff80000000000000ull) || OPM(0x4980000000000000ull, 0xff80000000000000ull) ||
                OPM(0x5180000000000000ull, 0xff80000000000000ull) || OPM(0x3280000000000000ull, 0xfe80000000000000ull)) {  // FFMA
         const char *bv;
         char cbuf_c[256], bbuf[256];
         const char *cv = operand_c_for_ffma(c, w, cbuf_c, &bv, bbuf);
-        sprintf(t, "fma(%s, %s, %s)", F(R(a)), NA(F(bv), bits(w, 48, 1), false), NA(F(cv), bits(w, 49, 1), false));
+        sprintf(t, bits(w, 53, 2) >= 2 ? "fmz_fma(%s, %s, %s)" : "fma(%s, %s, %s)", F(R(a)),
+                NA(F(bv), bits(w, 48, 1), false), NA(F(cv), bits(w, 49, 1), false));  // (.FMZ at 53, as FMUL's at 44)
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
     } else if (OPM(0x0c00000000000000ull, 0xfc00000000000000ull)) {  // FFMA32I
         sprintf(u, "as_type<float>(0x%08xu)", (uint32_t)bits(w, 20, 32));
-        sprintf(t, "fma(%s, %s, %s)", NA(F(R(a)), bits(w, 56, 1), false), u, NA(F(R(d)), bits(w, 57, 1), false));
+        sprintf(t, bits(w, 53, 2) >= 2 ? "fmz_fma(%s, %s, %s)" : "fma(%s, %s, %s)", NA(F(R(a)), bits(w, 56, 1), false), u,
+                NA(F(R(d)), bits(w, 57, 1), false));
         set_reg(c, d, FRES(t, bits(w, 55, 1)));
     } else if (OPM(0x5c60000000000000ull, 0xfff8000000000000ull) || OPM(0x4c60000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3860000000000000ull, 0xfef8000000000000ull)) {  // FMNMX
@@ -1494,7 +1500,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(u, "float(%s)", src);
         if (bits(w, 8, 2) == 1) {  // F16 result in the low half
             char h[700];
-            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
+            snprintf(h, sizeof h, c->glsl ? "(f2hb(%s))" : "(uint(as_type<ushort>(half(%s))))",
                      NA(u, bits(w, 45, 1), bits(w, 49, 1)));
             set_reg(c, d, h);
         } else {
@@ -1518,7 +1524,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
         if (dfmt == 1) {  // F16 result in the low half, high half zero
             char h[1100];
-            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
+            snprintf(h, sizeof h, c->glsl ? "(f2hb(%s))" : "(uint(as_type<ushort>(half(%s))))",
                      bits(w, 50, 1) ? (sprintf(u, "saturate(%s)", t), u) : t);
             set_reg(c, d, h);
         } else {
@@ -2243,6 +2249,11 @@ static const char glsl_prelude[] =
     "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
     "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
     "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
+    // FMUL / FFMA .FMZ (their 2-bit mode, 2 or 3): a zero operand makes the product 0, even times an infinity or a NaN
+    // (D3D's multiply). As a plain multiply 0 x infinity is NaN - the suspect for the black dot at the core of Z-A's
+    // sun on the phone (Adreno 830), where the Switch has 0.
+    "float fmz_mul(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n"
+    "float fmz_fma(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : fma(a, b, c); }\n"
     // Maxwell's warps are 32 lanes. A subgroup of 64 (AMD's GCN / Vega GPUs always, any GPU whose driver picks it) holds
     // two of them: lane, ballot, vote and shuffle work on each 32-lane half as on a warp. gl_SubgroupSize is a
     // constant to the driver's compiler: with 32-lane subgroups only the plain subgroup operation is left.
@@ -2293,9 +2304,17 @@ static const char glsl_h2f_exact[] =
 static const char glsl_h2f_native[] =
     "float h2f(uint h) { return unpackHalf2x16(h).x; }\n"
     "vec2 unpack_h2(uint v) { return unpackHalf2x16(v); }\n";
+// Float -> half as the Switch's GPU rounds it: out of range is an infinity (at 65520 and over: round to nearest), a
+// NaN stays one. GLSL leaves packHalf2x16 undefined out of range - the suspect for the black dot at the core of Z-A's
+// sun on Adreno 830 (its glow past 65504: if that packs as a NaN, a later saturate() reads 0), white on the Switch.
+// ph2 / f2hb replace every packHalf2x16.
+static const char glsl_prelude_f2h[] =
+    "uint f2hb(float x) { if (isnan(x)) return 0x7E00u; if (abs(x) >= 65520.0f) return ((floatBitsToUint(x) >> 16) & 0x8000u) | 0x7C00u;"
+    " return packHalf2x16(vec2(x, 0.0f)) & 0xFFFFu; }\n"
+    "uint ph2(vec2 v) { return f2hb(v.x) | (f2hb(v.y) << 16); }\n";
 static const char glsl_prelude_half[] =
     "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
-    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
+    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = f2hb(r.x), hi = f2hb(r.y); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 
 static const char *glsl_sampler_type(const ShaderTexture *t) {
@@ -2572,7 +2591,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     static int exact = -1;
     if (exact < 0) exact = getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0;
-    sp(&s, "%s%s", !exact && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE) ? glsl_h2f_native : glsl_h2f_exact,
+    sp(&s, "%s%s%s", glsl_prelude_f2h, !exact && (stage == STAGE_FRAGMENT || stage == STAGE_COMPUTE) ? glsl_h2f_native : glsl_h2f_exact,
        glsl_prelude_half);
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;
@@ -2805,7 +2824,13 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                     if (comp == 3) sp(&s, "  c%d[%d] = %s(1.0f);\n", rt, comp, cv);
                     else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);
                 } else if (r < 256 && c->reg_used[r]) {
-                    if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
+                    // (test) LARECOMP_CLAMP_F16_OUT=1: float outputs held to half's range, as the Switch's ROP may
+                    // store them (Z-A's sun core: an infinity on Adreno, then NaN in the tonemap?). Clear the shader
+                    // cache when switching it: it isn't part of the key.
+                    static int c16 = -1;
+                    if (c16 < 0) c16 = getenv("LARECOMP_CLAMP_F16_OUT") && atoi(getenv("LARECOMP_CLAMP_F16_OUT"));
+                    if (kind == 0 && c16) sp(&s, "  c%d[%d] = clamp(as_f(r%d), -65504.0f, 65504.0f);\n", rt, comp, r);
+                    else if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
                     else sp(&s, "  c%d[%d] = %s(r%d);\n", rt, comp, cv, r);
                 } else {
                     sp(&s, "  c%d[%d] = 0;\n", rt, comp);
@@ -2991,6 +3016,8 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
     sp(&s, "static inline uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(extract_bits(int(v), pos, min(len, 32u - pos))); }\n");
     sp(&s, "static inline uint bfi(uint ins, uint ctl, uint base) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u || pos >= 32u) return base; return insert_bits(base, ins, pos, min(len, 32u - pos)); }\n");
     sp(&s, "static inline float fswzadd(float a, float b, uint swz, uint lane) { uint m = (swz >> ((lane & 3u) * 2u)) & 3u; float ma = m == 1u ? -1.0f : (m == 3u ? 0.0f : 1.0f); float mb = m == 2u ? -1.0f : 1.0f; return a * ma + b * mb; }\n");
+    sp(&s, "static inline float fmz_mul(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n");  // (.FMZ: see glsl_prelude)
+    sp(&s, "static inline float fmz_fma(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : fma(a, b, c); }\n");
     sp(&s, "static inline uint2 rsc(uint2 c, float4 s) { return (s.x == 1.0f && s.y == 1.0f) ? c : uint2(floor((float2(c) + 0.5f) * s.xy)); }\n");
     sp(&s, "static inline float2 uvs(float2 uv, float4 s) { return (s.z == 1.0f && s.w == 1.0f) ? uv : min(uv, 1.0f) * s.zw; }\n");
     sp(&s, "static inline uint2 rscf(uint2 c, float4 s, float4 r, float2 p) { if (s.x == 1.0f && s.y == 1.0f) return c;"

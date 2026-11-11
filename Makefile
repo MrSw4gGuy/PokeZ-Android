@@ -128,9 +128,15 @@ SHADERC  ?= -lshaderc_shared
 # put the NDK's libc++ into the process with RTLD_GLOBAL before HWUI brought up Vulkan - Qualcomm's gralloc
 # then died in a std::string call (tombstone: snapalloc::SnapConstraintParser::StringToEnumType). Nothing
 # here passes C++ objects across a library boundary, so a private copy is safe.
-LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lnativewindow -lm
+# No -lvulkan: libmain.so defines every Vulkan command itself ($(B)/inc/vk_shim.c, tools/gen_vk_shim.py) and sends it to
+# the driver runtime/platform/android_vk.c picks - the system's, or a custom one (Turnip) through libadrenotools, built
+# by tools/linux/android-port/build_adrenotools.sh into ADRENOTOOLS.
+ADRENOTOOLS ?= build/android/adrenotools
+LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale $(SHADERC) \
+            $(ADRENOTOOLS)/libadrenotools.a $(ADRENOTOOLS)/lib/linkernsbypass/liblinkernsbypass.a -ldl -llog -landroid -lnativewindow -lm
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
-BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
+BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC))) $(B)/rt/vk_shim.o
+VK_HDR   := $(ANDROID_NDK)/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/vulkan
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
 UIFLAGS  := -x c++  # as on Linux: the .mm UI sources are plain C++ apart from __APPLE__ blocks
 GAMELIB  := $(B)/lasgame.so
@@ -203,6 +209,22 @@ $(B)/rt/gamebuild.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_BASE_ID
 $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(RTFLAGS) -c $< -o $@
+
+ifeq ($(PLATFORM),android)
+# Android: libmain.so's own Vulkan commands (see LDFLAGS above) - the ones its other objects call (their undefined vk*
+# symbols), generated from the NDK's headers
+VK_SHIM_USERS = $(filter-out $(B)/rt/vk_shim.o,$(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(FSR2_OBJ))
+$(B)/inc/vk_names.txt: $(VK_SHIM_USERS)
+	@mkdir -p $(dir $@)
+	$(NDKBIN)/llvm-nm -u $^ | grep -oE '\bvk[A-Z][A-Za-z0-9_]*' | sort -u > $@
+$(B)/inc/vk_shim.c: tools/gen_vk_shim.py $(B)/inc/vk_names.txt $(VK_HDR)/vulkan_core.h $(VK_HDR)/vulkan_android.h
+	@mkdir -p $(dir $@)
+	python3 tools/gen_vk_shim.py $@ $(B)/inc/vk_names.txt $(VK_HDR)/vulkan_core.h $(VK_HDR)/vulkan_android.h
+$(B)/rt/vk_shim.o: $(B)/inc/vk_shim.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RTFLAGS) -fvisibility=hidden -c $< -o $@
+$(B)/rt/platform/android_vk.o: RTFLAGS += -Ithird_party/libadrenotools/include
+endif
 
 # SMAA (third_party/smaa, MIT): the reference shader as a C string for runtime/nvn/smaa_data.c (both backends build
 # their passes from it); the non-ASCII bytes in its comments become '?', and its CRLF line ends plain LF (a CR left in

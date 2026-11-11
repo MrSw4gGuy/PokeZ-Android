@@ -103,6 +103,18 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
   traduzido é lento (despejar o GLSL dos VS do G-buffer: leitura dos atributos e dos buffers de constantes na memória
   do AHB?). Simplificar malhas no runtime (meshoptimizer, só índices novos) fica para depois, se os vértices ainda
   pesarem.
+- **Driver Vulkan próprio (Turnip)**: `LARECOMP_VK_DRIVER=<arquivo>` no `env.txt` carrega o driver de
+  `files/drivers/` (copiado para o armazenamento interno) pelo libadrenotools (`third_party/libadrenotools`, BSD-2;
+  `build_adrenotools.sh`). Para isso o `libmain.so` define os próprios comandos `vk*` (`tools/gen_vk_shim.py`, sem
+  `-lvulkan`) e cria a superfície com `vkCreateAndroidSurfaceKHR`. Sem a variável, nada muda (driver da Qualcomm).
+  No Turnip, o semáforo de linha do tempo é emulado pelo Mesa: as esperas seguravam o lock que cada envio precisa
+  (simpleperf: `vk_sync_timeline_alloc_point → mtx_lock`), e até um `vkGetFenceStatus` de fence ainda não sinalizada
+  ficava ~3 ms no kernel. Por isso, no Turnip, cada envio sinaliza uma fence de um anel (`vk.h vk_wait_timeline`,
+  `LARECOMP_VK_TIMELINE_FENCES`), e uma thread própria espera as fences em ordem e publica a última concluída.
+  Medido em 2026-11-08 com o PurpleVK T30 (Mesa 26.3-devel), estação, 75%: imagem correta; **G-buffer 4,1–4,6 ms
+  contra 10,7–12,4 ms** e **GPU por quadro 16–19 ms contra 25–29 ms** no driver da Qualcomm; fps ~32 nos dois, porque
+  o quadro espera a GPU duas vezes (`SyncWait` ~1,4 s a cada 2 s) sem sobrepor CPU e GPU. `LARECOMP_REC_SLOW=1` mostra
+  as chamadas lentas da thread gravadora.
 - **Ghidra**: `tools/za/nso2elf.py <exefs/main> <saída.elf>` gera o `main` descomprimido como ELF AArch64 (base
   `0x7000000000`, relocações aplicadas); importar com File › Import File. O ELF contém código do jogo: nunca
   commitar.

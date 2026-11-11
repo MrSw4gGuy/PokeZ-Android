@@ -1,12 +1,19 @@
 // Vulkan device, window, swapchain and presentation (counterpart of the window/present half of metal.m).
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <android/native_window.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_android.h>  // (the window's surface: ui_window_init)
+#endif
 
 #include "../../paths.h"
 #include "../../platform.h"
@@ -23,6 +30,98 @@
 #include <pthread.h>
 
 VkG g_vk;
+
+// (vk.h vk_wait_timeline) The fence ring: slot seq % TLF_N holds submission seq's fence. A thread of its own (tlf_main)
+// waits for them in order - submissions finish in order - and publishes the last one done in tlf_done, which everyone
+// else only reads: on this Turnip even a vkGetFenceStatus of a fence not yet signalled sat ~3 ms in the kernel (asked on
+// nearly every draw, it held the CPU to the GPU: every submission was done before the next one was made).
+#define TLF_N 128
+static VkFence tlf[TLF_N];
+static uint64_t tlf_seq[TLF_N];  // (tlf_mu)
+static _Atomic uint64_t tlf_done;
+static _Atomic bool tlf_lost;
+static pthread_mutex_t tlf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t tlf_cv_sub = PTHREAD_COND_INITIALIZER, tlf_cv_done = PTHREAD_COND_INITIALIZER;
+
+static void *tlf_main(void *arg) {
+    (void)arg;
+    for (uint64_t s = 1;; s++) {
+        unsigned i = (unsigned)(s % TLF_N);
+        pthread_mutex_lock(&tlf_mu);
+        while (tlf_seq[i] != s) pthread_cond_wait(&tlf_cv_sub, &tlf_mu);
+        VkFence f = tlf[i];
+        pthread_mutex_unlock(&tlf_mu);
+        VkResult r;
+        while ((r = vkWaitForFences(g_vk.dev, 1, &f, VK_TRUE, 1000000000ull)) == VK_TIMEOUT) {}
+        pthread_mutex_lock(&tlf_mu);
+        if (r != VK_SUCCESS) atomic_store(&tlf_lost, true);
+        atomic_store_explicit(&tlf_done, s, memory_order_release);
+        pthread_cond_broadcast(&tlf_cv_done);
+        pthread_mutex_unlock(&tlf_mu);
+        if (r != VK_SUCCESS) return NULL;  // (device lost: the waiters see it in tlf_lost)
+    }
+}
+
+uint64_t vk_timeline_value(void) {
+    if (!g_vk.timeline_fences) {
+        uint64_t v = 0;
+        return vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v) == VK_SUCCESS ? v : UINT64_MAX;
+    }
+    return atomic_load(&tlf_lost) ? UINT64_MAX : atomic_load_explicit(&tlf_done, memory_order_acquire);
+}
+
+// (a wait on tlf_cv_done with tlf_mu held: false on a timeout or a lost device)
+static bool tlf_wait_locked(uint64_t value, uint64_t deadline_ns) {
+    while (atomic_load(&tlf_done) < value && !atomic_load(&tlf_lost)) {
+        uint64_t now = SDL_GetTicksNS();
+        if (now >= deadline_ns) return false;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t left = deadline_ns - now, ns = (uint64_t)ts.tv_nsec + (left < 100000000ull ? left : 100000000ull);
+        ts.tv_sec += (time_t)(ns / 1000000000ull), ts.tv_nsec = (long)(ns % 1000000000ull);
+        pthread_cond_timedwait(&tlf_cv_done, &tlf_mu, &ts);
+    }
+    return !atomic_load(&tlf_lost);
+}
+
+static void tlf_start(void) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, tlf_main, NULL) != 0) FATAL("[vk] fence ring thread: %s\n", strerror(errno));
+    pthread_detach(th);
+}
+
+VkFence vk_timeline_fence(uint64_t seq) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, tlf_start);
+    unsigned i = (unsigned)(seq % TLF_N);
+    pthread_mutex_lock(&tlf_mu);
+    if (!tlf[i]) {
+        VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VK_CHECK(vkCreateFence(g_vk.dev, &fi, NULL, &tlf[i]));
+    } else if (tlf_seq[i]) {  // (its old submission, TLF_N back: long done in practice)
+        tlf_wait_locked(tlf_seq[i], UINT64_MAX);
+        VK_CHECK(vkResetFences(g_vk.dev, 1, &tlf[i]));
+    }
+    tlf_seq[i] = seq;
+    VkFence f = tlf[i];
+    pthread_cond_signal(&tlf_cv_sub);
+    pthread_mutex_unlock(&tlf_mu);
+    return f;
+}
+
+VkResult vk_wait_timeline(uint64_t value, uint64_t timeout_ns) {
+    if (!g_vk.timeline_fences) {
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                  .pSemaphores = &g_vk.timeline, .pValues = &value};
+        return vkWaitSemaphores(g_vk.dev, &wi, timeout_ns);
+    }
+    if (atomic_load_explicit(&tlf_done, memory_order_acquire) >= value) return VK_SUCCESS;
+    uint64_t now = SDL_GetTicksNS(), deadline = timeout_ns > UINT64_MAX - now ? UINT64_MAX : now + timeout_ns;
+    pthread_mutex_lock(&tlf_mu);
+    bool ok = tlf_wait_locked(value, deadline);
+    pthread_mutex_unlock(&tlf_mu);
+    return ok ? VK_SUCCESS : atomic_load(&tlf_lost) ? VK_ERROR_DEVICE_LOST : VK_TIMEOUT;
+}
 #define VK_DEFINE_COMMAND(f) PFN_##f vkp_##f;
 #define VK_DEFINE_COMMAND_13(f, ext) PFN_##f vkp_##f;
 VK_DEVICE_COMMANDS_12(VK_DEFINE_COMMAND)
@@ -835,6 +934,9 @@ static void create_device(void) {
         LOG("[vk] driver %s %s; graphics pipeline library: %s; vertex input dynamic state: %s; extended dynamic state 3: %s\n",
             drv.driverName, drv.driverInfo, gpl, vids_ext ? (have_vids.vertexInputDynamicState ? "yes" : "no") : "no extension",
             eds3);
+        const char *e = getenv("LARECOMP_VK_TIMELINE_FENCES");  // (vk.h vk_wait_timeline)
+        g_vk.timeline_fences = e && *e ? atoi(e) != 0 : drv.driverID == VK_DRIVER_ID_MESA_TURNIP;
+        if (g_vk.timeline_fences) LOG("[vk] submissions tracked by fences, not the timeline (its waits hold its signals)\n");
     }
     {   // dynamic vertex input (exec.c): fewer pipelines; LARECOMP_VK_DYN_VERTEX=0 keeps the layout in each pipeline
         const char *e = getenv("LARECOMP_VK_DYN_VERTEX");
@@ -1849,6 +1951,12 @@ void vk_frame_end(const char *shot_path) {
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
+#ifdef __ANDROID__
+    // (a relative path is an APK asset to SDL on Android - "Couldn't open asset 'build/pass_003.png'": the debug
+    // frame's pictures go under the data root, files/build/, instead)
+    char abs[1024];
+    if (path[0] != '/') { snprintf(abs, sizeof abs, "%s/%s", rt_data_root(), path); path = abs; }
+#endif
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
     SDL_DestroySurface(s);
@@ -2415,7 +2523,17 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
+#ifdef __ANDROID__
+    {   // made by our own loader (runtime/platform/android_vk.c), not SDL's: SDL calls the system's libvulkan.so, which
+        // knows nothing of an instance made through a custom driver's loader (LARECOMP_VK_DRIVER)
+        ANativeWindow *nw = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+        VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = nw};
+        VkResult r = nw ? vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, &g_vk.surface) : VK_ERROR_INITIALIZATION_FAILED;
+        if (r != VK_SUCCESS) FATAL("vkCreateAndroidSurfaceKHR: %d (window %p)\n", r, (void *)nw);
+    }
+#else
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+#endif
     pick_device();
     create_device();
     create_swapchain();

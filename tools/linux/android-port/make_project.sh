@@ -157,6 +157,13 @@ cp "$GAME_BUILD/libmain.so" "$JNI/"
 for l in libSDL3.so libavformat.so libavcodec.so libavutil.so libswscale.so libshaderc_shared.so; do
     cp "$DEPS/lib/$l" "$JNI/"
 done
+# libadrenotools' hook libraries (build_adrenotools.sh): its linker namespace loads them from the app's lib folder when a
+# custom Vulkan driver is chosen (LARECOMP_VK_DRIVER, runtime/platform/android_vk.c)
+for l in libhook_impl.so libmain_hook.so; do
+    cp "$WORK/build/android/adrenotools/src/hook/$l" "$JNI/"
+done
+mkdir -p "$APP/app/src/main/assets/licenses"
+cp "$WORK/third_party/libadrenotools/LICENSE" "$APP/app/src/main/assets/licenses/libadrenotools-LICENSE.txt"
 # libc++_shared is deliberately NOT packaged: see the Makefile's android LDFLAGS
 
 echo "=== bundled free fonts into assets/fonts (with their licences) ==="

@@ -162,8 +162,8 @@ static uint64_t cq_last_ticks;                   // two submissions
 static uint64_t snap_ring_end(void);             // (snap_storage: the copies' ring after the game's heap, for gmem_heap_size)
 
 uint64_t vk_completed_seq(void) {
-    uint64_t v = 0;
-    VK_CHECK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v));
+    uint64_t v = vk_timeline_value();
+    if (v == UINT64_MAX) VK_CHECK(VK_ERROR_DEVICE_LOST);
     return v;
 }
 
@@ -204,7 +204,7 @@ static void lost_report(uint64_t done) {
 static void ir_dump(void) {
     uint64_t done = 0;
     // (not VK_CHECK: the device may be lost - and then the value is UINT64_MAX or garbage: every entry is shown)
-    if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &done) != VK_SUCCESS || done > submit_seq) done = 0;
+    if ((done = vk_timeline_value()) > submit_seq) done = 0;
     unsigned lo = ir_n > IR_N ? ir_n - IR_N : 0, n = 0;
     for (unsigned k = lo; k < ir_n; k++) n += ir_ring[k & (IR_N - 1)].seq > done;
     lost_report(done);
@@ -256,12 +256,10 @@ void vk_wait_seq(uint64_t seq) {
         }
         rec_wait_submitted(seq);
     }
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                              .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
     extern void rq_watch(const char *what, uint64_t arg);
     rq_watch("vkWaitSemaphores (GPU submission)", seq);
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r = vk_wait_timeline(seq, 10ull * 1000000000ull);
     rq_watch(NULL, 0);
     uint64_t waited = SDL_GetTicksNS() - t0;  // (the game thread's fence waits and the render thread's: atomic sums)
     __atomic_fetch_add(&stat_wait_ns, waited, __ATOMIC_RELAXED);
@@ -593,7 +591,7 @@ static void dl_note(const char *fmt, ...) {
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
 void vk_devlost_dump(void) {
     uint64_t done = 0;  // (the recorder's path comes here without ir_dump)
-    if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &done) != VK_SUCCESS || done > submit_seq) done = 0;
+    if ((done = vk_timeline_value()) > submit_seq) done = 0;
     lost_report(done);
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
@@ -695,7 +693,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     {   // (test) LARECOMP_TEST_LOST_REPORT=<submission>: what a device lost logs, without one
         static long at = -2;
         if (at == -2) at = ENV("LARECOMP_TEST_LOST_REPORT") ? atol(ENV("LARECOMP_TEST_LOST_REPORT")) : -1;
-        if (at > 0 && (long)subr_now.seq == at) { uint64_t d = 0; vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &d); lost_report(d); }
+        if (at > 0 && (long)subr_now.seq == at) lost_report(vk_timeline_value());
     }
     rec_QueueSubmit2(&si, submit_seq + 1);  // (the recorder: in order with the commands; its vkQueueSubmit2 time is in RecStats)
     pthread_mutex_lock(&seq_lock);

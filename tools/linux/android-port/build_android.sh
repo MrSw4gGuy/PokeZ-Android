@@ -16,6 +16,9 @@ say "sync the checkout"
 rsync -a --delete -c --exclude=.git --exclude=build --exclude=extracted --exclude=tools/venv --exclude='generated-*' "$SRC/" "$WORK/"
 cd "$WORK"
 
+say "libadrenotools (custom Vulkan drivers)"
+bash "$WORK/tools/linux/android-port/build_adrenotools.sh" | tail -2
+
 say "compile the runtime for Android"
 # -k so one pass reports every file bionic rejects, instead of stopping at the first
 make -k -j"$JOBS" PLATFORM=android DEPS="$P" runtime-objs > /root/android_rt.log 2>&1 || true

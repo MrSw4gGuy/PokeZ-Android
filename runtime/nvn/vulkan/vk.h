@@ -180,7 +180,18 @@ typedef struct {
     uint32_t rotate;                           // 0, 90, 180 or 270: the content's clockwise turn into the window image
     VkSurfaceTransformFlagBitsKHR sc_transform;  // the surface transform the swapchain was made for
     VkExtent2D win_extent;                     // the window images' size (sc_extent, turned when rotate is 90 / 270)
+    bool timeline_fences;  // submissions' completion tracked by a ring of fences, not the timeline (device.c: Turnip)
 } VkG;
+// The submissions the GPU has finished, and waiting for one (vkWaitSemaphores semantics: VK_SUCCESS / VK_TIMEOUT).
+// Normally the timeline semaphore each submission signals. On Turnip over KGSL the timeline is Mesa's emulated one:
+// signalling it from a submission takes its lock, which its waits hold while they sit in the kernel for the GPU - the
+// recorder spent ~1.5 s of every 2 s inside vkQueueSubmit2 and CPU and GPU no longer overlapped (simpleperf:
+// vk_sync_timeline_alloc_point -> mtx_lock; polling the value instead did not help). There each submission signals a
+// fence of a ring instead (vk_timeline_fence, from the recorder) and these read the fences.
+// LARECOMP_VK_TIMELINE_FENCES=0 / 1 overrides the driver-based choice.
+VkResult vk_wait_timeline(uint64_t value, uint64_t timeout_ns);
+uint64_t vk_timeline_value(void);       // the last submission done (VK_ERROR_DEVICE_LOST: UINT64_MAX)
+VkFence vk_timeline_fence(uint64_t seq);  // submission seq's fence (recorder, in order; waits for the slot's old one)
 void vk_log_memory(const char *why);  // (device.c: per-heap budget and use, at start and on allocation failures)
 extern VkG g_vk;
 
