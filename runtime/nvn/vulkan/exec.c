@@ -1586,7 +1586,9 @@ void vk_exec_init(void) {
     }
     extern bool maxwell_quad_control_ok, maxwell_quad_control_default;
     maxwell_quad_control_ok = g_vk.quad_control;  // (translate.c quad_control_on: full quads where the game derives itself)
-    maxwell_quad_control_default = g_vk.quad_control && g_vk.props.vendorID == 0x1002;
+    // (AMD, and Qualcomm's own Adreno driver, which has quad control: the iris in full quads, the lockstep below with it -
+    // 2026-11-11 on an Adreno 830, station at 60 fps: no hang, same GPU time. Turnip v39 has none: off there)
+    maxwell_quad_control_default = g_vk.quad_control && (g_vk.props.vendorID == 0x1002 || g_vk.props.vendorID == 0x5143);
     {
         const char *qc = getenv("LARECOMP_SHADER_QUAD_CONTROL");
         bool qc_on = g_vk.quad_control && (qc ? atoi(qc) != 0 : maxwell_quad_control_default);  // (as translate.c decides)

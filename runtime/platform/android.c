@@ -663,6 +663,11 @@ static int rm_entry(const char *path, const struct stat *sb, int flag, struct FT
 }
 bool plat_remove_tree(const char *dir) { return nftw(dir, rm_entry, 16, FTW_DEPTH | FTW_PHYS) == 0; }
 bool plat_onedrive_synced(const char *dir) { (void)dir; return false; }
+// (as linux.c: anything but a plain file or folder - the start screen strips links from imported saves and mods)
+bool plat_is_link(const char *path) {
+    struct stat st;
+    return lstat(path, &st) == 0 && !S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode);
+}
 
 void plat_terminate(void) { _exit(0); }
 
