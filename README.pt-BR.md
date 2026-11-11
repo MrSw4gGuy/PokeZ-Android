@@ -54,7 +54,7 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 |---|---|
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
-| Cenas da introdução, trem, Lumiose | Funciona: sem bugs visuais pesados (fora os olhos, abaixo), só o pop-in do próprio jogo |
+| Cenas da introdução, trem, Lumiose | Funciona, com o pop-in do próprio jogo; em Lumiose o jogo ainda pode parar com um erro de GPU (abaixo) |
 | Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch). 60 fps: 60 estáveis em cenas mais leves (a estação com pouca gente) com sombras a 50%; cenas cheias pedem cerca de 22-25 ms de GPU por quadro, então ali o **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e tenta 60 de novo depois das trocas de cena |
 | Textos e caixas de diálogo | Funciona |
 | Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
@@ -65,9 +65,14 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | Upscaling | Snapdragon Game Super Resolution (o upscaler da própria Qualcomm) por padrão; AMD FSR 1 e bilinear no menu |
 | DLC *Mega Dimension* | Ainda não testado |
 
-**Bugs visuais conhecidos** (em correção):
-- Alguns olhos aparecem errados: a íris desenhada em quadradinhos azuis e brancos, um retângulo escuro atrás do olho
-  de alguns Pokémon.
+**Bugs conhecidos** (em correção):
+- Lumiose: algum tempo depois de chegar, o jogo pode parar com "device lost" (a GPU desistiu). Alguns desenhos
+  indiretos leem os parâmetros quando a memória do jogo ali já tem outros dados. Acontece de vez em quando no driver
+  da Qualcomm e, até agora, sempre com um driver Turnip personalizado.
+- Criação de personagem: o corpo do personagem aparece cortado logo abaixo dos ombros.
+- Olhos: corrigidos no driver da Qualcomm desde o ZA Recomp v0.1.22 (a correção da íris precisa do quad control do
+  driver). Os drivers Turnip personalizados (v39, PurpleVK T30) não têm quad control, então a íris ainda aparece em
+  quadradinhos neles.
 - Faixas claras retas e fracas sobre rostos e corpos em algumas cenas de close (vistas numa run).
 - A imagem fica menos nítida quando o celular esquenta: a resolução baixa para segurar a temperatura (veja
   [Qualidade de imagem](#qualidade-de-imagem)).

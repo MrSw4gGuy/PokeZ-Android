@@ -54,7 +54,7 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 |---|---|
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
-| Intro cutscenes, train, Lumiose City | Works: no heavy visual bugs left (the eyes below), the game's own pop-in |
+| Intro cutscenes, train, Lumiose City | Works, with the game's own pop-in; Lumiose can still stop with a GPU error (below) |
 | Frame rate | A steady 30 fps (the game's own rate on the Switch). 60 fps: a steady 60 in lighter scenes (the station with few people) with 50% shadows; crowded scenes need a GPU time per frame of about 22-25 ms, so there **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and tries 60 again after scene changes |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
@@ -65,8 +65,13 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Upscaling | Snapdragon Game Super Resolution (Qualcomm's own upscaler) by default; AMD FSR 1 and bilinear in the menu |
 | *Mega Dimension* DLC | Not tested yet |
 
-**Known visual bugs** (being worked on):
-- Some eyes look wrong: the iris drawn as blue and white squares, a dark rectangle behind some Pokémon's eyes.
+**Known bugs** (being worked on):
+- Lumiose City: some time after arriving, the game can stop with "device lost" (the GPU gave up). Some indirect draws
+  read their parameters after the game's memory there already holds other data. It happens on Qualcomm's driver now
+  and then, and every time so far with a custom Turnip driver.
+- Character creation: the character's body is cut off just below the shoulders.
+- Eyes: fixed on Qualcomm's driver since ZA Recomp v0.1.22 (its iris fix needs the driver's quad control). Custom
+  Turnip drivers (v39, PurpleVK T30) have no quad control, so the iris still shows squares there.
 - Faint straight light strips over faces and bodies in some close-up cutscenes (seen in one run).
 - The picture is soft once the phone is hot: the resolution goes down to keep the temperature in check (see
   [Image quality](#image-quality)).
