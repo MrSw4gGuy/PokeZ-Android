@@ -128,24 +128,46 @@ static const char *driver_copy(const char *name, char *dir, size_t n, char *lib,
         LOG("[vk] driver %s: not in drivers/ (or no library in it)\n", name);
         return NULL;
     }
-    char src[1400], dst[1400];
-    snprintf(src, sizeof src, "%s/%s", sdir, lib);
     snprintf(dir, n, "%s/gpu_drivers", base);
     mkdir(dir, 0755);
     snprintf(dir, n, "%s/gpu_drivers/%s/", base, name);
     mkdir(dir, 0755);
-    snprintf(dst, sizeof dst, "%s%s", dir, lib);
-    struct stat ss, ds;
-    if (stat(src, &ss) != 0) return NULL;
-    if (stat(dst, &ds) == 0 && ds.st_size == ss.st_size) return dir;
-    int in = open(src, O_RDONLY), out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-    bool ok = in >= 0 && out >= 0;
-    char buf[1 << 16];
-    for (ssize_t r; ok && (r = read(in, buf, sizeof buf)) > 0;) ok = write(out, buf, (size_t)r) == r;
-    if (in >= 0) close(in);
-    if (out >= 0) close(out);
-    if (!ok) { LOG("[vk] driver %s: copying it to %s failed\n", name, dst); unlink(dst); return NULL; }
-    LOG("[vk] driver %s: %s copied into internal storage (%lld bytes)\n", name, lib, (long long)ss.st_size);
+    // Every .so of a package folder goes along: Qualcomm's own drivers packaged for adrenotools (StevenMXZ's v891.x,
+    // extracted from OEM firmware) are the library and its renamed helpers (vkbgsl.so, vkbllvm-qcom.so...), which the
+    // linker namespace finds beside it. A bare .so in drivers/ is copied alone.
+    bool pkg = strcmp(sdir + strlen(sdir) - 8, "/drivers") != 0;
+    DIR *dd = pkg ? opendir(sdir) : NULL;
+    struct dirent *e = NULL;
+    const char *f = lib;
+    for (;;) {
+        if (dd) {
+            while ((e = readdir(dd)) && !ends_with_so(e->d_name)) {}
+            if (!e) break;
+            f = e->d_name;
+        }
+        char src[1400], dst[1400];
+        snprintf(src, sizeof src, "%s/%s", sdir, f);
+        snprintf(dst, sizeof dst, "%s%s", dir, f);
+        struct stat ss, ds;
+        if (stat(src, &ss) != 0) { if (dd) closedir(dd); return NULL; }
+        if (!(stat(dst, &ds) == 0 && ds.st_size == ss.st_size)) {
+            int in = open(src, O_RDONLY), out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            bool ok = in >= 0 && out >= 0;
+            char buf[1 << 16];
+            for (ssize_t r; ok && (r = read(in, buf, sizeof buf)) > 0;) ok = write(out, buf, (size_t)r) == r;
+            if (in >= 0) close(in);
+            if (out >= 0) close(out);
+            if (!ok) {
+                LOG("[vk] driver %s: copying it to %s failed\n", name, dst);
+                unlink(dst);
+                if (dd) closedir(dd);
+                return NULL;
+            }
+            LOG("[vk] driver %s: %s copied into internal storage (%lld bytes)\n", name, f, (long long)ss.st_size);
+        }
+        if (!dd) break;
+    }
+    if (dd) closedir(dd);
     return dir;
 }
 
@@ -254,9 +276,10 @@ static bool elf_arm64(const unsigned char *b, size_t n) {
 static unsigned rd16(const unsigned char *p) { return p[0] | p[1] << 8; }
 static unsigned rd32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (unsigned)p[3] << 24; }
 
-// A zip's entry by name (its last path part, any case), inflated; NULL if absent or unreadable. so_any: the first .so
-// instead (a package without meta.json). Driver zips are a few MB: the whole archive is in memory already.
-static unsigned char *zip_get(const unsigned char *z, size_t zn, const char *want, bool so_any, size_t *outn,
+// A zip's entry by name (its last path part, any case), inflated; NULL if absent or unreadable. so_any > 0: the
+// so_any-th .so instead (1: the first - a package without meta.json; the rest: a package's helper libraries). Driver
+// zips are a few MB: the whole archive is in memory already.
+static unsigned char *zip_get(const unsigned char *z, size_t zn, const char *want, int so_any, size_t *outn,
                               char *got, size_t gn) {
     size_t eocd = (size_t)-1, stop = zn > 65557 ? zn - 65557 : 0;  // (the end record: last, after a comment of < 64 KB)
     for (size_t i = zn >= 22 ? zn - 21 : 0; i-- > stop;)
@@ -272,7 +295,7 @@ static unsigned char *zip_get(const unsigned char *z, size_t zn, const char *wan
         snprintf(name, sizeof name, "%.*s", (int)nl, (const char *)h + 46);
         cd += 46 + nl + el + cl;
         const char *leaf = strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
-        if (!*leaf || !(so_any ? ends_with_so(leaf) : !strcasecmp(leaf, want))) continue;
+        if (!*leaf || !(so_any ? ends_with_so(leaf) && --so_any == 0 : !strcasecmp(leaf, want))) continue;
         if (lo + 30 > zn || rd32(z + lo) != 0x04034b50) return NULL;
         size_t data = lo + 30 + rd16(z + lo + 26) + rd16(z + lo + 28);
         if (data + csz > zn || usz > (256u << 20)) return NULL;
@@ -342,13 +365,13 @@ bool plat_vk_driver_import(const char *src, char *msg, size_t mn) {
         safe_name(fname[0] ? fname : "driver", name, sizeof name);
         snprintf(lib, sizeof lib, "%s.so", name);
     } else if (n > 4 && rd32(f) == 0x04034b50) {
-        meta = zip_get(f, n, "meta.json", false, &metan, NULL, 0);
+        meta = zip_get(f, n, "meta.json", 0, &metan, NULL, 0);
         char want[256] = "", title[96] = "";
         if (meta) {
             json_str((const char *)meta, "libraryName", want, sizeof want);
             json_str((const char *)meta, "name", title, sizeof title);
         }
-        so = want[0] ? zip_get(f, n, want, false, &son, lib, sizeof lib) : zip_get(f, n, NULL, true, &son, lib, sizeof lib);
+        so = want[0] ? zip_get(f, n, want, 0, &son, lib, sizeof lib) : zip_get(f, n, NULL, 1, &son, lib, sizeof lib);
         if (!so) { snprintf(msg, mn, "%s", UI_TR("no driver library (.so) in this zip", "nenhuma biblioteca de driver (.so) neste zip")); goto done; }
         safe_name(title[0] ? title : fname[0] ? fname : "driver", name, sizeof name);
     } else {
@@ -366,6 +389,15 @@ bool plat_vk_driver_import(const char *src, char *msg, size_t mn) {
         mkdir(dir, 0755);
         snprintf(p, sizeof p, "%s/%s", dir, lib);
         ok = write_file(p, so, son);
+        // (the package's other libraries: Qualcomm's own drivers come with renamed helpers - driver_copy)
+        for (int k = 1; ok && f != so; k++) {
+            size_t hn = 0;
+            char hl[256];
+            unsigned char *h = zip_get(f, n, NULL, k, &hn, hl, sizeof hl);
+            if (!h) break;
+            if (strcmp(hl, lib) && elf_arm64(h, hn)) snprintf(p, sizeof p, "%s/%s", dir, hl), ok = write_file(p, h, hn);
+            free(h);
+        }
         snprintf(p, sizeof p, "%s/meta.json", dir);
         if (ok && meta) ok = write_file(p, meta, metan);
         else if (ok) {  // (a bare .so: a meta.json of our own, so every package has one)
