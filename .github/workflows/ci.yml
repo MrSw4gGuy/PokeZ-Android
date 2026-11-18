@@ -74,6 +74,10 @@ jobs:
         run: |
           clang -O2 -pthread tools/test_condvar.c -o build/test-condvar
           build/test-condvar
+      - name: Build threads (a waiting draw's build off the render thread; a compiler crash there survived, #251)
+        run: |
+          clang -std=gnu11 -O1 -pthread -Iruntime tools/test_build_threads.c -o build/test-build-threads
+          timeout 60 build/test-build-threads
       - name: Settings regression tests
         run: DEPS="$HOME/sdl3" python3 tools/test_settings.py
       - name: Game-files delete guard (links, outside the data folder)
@@ -90,8 +94,14 @@ jobs:
         run: |
           clang -std=gnu11 -O1 tools/test_update_marker.c -o build/test-update-marker
           build/test-update-marker
+      - name: Mystery Gift (BCAT delivery cache over a made-up folder, EventsGallery list parsing)
+        run: |
+          clang -std=gnu11 -O1 -Iruntime tools/test_bcat.c -o build/test-bcat -lpthread
+          build/test-bcat
       - name: Draw distance generator (synthetic scene parts)
         run: python3 tools/test_draw_dist.py
+      - name: Content generator (synthetic item, shop and evolution tables)
+        run: python3 tools/test_content_mod.py
       - name: Controller light colours
         run: |
           clang -std=gnu11 -O1 tools/test_led.c -lm -o build/test-led
@@ -104,10 +114,16 @@ jobs:
         run: |
           clang -std=gnu11 -O2 -I"$HOME/sdl3/include" tools/test_active_pad.c -L"$HOME/sdl3/lib" -Wl,-rpath,"$HOME/sdl3/lib" -lSDL3 -lm -o build/test-active-pad
           build/test-active-pad
+      - name: Battle moves by position, not while throwing a ball (#224)
+        run: |
+          clang -std=gnu11 -O2 -I"$HOME/sdl3/include" tools/test_battle_by_pos.c -L"$HOME/sdl3/lib" -Wl,-rpath,"$HOME/sdl3/lib" -lSDL3 -lm -o build/test-battle-by-pos
+          build/test-battle-by-pos
       - name: First start with an Xbox / PlayStation pad (virtual gamepads, #241)
         run: |
           clang -std=gnu11 -O2 -Iruntime -I"$HOME/sdl3/include" tools/test_first_start_pad.c -L"$HOME/sdl3/lib" -Wl,-rpath,"$HOME/sdl3/lib" -lSDL3 -lm -o build/test-first-start-pad
           build/test-first-start-pad
+      - name: Button prompt / HD pack texture names (#229)
+        run: python3 tools/test_pack_names.py
       - name: Vulkan fence sequence regression
         run: python3 tools/test_fence_sequence.py
       - name: Guest heap import on low-memory machines
@@ -187,6 +203,10 @@ jobs:
         run: |
           clang -O2 -pthread tools/test_condvar.c -o build/test-condvar.exe
           build/test-condvar.exe
+      - name: Build threads (a waiting draw's build off the render thread; a compiler crash there survived, #251)
+        run: |
+          clang -std=gnu11 -O1 -pthread -Iruntime tools/test_build_threads.c -o build/test-build-threads.exe
+          timeout 60 build/test-build-threads.exe
       - name: Controller rumble (HID bridge to SDL, fake gamepad)
         run: |
           clang -std=gnu11 -O2 $(pkg-config --cflags sdl3) tools/test_rumble.c $(pkg-config --libs sdl3) -o build/test-rumble.exe
@@ -197,16 +217,28 @@ jobs:
         run: |
           clang -std=gnu11 -O1 tools/test_update_marker.c -o build/test-update-marker.exe
           build/test-update-marker.exe
+      - name: Mystery Gift (BCAT delivery cache over a made-up folder, EventsGallery list parsing)
+        run: |
+          clang -std=gnu11 -O1 -Iruntime tools/test_bcat.c -o build/test-bcat.exe -lpthread
+          build/test-bcat.exe
       - name: Draw distance generator (synthetic scene parts)
         run: python tools/test_draw_dist.py
+      - name: Content generator (synthetic item, shop and evolution tables)
+        run: python tools/test_content_mod.py
       - name: Controller in use (two virtual gamepads, #455)
         run: |
           clang -std=gnu11 -O2 $(pkg-config --cflags sdl3) tools/test_active_pad.c $(pkg-config --libs sdl3) -o build/test-active-pad.exe
           build/test-active-pad.exe
+      - name: Battle moves by position, not while throwing a ball (#224)
+        run: |
+          clang -std=gnu11 -O2 $(pkg-config --cflags sdl3) tools/test_battle_by_pos.c $(pkg-config --libs sdl3) -o build/test-battle-by-pos.exe
+          build/test-battle-by-pos.exe
       - name: First start with an Xbox / PlayStation pad (virtual gamepads, #241)
         run: |
           clang -std=gnu11 -O2 -Iruntime $(pkg-config --cflags sdl3) tools/test_first_start_pad.c $(pkg-config --libs sdl3) -o build/test-first-start-pad.exe
           build/test-first-start-pad.exe
+      - name: Button prompt / HD pack texture names (#229)
+        run: python tools/test_pack_names.py
       - name: Vulkan fence sequence regression
         run: python tools/test_fence_sequence.py
       - name: Guest heap import on low-memory machines

@@ -23,7 +23,11 @@ extern "C" int launcher_maxlod_state(void);
 extern "C" bool g_maxlod_on;  // runtime/services/fs.c
 extern "C" void launcher_drawdist_kick(void);  // F1 > Draw distance (#190)
 extern "C" int launcher_drawdist_state(void);
+extern "C" int mystery_gift_support(void);  // runtime/hle/mystery_gift.c: 1 this game version can, 0 it cannot, -1 no game loaded
 extern "C" bool g_drawdist_on;
+extern "C" void launcher_content_kick(void);  // F1 > Content
+extern "C" int launcher_content_state(void);
+extern "C" bool g_content_on;
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -46,6 +50,7 @@ extern "C" SDL_Window *ui_window(void);       // device.c: the window (the drive
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../bugrec.h"
 extern int g_game_is_la;  // runtime/kernel.c: Link's Awakening (its own tabs: randomizer, warp, cheats...)
 #include "menu.h"
 void input_reset(void);
@@ -700,6 +705,16 @@ static void tab_display(bool in_game) {
                   "ultrawide. Original 16:9: the game's own framing, with bars.",
                   "Livre: a imagem ocupa a janela toda, então janelas mais largas (ou mais altas) mostram mais do mundo "
                   "- até ultrawide. 16:9 original: o enquadramento do próprio jogo, com barras."));
+    if (!la && g_settings.aspect == ASPECT_UNLOCKED)  // (Pokémon Z-A: its HUD is boxed 16:9 - vulkan/exec.c moves it out)
+        opt_int(TR("HUD width", "Largura do HUD"), &g_settings.hud_width, 0, 100, 10, 0, "%d%%",
+                TR("In a window wider than 16:9: how far the HUD's corners move out towards the window's sides. 16:9: "
+                   "the HUD as the game lays it out, in the middle. 100%: at the window's edges. Menus stay in the middle. "
+                   "Markers over characters and places near the sides (name tags, quest markers) move with the HUD.",
+                   "Numa janela mais larga que 16:9: quanto os cantos do HUD se afastam para os lados da janela. 16:9: "
+                   "o HUD como o jogo o dispõe, no meio. 100%: nas bordas da janela. Os menus ficam no meio. "
+                   "Marcadores sobre personagens e lugares perto das laterais (nomes, marcadores de missão) se movem "
+                   "com o HUD."),
+                "16:9");
     bool fs = g_settings.fullscreen;
     if (opt_toggle(TR("Fullscreen", "Tela cheia"), &fs, false,
                    TR("Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.", "Ocupa a tela toda. Também: F11, Alt+Enter ou Cmd+Ctrl+F."))) {
@@ -745,11 +760,13 @@ static void tab_display(bool in_game) {
                 g_settings.fps60_lock = !fall;
             ImGui::EndDisabled();
             opt_toggle(TR("Constant game speed", "Velocidade constante"), &g_settings.frame_dt, true,
-                       TR("The world runs at the same speed at any frame rate: the game's step comes from the time that "
-                          "really passed, so 50 fps plays at full speed, not in slow motion. Off: the game's own step - "
-                          "below the chosen rate everything moves in slow motion. Applies from the next frame.",
-                          "O mundo roda na mesma velocidade em qualquer taxa de quadros: o passo do jogo vem do tempo que "
-                          "realmente passou, então 50 fps joga em velocidade normal, não em câmera lenta. Desligado: o "
+                       TR("The world runs at the same speed from 30 to 60 fps: the game's step comes from the time that "
+                          "really passed, so 50 fps plays at full speed, not in slow motion. Below 30 fps it slows down, "
+                          "as on the Switch (bigger steps make dash moves miss). Off: the game's own step - below the "
+                          "chosen rate everything moves in slow motion. Applies from the next frame.",
+                          "O mundo roda na mesma velocidade de 30 a 60 fps: o passo do jogo vem do tempo que realmente "
+                          "passou, então 50 fps joga em velocidade normal, não em câmera lenta. Abaixo de 30 fps fica "
+                          "mais lento, como no Switch (passos maiores fazem golpes de investida errarem). Desligado: o "
                           "passo do próprio jogo - abaixo da taxa escolhida tudo fica em câmera lenta. Vale a partir do "
                           "próximo quadro."));
             opt_toggle(TR("Smooth distant animation", "Animação suave à distância"), &g_settings.smooth_anim, true,
@@ -1523,6 +1540,58 @@ static void tab_online(void) {
     opt_disable_next();
     opt_action(TR("Status", "Situação"), st, why, false);
     (void)peers;
+    // Mystery Gift without Nintendo's servers (runtime/services/bcat.c, mystery_gift_cards.c, hle/mystery_gift.c)
+    opt_section(TR("Mystery Gift", "Presente Misterioso"));
+    if (mystery_gift_support() == 0) {  // (#316: a version whose login step isn't found would crash there)
+        opt_disable_next();
+        bool off = false;
+        opt_toggle(TR("Get via Internet", "Receber pela internet"), &off, false,
+                   TR("Not available for this version of the game yet. The game sees no internet connection (as before).",
+                      "Ainda não disponível nesta versão do jogo. O jogo não vê conexão com a internet (como antes)."));
+    } else {
+        opt_toggle(TR("Get via Internet", "Receber pela internet"), &g_settings.mystery_gift, false,
+                   TR("Link Play > Mystery Gift > Get via Internet lists every gift in Project Pokémon's EventsGallery, past "
+                      "and present, downloaded to this PC (cache/mystery_gift); nothing goes to Nintendo. Off: the game sees "
+                      "no internet connection (as before).",
+                      "Modo Conexão > Presente Misterioso > Receber pela internet lista todos os presentes do EventsGallery "
+                      "do Project Pokémon, antigos e atuais, baixados neste PC (cache/mystery_gift); nada vai para a "
+                      "Nintendo. Desligado: o jogo não vê conexão com a internet (como antes)."));
+    }
+    opt_end();
+}
+
+// Content the console only hands out through Nintendo's servers, made available in the game itself
+// (tools/za/content_mod.py on the player's own files: runtime/ui/launcher.mm launcher_content_kick, runtime/services/fs.c)
+static void tab_content(bool in_game) {
+    opt_begin("##content", ImGui::GetFontSize() / 34);
+    bool stones = g_settings.content_stones, trade = g_settings.content_trade;
+    opt_section(TR("Online-only content", "Conteúdo só online"));
+    opt_toggle(TR("Ranked Mega Stones in the shop", "Megapedras das ranqueadas na loja"), &g_settings.content_stones, false,
+               TR("Greninjite, Delphoxite, Chesnaughtite, Baxcalibrite, Sceptilite, Swampertite and Blazikenite are only "
+                  "given as Ranked Battle rewards, which need Nintendo's servers. On: Quasartico Inc.'s Mega Shard "
+                  "exchange sells them from the day it opens, 360 Mega Shards each. Made from your own game files; "
+                  "applies from the next start.",
+                  "Greninjite, Delphoxite, Chesnaughtite, Baxcalibrite, Sceptilite, Swampertite e Blazikenite só são "
+                  "dadas como recompensa das Batalhas Ranqueadas, que precisam dos servidores da Nintendo. Ligado: a "
+                  "troca de Megafragmentos da Quasartico Inc. vende todas desde que abre, por 360 Megafragmentos cada. "
+                  "Feito a partir dos seus arquivos do jogo; vale a partir da próxima abertura."));
+    opt_toggle(TR("Trade evolutions without trading", "Evoluções por troca sem trocar"), &g_settings.content_trade, false,
+               TR("Pokémon that evolve when traded (Kadabra, Haunter, Machoke, Phantump, Pumpkaboo...) also evolve at "
+                  "level 40; those that evolve when traded holding an item (Onix and Scyther with a Metal Coat, "
+                  "Slowpoke with a King's Rock...) can evolve while holding it: the evolve icon appears, day or night. "
+                  "After the \"No More Trade Evolutions\" mod's rules. Trading still works. Made from your own game "
+                  "files; applies from the next start.",
+                  "Pokémon que evoluem por troca (Kadabra, Haunter, Machoke, Phantump, Pumpkaboo...) também evoluem no "
+                  "nível 40; os que evoluem por troca segurando um item (Onix e Scyther com Revestimento Metálico, "
+                  "Slowpoke com Pedra do Rei...) podem evoluir segurando o item: o ícone de evolução aparece, de dia ou "
+                  "de noite. Segue as regras do mod \"No More Trade Evolutions\". A troca continua funcionando. Feito "
+                  "a partir dos seus arquivos do jogo; vale a partir da próxima abertura."));
+    if (stones != g_settings.content_stones || trade != g_settings.content_trade) settings_save(), launcher_content_kick();
+    int st = launcher_content_state();
+    if ((g_settings.content_stones || g_settings.content_trade) && st == 1)
+        ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s", TR("Preparing...", "Preparando..."));
+    else if ((g_settings.content_stones || g_settings.content_trade) && st == 2 && in_game && !g_content_on)
+        ImGui::TextDisabled("%s", TR("Ready: applies from the next start.", "Pronto: vale a partir da próxima abertura."));
     opt_end();
 }
 
@@ -1540,6 +1609,13 @@ static void tab_game(void) {
                       "Start Screen, then Play. (A translation mod, like a PT-BR one, goes in Mods on the start screen.)",
                       "O idioma dos textos do jogo, como a configuração do próprio sistema. Vale quando o jogo reinicia: "
                       "Sair > Tela inicial, depois Jogar. (Um mod de tradução, como o PT-BR, vai em Mods na tela inicial.)"));
+    }
+    if (bugrec_active()) {  // (recording for a bug report, runtime/bugrec.c: F8's mark for controller players)
+        opt_section(TR("Bug report", "Relatar um bug"));
+        if (opt_button(TR("Mark the bug now", "Marcar o bug agora"),
+                       TR("The replay stops here (F8 does the same). Then close the game: the zip is in the bug-reports folder.",
+                          "A reprodução para aqui (F8 faz o mesmo). Depois feche o jogo: o zip fica na pasta bug-reports.")))
+            bugrec_mark();
     }
     opt_section(TR("This menu", "Este menu"));
     opt_button(TR("Shortcuts", "Atalhos"),
@@ -1732,9 +1808,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     if (prelaunch) tabs[ntabs++] = {TR("Files", "Arquivos"), -1, true};
     if (!menu_la_tabs) {
         const char *names[] = {TR("Controls", "Controles"), TR("Video", "Vídeo"), TR("Audio", "Áudio"), TR("Game", "Jogo"),
-                               "Online", TR("Quit", "Sair")};
-        static const int ids[] = {8, 0, 1, 10, 11, 9};
-        for (int i = 0; i < 6; i++)
+                               TR("Content", "Conteúdo"), "Online", TR("Quit", "Sair")};
+        static const int ids[] = {8, 0, 1, 10, 12, 11, 9};
+        for (int i = 0; i < 7; i++)
             if ((ids[i] != 9 || !prelaunch) && (ids[i] != 11 || in_game)) tabs[ntabs++] = {names[i], ids[i], true};
     } else {
         static const char *names[] = {"Video", "Audio", "Save Editor", "Randomizer", "Warp", "Cheats", "Gameplay",
@@ -1900,6 +1976,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 9: tab_quit(scale, in_game); break;
                 case 10: tab_game(); break;
                 case 11: tab_online(); break;
+                case 12: tab_content(in_game); break;
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
                 if (scroll_test) ImGui::SetScrollY(ImGui::GetScrollMaxY() * (float)atof(scroll_test));

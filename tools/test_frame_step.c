@@ -3,10 +3,12 @@
 // rt_za_frame_step for each of its 11 clock channels. #179 #188:
 //  - below 60 fps (the mode flipping frame by frame) channel 0 - the player's - gets the world's ticks (channel 1's):
 //    v0.1.20 held one back at every switch into the 30 fps mode and never gave it back (16% slow at ~47 fps);
-//  - the first 30 fps frame after a 60 fps one still gives channel 0 one tick (two left the player stuck after a roll);
+//  - channel 0's step changes seldom (#237: one / two ticks changing every frame or two left the player stuck after a
+//    roll - it goes in runs instead);
 //  - game code without the per-channel hook never runs the per-frame mode (1.0.0 / 2.0.0 before the recompile).
 // Built by tools/test_frame_step.py; no game data.
 #include <assert.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,12 +25,21 @@ Settings g_settings;
 uint64_t renderer_present_count(void) { return 0; }
 uint64_t renderer_shader_builds(void) { return 0; }
 void menu_notice(const char *text, int seconds) { (void)text; (void)seconds; }
+// (the clock set function's override: no guest here - cases 1-3 run channel 0 in runs, case 4 drives ch0_duration)
+Cpu *kernel_current_cpu(void) { return NULL; }
+GuestFn dispatch_lookup(uint64_t addr) { (void)addr; return NULL; }
+void hle_override(uint64_t guest_addr, HostFn fn, const char *name) { (void)guest_addr; (void)fn; (void)name; }
+void guest_call(Cpu *c, uint64_t addr) { (void)c; (void)addr; }
+uint8_t g_main_build_id[8];  // (the smooth-animation policies: not 2.0.2 here, never installed)
+int g_nmodules;
+Module g_modules[6];
 
 static int frames_30;  // (frames run in the game's 30 fps mode)
 // One game frame of ms milliseconds: the frame clock's three calls; ticks[] += what each channel was handed (+1: a
 // channel's step n is n + 1 ticks). hook: the game code has the per-channel call (FRAME_STEP).
-static void frame(double ms, bool hook, uint64_t ticks[11], int *first_30_ch0) {
-    static bool prev30;
+static int ch0_changes;  // (frames where channel 0's step differs from the frame before)
+static void frame(double ms, bool hook, uint64_t ticks[11]) {
+    static uint32_t prev_ch0;
     now_ns += (uint64_t)(ms * 1e6);
     g_vsync_count += (uint64_t)(ms / 16.6667 + 0.5);
     rt_za_frame_dt(16666667);
@@ -39,9 +50,8 @@ static void frame(double ms, bool hook, uint64_t ticks[11], int *first_30_ch0) {
         uint32_t game_step = in30 ? 1 : 0;  // (what the game itself hands a channel in that mode)
         uint32_t s = hook ? rt_za_frame_step(game_step, ch) : game_step;
         ticks[ch] += s + 1;
-        if (ch == 0 && in30 && !prev30 && first_30_ch0) *first_30_ch0 = s + 1 > *first_30_ch0 ? (int)(s + 1) : *first_30_ch0;
+        if (ch == 0) ch0_changes += s != prev_ch0, prev_ch0 = s;
     }
-    prev30 = in30;
 }
 
 int main(int argc, char **argv) {
@@ -49,26 +59,68 @@ int main(int argc, char **argv) {
     g_settings.frame_dt = true, g_settings.fps60 = true, g_settings.fps60_lock = true;
     int which = argc > 1 ? atoi(argv[1]) : 1;
     uint64_t t[11] = {0};
-    int first30 = 0;
     if (which == 1) {  // ~45 fps for 3000 frames with the hook: the mode flips, channel 0 keeps the world's pace
-        for (int i = 0; i < 3000; i++) frame(22.2, true, t, &first30);
+        for (int i = 0; i < 3000; i++) frame(22.2, true, t);
         double drift = (double)t[0] / (double)t[1], tps = (double)t[1] / 66.6;  // (3000 x 22.2 ms of game time)
-        printf("hook, ~45 fps: %d of 3000 frames in the 30 fps mode; ticks channel 0 %llu, channel 1 %llu (%.3f); the "
-               "first 30 fps frame gives channel 0 %d tick(s); world %.1f ticks/s\n", frames_30, (unsigned long long)t[0],
-               (unsigned long long)t[1], drift, first30, tps);
+        printf("hook, ~45 fps: %d of 3000 frames in the 30 fps mode; ticks channel 0 %llu, channel 1 %llu (%.3f); "
+               "channel 0's step changed on %d frames; world %.1f ticks/s\n", frames_30, (unsigned long long)t[0],
+               (unsigned long long)t[1], drift, ch0_changes, tps);
         assert(frames_30 > 300);               // (the per-frame mode ran)
         assert(drift > 0.97 && drift < 1.03);  // (v0.1.20's rule: ~0.84)
-        assert(first30 == 1);                  // (two ticks there: the stuck-after-a-roll)
+        assert(ch0_changes < 3000 / 6);        // (runs: every frame or two got the player stuck after a roll, #237)
         assert(tps > 55 && tps < 65);          // (the world at full speed)
     } else if (which == 2) {  // game code without the hook: the per-frame mode never runs
-        for (int i = 0; i < 600; i++) frame(22.2, false, t, NULL);
+        for (int i = 0; i < 600; i++) frame(22.2, false, t);
         printf("no hook, ~45 fps: %d of 600 frames in the 30 fps mode\n", frames_30);
         assert(frames_30 <= 2);  // (the first frames, before the hook's absence is known)
+    } else if (which == 4 || which == 5) {  // channel 0's smooth duration (#224): ~33 fps / 60 fps (=6, smooth always)
+        g_ch_set_hooked = true;  // (as if the set function had been recognised)
+        if (which == 5) setenv("LARECOMP_DYN_CH0", "6", 1);  // (by default 60 fps goes in runs: one tick, the same)
+        double ms = which == 4 ? 30.0 : 16.6667, sum = 0, world = 0, prev = 0, jump = 0;
+        int n = which == 4 ? 3000 : 600, exact = 0;
+        for (int i = 0; i < n; i++) {
+            frame(ms, true, t);
+            assert(g_ch0_smooth || i < 200);  // (=7: smooth once the average says below ~40 fps)
+            if (!g_ch0_smooth) continue;      // (not yet: the frames before don't count)
+            double d = (double)ch0_duration(g_ch0_world);
+            sum += d, world += g_ch0_world * 16666667.0;
+            if (i > 230 && fabs(d - prev) > jump) jump = fabs(d - prev);  // (after the switch to smooth: =7)
+            exact += d == 16666667.0;
+            prev = d;
+        }
+        printf("smooth channel 0, %.1f ms frames: %.3f s (world %.3f s), largest change between frames %.2f ms, "
+               "%d of %d frames exactly one tick\n", ms, sum / 1e9, world / 1e9, jump / 1e6, exact, n);
+        assert(fabs(sum - world) < 0.1e9);  // (the world's time, within what is still owed)
+        if (which == 4) assert(jump < 0.5 * 16666667.0);  // (never a whole tick from one frame to the next)
+        else assert(exact == n);  // (60 fps: the game's own 16,666,667 ns every frame, as before)
     } else if (which == 3) {  // 60 fps: nothing changes - one tick a frame everywhere, never the 30 fps mode
-        for (int i = 0; i < 600; i++) frame(16.6667, true, t, NULL);
+        for (int i = 0; i < 600; i++) frame(16.6667, true, t);
         printf("hook, 60 fps: %d frames in the 30 fps mode; ticks channel 0 %llu, channel 1 %llu\n", frames_30,
                (unsigned long long)t[0], (unsigned long long)t[1]);
         assert(frames_30 <= 5 && t[0] == t[1]);
+    } else if (which == 6) {  // below 30 fps (#222): never more than two ticks a frame - a dash passed through its target
+        setenv("LARECOMP_FPS", "30", 1);
+        g_settings.fps60 = false;
+        uint64_t most = 0;
+        for (int i = 0; i < 600; i++) {
+            now_ns += i % 50 == 49 ? 300000000ull : 0;  // (now and then a stall, as on a laptop paging memory)
+            uint64_t before[11];
+            memcpy(before, t, sizeof before);
+            frame(i % 2 ? 50.0 : 40.9, true, t);  // (~22 fps: steps 1 and 2 by turns before the cap)
+            for (int ch = 0; ch < 11; ch++) if (t[ch] - before[ch] > most) most = t[ch] - before[ch];
+        }
+        printf("hook, ~22 fps in the 30 fps mode: at most %llu ticks a frame on any channel\n", (unsigned long long)most);
+        assert(most == 2);  // (the game's own 30 fps frame; v0.1.24's catch-up handed up to 5)
+    } else if (which == 7) {  // ~50 fps (#309): channel 0 in whole ticks, in runs - a ladder's top is never missed
+        g_ch_set_hooked = true;
+        int smooth = 0;
+        for (int i = 0; i < 3000; i++) frame(20.0, true, t), smooth += g_ch0_smooth;
+        double drift = (double)t[0] / (double)t[1];
+        printf("hook, ~50 fps: %d of 3000 frames smooth; ticks channel 0 %llu, channel 1 %llu (%.3f); channel 0's step "
+               "changed on %d frames\n", smooth, (unsigned long long)t[0], (unsigned long long)t[1], drift, ch0_changes);
+        assert(smooth == 0);                   // (v0.1.24: every frame - stuck at the top of a ladder)
+        assert(drift > 0.97 && drift < 1.03);  // (the world's pace)
+        assert(ch0_changes < 3000 / 6);        // (runs, #237)
     }
     printf("ok\n");
     return 0;

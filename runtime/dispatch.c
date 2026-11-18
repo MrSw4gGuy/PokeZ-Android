@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@ static int hle_count;
 // Overrides of recompiled guest functions (by address)
 #define MAX_OVERRIDE 1024
 static struct { uint64_t addr; HostFn fn; const char *name; } overrides[MAX_OVERRIDE];
+static _Atomic unsigned g_dcache_gen;  // (bumped by hle_override: every thread's dispatch cache is dropped - rt_dispatch)
 static int override_count;
 
 // Host implementations registered by name (runtime/hle/*.c fill this via HLE_FUNC)
@@ -79,6 +81,7 @@ void hle_override(uint64_t addr, HostFn fn, const char *name) {
     overrides[override_count].fn = fn;
     overrides[override_count].name = name;
     override_count++;
+    atomic_fetch_add(&g_dcache_gen, 1);  // (every thread drops what it cached: rt_dispatch)
 }
 
 static __thread uint64_t unimpl_pc;
@@ -155,6 +158,11 @@ GuestFn dispatch_lookup(uint64_t addr) {
 // Small direct-mapped cache in front of the binary search
 #define DCACHE 4096
 static __thread struct { uint64_t addr; GuestFn fn; } dcache[DCACHE];
+// An override installed after a function's first call (the clock's channel getter, framepace.c: found from the game's
+// own frame loop, long after its first use) was never seen by a thread that had it cached. hle_override bumps the
+// generation, and a thread whose cache is older empties it at its next dispatch (one load of a line nothing writes
+// while playing).
+static __thread unsigned t_dcache_gen;  // (g_dcache_gen: with the overrides, above)
 
 // Guest setjmp sites of this thread (cpu.h RtJmp): one per guest jmp_buf, the oldest replaced when full
 #define NJMP 32
@@ -187,10 +195,15 @@ RtJmp *rt_setjmp_site(Cpu *c, uint64_t ret) {
 // the step's last call: + 0x98, the same in both builds) waits for the store and is made by the store's thread right
 // after it stores. LARECOMP_BOOT_DELEGATE_DEFER=0: the old 30 s wait. LARECOMP_TEST_STORE_LATE=<ms> (test): the store
 // waits that long before storing, so the call comes first.
-typedef struct { uint8_t id[8]; uint64_t obj, set, use; } BootDelegate;
+// 1.0.0 (main 7222E13ECF6ADB32) has the same race: #276 crashed at "host pc 0", lr 7000480c50 = f_7000480c18+0x38 with
+// x0 = 7005f0f5c0 (the object + 0xc0). The store is f_7000a3e9bc (the twin of 2.0.0's f_7000ac2a2c, line for line:
+// object 0x7005f0f500, ready flag +0x140, delegate +0xc0) and the step is f_7000480b9c, which ends in a tail call of
+// the delegate's call f_7000480c18 (+0x7c here: 1.0.0's step makes one call less). Both reached only through pointers.
+typedef struct { uint8_t id[8]; uint64_t obj, set, use, call; } BootDelegate;  // (call: the delegate's call, from use)
 static const BootDelegate boot_delegates[] = {
-    {{0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69}, 0x7006109cc0ull, 0x7000ac2a2cull, 0x7000bbb0dcull},  // 2.0.0
-    {{0xB1, 0xF1, 0x2F, 0xD9, 0x19, 0xEA, 0xE8, 0x6A}, 0x700610ecc0ull, 0x7000ac321cull, 0x7000bb9cccull},  // 2.0.2
+    {{0x72, 0x22, 0xE1, 0x3E, 0xCF, 0x6A, 0xDB, 0x32}, 0x7005f0f500ull, 0x7000a3e9bcull, 0x7000480b9cull, 0x7c},  // 1.0.0
+    {{0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69}, 0x7006109cc0ull, 0x7000ac2a2cull, 0x7000bbb0dcull, 0x98},  // 2.0.0
+    {{0xB1, 0xF1, 0x2F, 0xD9, 0x19, 0xEA, 0xE8, 0x6A}, 0x700610ecc0ull, 0x7000ac321cull, 0x7000bb9cccull, 0x98},  // 2.0.2
 };
 static const BootDelegate *g_bd;  // (this game's entry: boot_delegate_build)
 // (a step call that went on without its delegate: running it, or its delegate's call waiting for the store)
@@ -200,6 +213,7 @@ static pthread_mutex_t g_bd_lock = PTHREAD_MUTEX_INITIALIZER;
 #define BOOT_DELEGATE_OBJ GUEST_REBASE(g_bd->obj)  // (desktop addresses, moved with the window: rt.h)
 #define BOOT_DELEGATE_SET GUEST_REBASE(g_bd->set)
 #define BOOT_DELEGATE_USE GUEST_REBASE(g_bd->use)
+#define BOOT_DELEGATE_CALL GUEST_REBASE(g_bd->use + g_bd->call)
 #define BOOT_OBJ_READY ((volatile uint32_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x140))
 #define BOOT_OBJ_DONE ((volatile uint8_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0x100))
 #define BOOT_OBJ_FN ((volatile uint64_t *)(uintptr_t)(BOOT_DELEGATE_OBJ + 0xc0 + 0x20))
@@ -234,6 +248,10 @@ static void boot_delegate_set(Cpu *c) {
         pthread_detach(t);
     }
     LOG("[boot] step store: object ready %u, delegate %llx\n", *BOOT_OBJ_READY, (unsigned long long)*BOOT_OBJ_FN);
+    if (getenv("LARECOMP_TEST_NULL_GETTER")) {  // (test, #274: the listed getter called with no object, here, once)
+        extern bool rt_null_getter_test(Cpu *c);
+        rt_null_getter_test(c);
+    }
     if (!*BOOT_OBJ_READY && boot_wait_on()) boot_wait("the object", BOOT_OBJ_READY, NULL, 30000000000ull);
     const char *sl = getenv("LARECOMP_TEST_STORE_LATE");
     if (sl) plat_sleep_until_ns(plat_now_ns() + (uint64_t)atoll(sl) * 1000000);
@@ -247,14 +265,14 @@ static void boot_delegate_set(Cpu *c) {
         uint64_t ret = c->x[0];  // (the store's own result, 1)
         LOG("[boot] the delegate stored after its step: called now, on the storing thread\n");
         c->x[0] = BOOT_DELEGATE_OBJ;
-        dispatch_lookup(BOOT_DELEGATE_USE + 0x98)(c);
+        dispatch_lookup(BOOT_DELEGATE_CALL)(c);
         c->x[0] = ret;
     }
 }
 static void boot_delegate_use(Cpu *c) {
     LOG("[boot] step call: object ready %u, delegate %llx, done %u\n", *BOOT_OBJ_READY, (unsigned long long)*BOOT_OBJ_FN, *BOOT_OBJ_DONE);
     const char *df = getenv("LARECOMP_BOOT_DELEGATE_DEFER"), *wm = getenv("LARECOMP_BOOT_DELEGATE_WAIT_MS");
-    bool defer = !(df && !atoi(df)) && dispatch_lookup(BOOT_DELEGATE_USE + 0x98);
+    bool defer = !(df && !atoi(df)) && dispatch_lookup(BOOT_DELEGATE_CALL);
     uint64_t wait_ns = defer ? (uint64_t)(wm ? atoll(wm) : 2000) * 1000000 : 30000000000ull;
     if (!*BOOT_OBJ_DONE && !*BOOT_OBJ_FN && boot_wait_on()) boot_wait("the delegate", NULL, BOOT_OBJ_FN, wait_ns);
     // (LARECOMP_TEST_DELEGATE_LATE=1, test: the delegate reads as not stored here - the step without it, then its call)
@@ -276,8 +294,44 @@ static void boot_delegate_use(Cpu *c) {
     if (now) {
         LOG("[boot] the delegate was stored during the step: called now\n");
         c->x[0] = BOOT_DELEGATE_OBJ;
-        dispatch_lookup(BOOT_DELEGATE_USE + 0x98)(c);
+        dispatch_lookup(BOOT_DELEGATE_CALL)(c);
     }
+}
+
+// The same kind of start-up race elsewhere: a step reached only through a pointer that reads a global object without
+// checking its ready flag - when the flag is 0 the game's own code picks address 0 + field, a sure crash. #271 (2.0.2,
+// a first start with 158 s of shader preparation): f_7002c209d8+0x14c reads [0x700610db00 + 0xd0] behind the flag at
+// +0x100 and crashed "accessing 0xd0" right after the boot delegate's store. The step waits for the flag here (up to
+// 30 s; then it runs as before). LARECOMP_BOOT_READY_WAIT=0: no wait.
+typedef struct { uint8_t id[8]; uint64_t fn, flag; } ReadyWait;
+static const ReadyWait ready_waits[] = {
+    {{0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69}, 0x7002c1e578ull, 0x7006108b00ull + 0x100},  // 2.0.0 (its twin)
+    {{0xB1, 0xF1, 0x2F, 0xD9, 0x19, 0xEA, 0xE8, 0x6A}, 0x7002c209d8ull, 0x700610db00ull + 0x100},  // 2.0.2
+};
+static const ReadyWait *g_rw;
+static int g_rw_known;  // (0 not looked up yet, 1 this build has one, -1 none)
+static bool ready_wait_build(void) {
+    if (!g_rw_known) {
+        g_rw_known = -1;
+        if (!g_game_is_la)
+            for (size_t i = 0; i < sizeof ready_waits / sizeof *ready_waits; i++)
+                if (!memcmp(g_main_build_id, ready_waits[i].id, 8)) g_rw = &ready_waits[i], g_rw_known = 1;
+    }
+    return g_rw_known > 0;
+}
+static void ready_wait_step(Cpu *c) {
+    volatile uint32_t *flag = (volatile uint32_t *)(uintptr_t)GUEST_REBASE(g_rw->flag);  // (desktop addresses, moved with the window: rt.h)
+    static _Atomic int seen;
+    if (!seen++) LOG("[boot] step %llx: its object ready %u\n", (unsigned long long)g_rw->fn, *flag);
+    if (!*flag && boot_wait_on()) {
+        const char *e = getenv("LARECOMP_BOOT_READY_WAIT");
+        if (!(e && !atoi(e))) {
+            LOG("[boot] step %llx before its object (%llx) is ready: waiting for it (#271)\n", (unsigned long long)g_rw->fn,
+                (unsigned long long)(g_rw->flag - 0x100));
+            boot_wait("the object", flag, NULL, 30000000000ull);
+        }
+    }
+    dispatch_lookup(GUEST_REBASE(g_rw->fn))(c);
 }
 
 static bool mod_blank(uint64_t pc) {  // (inside a code mod, and its image's word there is 0: nothing written yet)
@@ -287,10 +341,43 @@ static bool mod_blank(uint64_t pc) {  // (inside a code mod, and its image's wor
     return false;
 }
 
+// Mystery Gift diagnostics: once the game goes online for it (misc.c nifm_online), every main-module function first
+// reached through a pointer (a cache miss here) is written to logs/mystery_gift_trace.log with its caller - the steps
+// of the game's connection sequence, in order. Off otherwise; at most 20000 lines.
+volatile int g_mg_trace;  // (misc.c: set when the connection is first reported)
+static FILE *g_mg_f;
+static int g_mg_lines;
+static void mg_open(void) { if (!g_mg_f) g_mg_f = fopen("logs/mystery_gift_trace.log", "w"); }
+void mg_calls_mark(const char *what);  // (fnprof.c)
+void mg_trace_mark(const char *what) {  // (bcat.c, misc.c: what the services saw, between the calls)
+    if (!g_mg_trace) return;
+    mg_calls_mark(what);
+    mg_open();
+    if (g_mg_f) { fprintf(g_mg_f, "---- %s\n", what); fflush(g_mg_f); }
+}
+static void mg_trace(Cpu *c, uint64_t pc) {
+    static uint64_t seen[1 << 15][2];
+    if (!g_nmodules || pc < g_modules[0].base || pc >= g_modules[0].base + g_modules[0].size || g_mg_lines >= 60000) return;
+    uint64_t lr = c->x[30];
+    unsigned h = (unsigned)(((pc >> 2) ^ (lr * 0x9E3779B1u)) * 2654435761u) & ((1 << 15) - 1);
+    for (unsigned i = 0; i < 64; i++, h = (h + 1) & ((1 << 15) - 1)) {
+        if (seen[h][0] == pc && seen[h][1] == lr) return;
+        if (!seen[h][0]) { seen[h][0] = pc, seen[h][1] = lr; break; }
+    }
+    mg_open();
+    if (!g_mg_f) return;
+    uint64_t b = g_modules[0].base, e = b + g_modules[0].size;
+    fprintf(g_mg_f, "main+%llx <- %s%llx  x0=%llx x1=%llx\n", (unsigned long long)(pc - b), lr >= b && lr < e ? "main+" : "",
+            (unsigned long long)(lr >= b && lr < e ? lr - b : lr), (unsigned long long)c->x[0], (unsigned long long)c->x[1]);
+    if (++g_mg_lines % 64 == 0) fflush(g_mg_f);
+}
+
 __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
+    if (g_mg_trace) mg_trace(c, pc);
     if (boot_delegate_build() && pc == BOOT_DELEGATE_SET) return boot_delegate_set;
     if (boot_delegate_build() && pc == BOOT_DELEGATE_USE) return boot_delegate_use;
+    if (ready_wait_build() && pc == GUEST_REBASE(g_rw->fn)) return ready_wait_step;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
         int i = (int)((pc - HLE_BASE) / 16);
@@ -325,6 +412,8 @@ __attribute__((noinline)) static GuestFn dispatch_slow(Cpu *c) {
 #endif
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
     }
+    if (g_mg_trace && g_nmodules && pc >= g_modules[0].base && pc < g_modules[0].base + g_modules[0].size)
+        return f;  // (tracing: main's calls stay uncached, so every caller -> callee pair passes mg_trace)
     unsigned h = (unsigned)(pc >> 2) & (DCACHE - 1);
     dcache[h].addr = pc;
     dcache[h].fn = f;
@@ -341,6 +430,10 @@ __attribute__((noinline)) static void dispatch_miss(Cpu *c) {
 
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
+    if (__builtin_expect(atomic_load_explicit(&g_dcache_gen, memory_order_relaxed) != t_dcache_gen, 0)) {
+        memset(dcache, 0, sizeof dcache);
+        t_dcache_gen = atomic_load_explicit(&g_dcache_gen, memory_order_relaxed);
+    }
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
     if (__builtin_expect(dcache[h].addr == c->pc, 1)) {
         GuestFn f = dcache[h].fn;
@@ -491,6 +584,54 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
     }
     plat_protect(watch_page, PLAT_PAGE, PLAT_PROT_RW);
     return true;
+}
+
+// #274 (2.0.2 + DLC, the first DLC mission's battle against Grisham, twice at the same point): the game crashed
+// "accessing 0xc0" in f_70009e198c, a leaf that only copies 48 bytes (three vectors) from an object's +0xc0 into
+// v0-v2. Its callers take the object from a handle (f_70002d2c78, then f_7000349b1c reads it) and some of them
+// (0x7002968c58, 0x7002971074, 0x70009df558) never check the handle (f_7000349c3c) first: an object gone at that
+// moment - thread timing, which is ours and not the Switch's - is a null object. A null-page read inside one of these
+// getters (the table below, per build) gives the caller zeros instead, and the platform's handler returns to it
+// (windows.c: one frame unwound). Logged the first times. LARECOMP_NULL_GETTER=0 off.
+typedef struct { uint8_t id[8]; uint64_t fn; int nvec; } NullGetter;
+static const NullGetter null_getters[] = {
+    {{0x8A, 0x1C, 0x86, 0xC4, 0x37, 0x39, 0x4B, 0x69}, 0x70009e012cull, 3},  // 2.0.0 (the same body)
+    {{0xB1, 0xF1, 0x2F, 0xD9, 0x19, 0xEA, 0xE8, 0x6A}, 0x70009e198cull, 3},  // 2.0.2
+};
+bool rt_null_getter_recover(uint64_t pc, uint64_t fa) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_NULL_GETTER"); on = !(e && !atoi(e)); }
+    if (!on || fa >= 0x10000 || g_game_is_la) return false;
+    uint64_t off = 0, fn = 0;
+    const char *nm = host_sym(pc, &off);
+    if (!nm || sscanf(nm, "f_%llx", (unsigned long long *)&fn) != 1) return false;
+    const NullGetter *g = NULL;
+    for (size_t i = 0; i < sizeof null_getters / sizeof *null_getters; i++)
+        if (GUEST_REBASE(null_getters[i].fn) == fn && !memcmp(g_main_build_id, null_getters[i].id, 8)) g = &null_getters[i];
+    Cpu *c = g ? kernel_current_cpu() : NULL;
+    if (!c) return false;
+    for (int i = 0; i < g->nvec; i++) c->v[i] = 0;
+    static _Atomic int n;
+    int k = ++n;
+    if (k <= 10 || !(k & (k - 1)))
+        LOG("[guard] f_%llx read an object that isn't there (accessing %#llx, guest lr %llx): zeros given back (%d so far, #274)\n",
+            (unsigned long long)fn, (unsigned long long)fa, (unsigned long long)c->x[30], k);
+    return true;
+}
+
+bool rt_null_getter_test(Cpu *c) {
+    const NullGetter *g = NULL;
+    for (size_t i = 0; i < sizeof null_getters / sizeof *null_getters; i++)
+        if (!memcmp(g_main_build_id, null_getters[i].id, 8)) g = &null_getters[i];
+    if (!g || !dispatch_lookup(GUEST_REBASE(g->fn))) return false;
+    uint64_t x0 = c->x[0];
+    __uint128_t v[3] = {c->v[0], c->v[1], c->v[2]};
+    c->x[0] = 0, c->v[0] = c->v[1] = c->v[2] = ~(__uint128_t)0;
+    dispatch_lookup(GUEST_REBASE(g->fn))(c);
+    bool ok = !c->v[0] && !c->v[1] && !c->v[2];
+    LOG("[guard] test: f_%llx called with no object came back, v0-v2 %s\n", (unsigned long long)g->fn, ok ? "zero" : "NOT zero");
+    c->x[0] = x0, c->v[0] = v[0], c->v[1] = v[1], c->v[2] = v[2];
+    return ok;
 }
 
 void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {

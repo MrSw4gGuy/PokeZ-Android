@@ -64,6 +64,7 @@ Settings g_settings = {
     .menu_confirm = MENU_CONFIRM_CONTROLLER,
 #endif
     .show_fps = false,
+    .mystery_gift = false,  // (F1 > Online > Mystery Gift: on, the game sees a connection and the gift list is fetched)
     .fps60_lock = true,  // ("Drop to 30 fps when needed" off unless the player turns it on)
     .smooth_anim = true,  // (Pokémon Z-A 2.0.2: distant characters animate every frame)
     .draw_dist = 100,  // (the game's own draw distances: #190's option off)
@@ -328,11 +329,15 @@ void settings_load(void) {
         }
         if (fields != 2) continue;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        else if (!strcmp(key, "hud_width")) { int v = atoi(val); g_settings.hud_width = v < 0 ? 0 : v > 100 ? 100 : v; }
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "mystery_gift")) g_settings.mystery_gift = atoi(val) != 0;
+        else if (!strcmp(key, "content_stones")) g_settings.content_stones = atoi(val) != 0;
+        else if (!strcmp(key, "content_trade")) g_settings.content_trade = atoi(val) != 0;
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
         else if (!strcmp(key, "fps40")) g_settings.fps40 = atoi(val) != 0;
@@ -425,6 +430,7 @@ void settings_load(void) {
         else if (!strcmp(key, "rstick_snap")) { int d = atoi(val); g_settings.rstick_snap = d < 0 ? 0 : d > 30 ? 30 : d; }
         else if (!strcmp(key, "lstick_deadzone")) g_settings.lstick_deadzone = atoi(val);
         else if (!strcmp(key, "lstick_outer")) g_settings.lstick_outer = atoi(val);
+        else if (!strcmp(key, "rstick_deadzone")) g_settings.rstick_deadzone = atoi(val);
         else if (!strcmp(key, "blur_removal")) g_settings.blur_removal = atoi(val) != 0;
         else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
@@ -488,10 +494,23 @@ void settings_load(void) {
     if (!(g_settings.mouse_sens >= 0.1f && g_settings.mouse_sens <= 5)) g_settings.mouse_sens = 1.0f;
     if (g_settings.lstick_deadzone < 0 || g_settings.lstick_deadzone > 30) g_settings.lstick_deadzone = 10;
     if (g_settings.lstick_outer < 70 || g_settings.lstick_outer > 100) g_settings.lstick_outer = 90;
+    if (g_settings.rstick_deadzone < 0 || g_settings.rstick_deadzone > 30) g_settings.rstick_deadzone = 0;
     if (g_settings.rumble_strength < 25 || g_settings.rumble_strength > 100) g_settings.rumble_strength = 100;
     if (g_settings.draw_dist != 150 && g_settings.draw_dist != 200 && g_settings.draw_dist != 300) g_settings.draw_dist = 100;
     settings_env_overrides();
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
+    {   // F1 > Compatibility choices that aren't Auto, and a chosen graphics card: a report's log shows them (#288 had
+        // robust access 2 on, which Auto keeps off on AMD GPUs, and nothing in its log said so)
+        static const char *const names[GPU_COMPAT_N] = {"gpu_dynamic_vertex", "gpu_overlap", "gpu_straight_shaders", "gpu_xfb_mirror",
+            "gpu_robust_access", "gpu_texture_prefetch", "gpu_prepare_shaders", "gpu_pages_outside"};
+        char line[256] = "";
+        size_t n = 0;
+        for (int i = 0; i < GPU_COMPAT_N && n < sizeof line - 48; i++)
+            if (g_settings.gpu_compat[i] != GPU_AUTO)
+                n += (size_t)snprintf(line + n, sizeof line - n, " %s=%s", names[i], g_settings.gpu_compat[i] == GPU_ON ? "on" : "off");
+        if (n) LOG("[settings] F1 > Compatibility, not Auto:%s\n", line);
+        if (g_settings.gpu_name[0]) LOG("[settings] graphics card chosen in F1: %s\n", g_settings.gpu_name);
+    }
 }
 
 void settings_save(void) {
@@ -499,11 +518,14 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# ZA Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "hud_width = %d\n", g_settings.hud_width);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "mystery_gift = %d\n", g_settings.mystery_gift);
+    fprintf(f, "content_stones = %d\ncontent_trade = %d\n", g_settings.content_stones, g_settings.content_trade);
     fprintf(f, "fps60 = %d\n", g_settings.fps60);
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
     fprintf(f, "fps40 = %d\n", g_settings.fps40);
@@ -573,6 +595,7 @@ void settings_save(void) {
     fprintf(f, "controller_light = %d\n", g_settings.controller_light);
     fprintf(f, "background_input = %d\n", g_settings.bg_input);
     fprintf(f, "rstick_snap = %d\n", g_settings.rstick_snap);
+    fprintf(f, "rstick_deadzone = %d\n", g_settings.rstick_deadzone);
     fprintf(f, "lstick_deadzone = %d\nlstick_outer = %d\n", g_settings.lstick_deadzone, g_settings.lstick_outer);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);

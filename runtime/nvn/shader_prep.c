@@ -63,12 +63,13 @@ uint8_t shader_topo_class(uint32_t mode) { return mode == 0 ? 0 : mode == 1 || m
 // ------------------------------------------------------------------ text form
 // G vs=<hash> fs=<hash> f=<flags> a=<attrib,...> s=<stride/divisor,...> c=<format[:view],...> d=<depth> n=<samples>
 //   m=<channel mask> b=<blend enables> B=<blend state of each target, 16 hex digits,...> k=<a2c> t=<topology> p=<fill>
-// C cs=<hash> l=<x,y,z>
+// C cs=<hash> l=<x,y,z> [s=<shared memory bytes>]
 void shader_rec_format(const ShaderRec *r, char *out, size_t n) {
     size_t o = 0;
 #define PUT(...) do { if (o < n) o += (size_t)snprintf(out + o, n - o, __VA_ARGS__); } while (0)
     if (r->kind == 'C') {
         PUT("C cs=%016" PRIx64 " l=%u,%u,%u", r->vs, r->local[0], r->local[1], r->local[2]);
+        if (r->shared) PUT(" s=%u", r->shared);  // (decimal; only when there is some: older lines stay as they were)
         return;
     }
     PUT("G vs=%016" PRIx64 " fs=%016" PRIx64 " f=%x a=", r->vs, r->fs, r->flags);
@@ -127,6 +128,7 @@ bool shader_rec_parse(const char *line, ShaderRec *r) {
             if (e == v) return false;
             v = *e == ',' ? e + 1 : e;
         }
+        if ((v = field(line, "s"))) r->shared = (uint32_t)strtoul(v, NULL, 10);
         return r->vs != 0;
     }
     if (!(v = field(line, "vs"))) return false;
@@ -536,8 +538,12 @@ void shader_cache_tag_write(const char *tag_path, const char *tag) { shader_cach
 static const char shipped_list[] =
 #include "shader_variants.inc"
     ;
+static const char shipped_list_za[] =  // (Pokémon Z-A: its code comes from SHADER_GAME_CODE_FILE)
+#include "shader_variants_za.inc"
+    ;
 
-const char *shader_prep_shipped_list(void) { return shipped_list; }
+const char *shader_prep_shipped_list(void) { return g_game_is_la ? shipped_list : shipped_list_za; }
+const char *shader_prep_shipped_list_za(void) { return shipped_list_za; }
 
 // The game files' shaders as one id (order-independent): another game version has another
 static uint64_t idx_game_id(void) {
@@ -575,7 +581,7 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
             if (n > 0 && fread(list, 1, (size_t)n, f) != (size_t)n) list[0] = 0;
             fclose(f);
         }
-    } else list = strdup(shipped_list);
+    } else list = strdup(shader_prep_shipped_list());
     if (!list || !*list) { free(list); LOG("[shader] preparation: no variant list\n"); return false; }
     if (!renderer_prepare_begin()) { free(list); LOG("[shader] preparation: no GPU device yet\n"); return false; }
     uint64_t seen_game;
@@ -590,6 +596,7 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
         snprintf(main_nso, sizeof main_nso, "%s/../exefs/main", romfs);
         idx_nso(main_nso);
         idx_store(SHADER_CODE_FILE);
+        idx_store(SHADER_GAME_CODE_FILE);
     }
     double t_idx = ms_now() - t0;
     if (idx_n) {  // (the player's list of other game files - none yet, or an update: only what this game has)
@@ -666,6 +673,30 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
 // (at the game's GPU device setup) Pokémon Z-A: always - the start screen can't prepare its shaders (vulkan/exec.c
 // renderer_prepare_begin), and here, during its logos, the ones its earlier runs kept (shader_seen_code) take well
 // under a second with warm caches. LARECOMP_SHADER_PREP=0: not; =1: Link's Awakening too (tests).
+// The preparation's progress on screen (a black frame with a notice line: vulkan/device.c backend_notice_frame), once
+// it has taken over 1.5 s - with warm caches it is done in well under a second and nothing shows. After a driver or
+// ZA Recomp update it can take minutes on a slow driver (#291: 338 s on an Intel HD 520) with the window black, and
+// players closed it as a hang (#291 #297). Ten frames a second at most.
+static bool boot_shown;
+static void boot_progress(int done, int total) {
+    extern void backend_notice_frame(void) __attribute__((weak));  // (Vulkan only: Metal shows nothing)
+    extern void menu_notice(const char *text, int seconds);
+    static double t0, last;
+    double now = ms_now();
+    if (!t0) t0 = now;
+    static double after = -1;  // (LARECOMP_PREP_NOTICE_MS: from how long; 0 at once, tests)
+    if (after < 0) after = getenv("LARECOMP_PREP_NOTICE_MS") ? atof(getenv("LARECOMP_PREP_NOTICE_MS")) : 1500;
+    if (!backend_notice_frame || now - t0 < after || now - last < 100) return;
+    last = now, boot_shown = true;
+    char s[200];
+    int pct = total > 0 ? (int)(100.0 * (done < 0 ? 0 : done) / total) : 0;
+    snprintf(s, sizeof s, UI_TR("Preparing the game's shaders: %d%% (after an update or a new graphics driver: it can take "
+                                "a few minutes, please wait)", "Preparando os shaders do jogo: %d%% (depois de uma atualização ou de um driver de vídeo "
+                                "novo: pode levar alguns minutos, aguarde)"), pct > 100 ? 100 : pct);
+    menu_notice(s, 2);
+    backend_notice_frame();
+}
+
 void shader_prep_boot(const char *romfs) {
     extern int g_game_is_la;  // (runtime/rt.h)
     // (Pokémon Z-A only; F1 > Compatibility)
@@ -673,5 +704,9 @@ void shader_prep_boot(const char *romfs) {
         const char *e = getenv("LARECOMP_SHADER_PREP");
         if (!(e && atoi(e))) return;  // (=1 still forces it, Link's Awakening included)
     }
-    shader_prep_run(romfs, NULL, NULL);
+    shader_prep_run(romfs, boot_progress, NULL);
+    if (boot_shown) {
+        extern void menu_notice(const char *text, int seconds);
+        menu_notice(UI_TR("Shaders ready.", "Shaders prontos."), 2);
+    }
 }

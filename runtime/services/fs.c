@@ -24,6 +24,7 @@
 #include "../input_bind.h"
 #include "../xbox_attack_layout.h"
 #include "mod_layout.h"
+#include "../paths.h"
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -129,7 +130,16 @@ static void base_open(void) {
         // scene, a 6 GiB list read from data, on any GPU: a folder extracted elsewhere, maybe from another version.
         // 2.0.0's is 9877520 bytes)
         snprintf(path, sizeof path, "%s/arc/data.trpfd", g_romfs_dir);
-        if (stat(path, &sb) == 0) LOG("[fs] romfs: arc/data.trpfd %lld bytes (a folder extracted by another tool)\n", (long long)sb.st_size);
+        if (stat(path, &sb) == 0) {
+            LOG("[fs] romfs: arc/data.trpfd %lld bytes (a folder extracted by another tool)\n", (long long)sb.st_size);
+            // (#311: a folder with Pokémon Z-A's index but not its packs - the game read null as it started. The start
+            // screen says so too: runtime/ui/launcher.mm launcher_verify_kick)
+            snprintf(path, sizeof path, "%s/arc/data.trpfs", g_romfs_dir);
+            bool none = stat(path, &sb) != 0;
+            if (none || sb.st_size < (1 << 20))
+                FATAL("the game files are incomplete: %s/arc/data.trpfs is %s (the game's packs, about 4.7 GB)\n",
+                      g_romfs_dir, none ? "missing" : "almost empty");
+        }
     } else {
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // (an older version's image)
         if (stat(path, &sb) == 0) LOG("[fs] romfs: %s.bin, %lld bytes\n", g_romfs_dir, (long long)sb.st_size);
@@ -315,9 +325,35 @@ static bool xbox_layer_prepare(void) {
 // F1 > Draw distance (#190): cache/drawdist/romfs, the scene parts holding the world's trinity_ModelLodSetting /
 // trinity_ModelCullingSetting tables with their distances scaled (tools/za/draw_dist.py via zaprompts --drawdist).
 // .made: the data.trpfs size and the factor in percent - both must match this game and the setting.
+// Both are made in the background by zaprompts (the launcher starts it, then the game) into DIR.new, .made written last.
+// They used to be swapped in by zaprompts itself as soon as they were done - while the game was playing from the old
+// DIR: it deleted the files the game was serving, which read as zeros from then on, and a model read as zeros is a
+// crash (#266: "can't open randomizer file cache/maxlod/romfs/ik_pokemon/.../pm0158_00_00.trmdl (No such file or
+// directory)", then "accessing 0" in f_7001864c30). Now a finished DIR.new is taken in here, at the start, before
+// anything is served from DIR: the old DIR is moved aside first, so if it can't be (in use), nothing changes.
+static void cache_take_new(const char *dir) {
+    char nd[300], made[320], old[300];
+    snprintf(nd, sizeof nd, "%s.new", dir), snprintf(made, sizeof made, "%s/.made", nd), snprintf(old, sizeof old, "%s.old", dir);
+    struct stat st;
+    if (stat(made, &st)) return;  // (none, or still being made)
+    if (!stat(old, &st)) plat_remove_tree(old);
+    if (!stat(dir, &st) && rename(dir, old)) {
+        LOG("[fs] %s: a new one is ready, but the old one can't be moved aside (%s): taken in at a later start\n",
+            dir, strerror(errno));
+        return;
+    }
+    if (rename(nd, dir)) {
+        LOG("[fs] %s: the new one can't be moved in (%s)\n", dir, strerror(errno));
+        if (!stat(old, &st)) rename(old, dir);
+        return;
+    }
+    plat_remove_tree(old);
+    LOG("[fs] %s: the one made in the background taken in\n", dir);
+}
 bool g_drawdist_on;
 static void drawdist_layer(void) {
     if (g_settings.draw_dist == 100) return;
+    cache_take_new("cache/drawdist");
     unsigned long long made = 0;
     int pct = 0;
     FILE *f = fopen("cache/drawdist/.made", "rb");
@@ -337,9 +373,41 @@ static void drawdist_layer(void) {
     LOG("[fs] draw distance: %d%% (cache/drawdist)\n", pct);
 }
 
+// F1 > Content: cache/content/romfs, the item, shop and evolution tables with the Ranked Battle Mega Stones on sale for
+// Mega Shards and the trade evolutions that need no trade (tools/za/content_mod.py via zaprompts --content,
+// runtime/ui/launcher.mm launcher_content_kick). After the player's mods: a mod with the same table wins. Only for the
+// game and the choices it was made from (cache/content/.made: data.trpfs's size, "stones+tradeevo").
+const char *content_want(void) {
+    return g_settings.content_stones && g_settings.content_trade ? "stones+tradeevo"
+         : g_settings.content_stones ? "stones" : g_settings.content_trade ? "tradeevo" : "";
+}
+bool g_content_on;  // (this session serves cache/content: F1 says so)
+static void content_layer(void) {
+    if (!*content_want()) return;
+    cache_take_new("cache/content");
+    unsigned long long made = 0;
+    char what[32] = "";
+    FILE *f = fopen("cache/content/.made", "rb");
+    if (!f) { LOG("[fs] content (%s): not made yet (cache/content.log)\n", content_want()); return; }
+    if (fscanf(f, "%llu %31s", &made, what) != 2) made = 0;
+    fclose(f);
+    RomFile *pack = NULL;
+    for (int i = 0; i < rom_nfiles && !pack; i++)
+        if (!strcmp(rom_files[i].path, "arc/data.trpfs")) pack = &rom_files[i];
+    if (!pack || pack->size != made || strcmp(what, content_want())) {
+        LOG("[fs] content (%s): made for another game version or choice (%llu, %s): off until made again\n",
+            content_want(), made, what);
+        return;
+    }
+    strlcpy(layer_root[nlayers++], "cache/content/romfs", sizeof *layer_root);
+    g_content_on = true;
+    LOG("[fs] content: %s (cache/content)\n", what);
+}
+
 bool g_maxlod_on;  // (this session serves cache/maxlod: F1 says so)
 static void maxlod_layer(void) {
     if (!g_settings.full_detail) return;
+    cache_take_new("cache/maxlod");
     unsigned long long made = 0;
     FILE *f = fopen("cache/maxlod/.made", "rb");
     if (!f) { LOG("[fs] full-detail models: not made yet (cache/maxlod.log)\n"); return; }
@@ -376,15 +444,29 @@ static int mod_cmp(const void *a, const void *b) {
     return ra != rb ? (ra < rb ? -1 : 1) : name_cmp(a, b);
 }
 
+// The start screen's check of the game files (runtime/ui/launcher.mm launcher_verify_kick): its result in the log, so
+// a crash report says at once whether the player's files are a damaged download (#294 #301)
+static void verify_log(void) {
+    FILE *f = fopen("cache/verify.txt", "rb");
+    if (!f) { LOG("[fs] game files: not checked yet (the start screen checks them once)\n"); return; }
+    char line[256];
+    for (int n = 0; n < 6 && fgets(line, sizeof line, f); n++) {
+        line[strcspn(line, "\r\n")] = 0;
+        LOG("[fs] game files%s %s\n", n ? ", damaged pack:" : ":", line);
+    }
+    fclose(f);
+}
+
 static void layer_init(void) {
     if (nlayers >= 0) return;
     nlayers = 0;
     settings_load();
+    if (!g_game_is_la) verify_log();
     if (xbox_layer_prepare()) strlcpy(layer_root[nlayers++], XBOX_ATTACK_ROOT, sizeof *layer_root);
     const char *seed = rando_seed_dir();
     if (seed) snprintf(layer_root[nlayers++], sizeof *layer_root, "%s/romfs", seed);
     DIR *d = opendir("mods");
-    if (!d) { maxlod_layer(); drawdist_layer(); return; }  // (no mods folder: ours still)
+    if (!d) { maxlod_layer(); drawdist_layer(); content_layer(); return; }  // (no mods folder: ours still)
     char names[15][256];
     int n = 0;
     settings_load();  // (the start screen's Mods page: mods_off, mods_order)
@@ -408,6 +490,7 @@ static void layer_init(void) {
     }
     maxlod_layer();
     drawdist_layer();
+    content_layer();
 }
 
 static bool layer_file(const char *path, char *out, size_t cap) {
@@ -923,6 +1006,49 @@ static void recent_read_note(uint64_t off, uint64_t size, const uint8_t *dst, ss
 // LARECOMP_OODLE_RETRY=<n> tries after the first (default 2, 0 off). Log: "[oodle] decode failed ... retry n: ok".
 // the compressed bytes at [src, src + n) inside one of the last reads: read again from the RomFS (1), else 0
 static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size);
+
+// The block decoded outside the game: oodec (third_party/ooz/oodec.cpp, a separate GPLv3 program shipped in
+// zaprompts/ next to ooz - ZA Recomp only runs it, as it does zaprompts) on the same compressed bytes. #248 (v0.1.22):
+// the game's decode of the block leaving the lab (71548 bytes from 33445) still failed with the compressed bytes
+// unchanged and intact (as read from the disk) and decoder memory of its own, on the players' PCs only - while ooz
+// decodes those very bytes right. So whatever goes wrong is inside the game's run of the decoder there, and a decoder
+// that isn't the game's gets the block anyway. Returns the bytes written to dst (raw), or 0 (logged why).
+static uint64_t oodle_native(uint64_t src, uint64_t n, uint64_t dst, uint64_t raw) {
+    char tool[1100];
+    if (!rt_resource("zaprompts/oodec" PLAT_EXE_SUFFIX, "build/ooz/oodec" PLAT_EXE_SUFFIX, tool, sizeof tool)) {
+        LOG("[oodle] no oodec program (zaprompts/oodec" PLAT_EXE_SUFFIX "): the block can't be decoded outside the game\n");
+        return 0;
+    }
+    static _Atomic unsigned seq;
+    unsigned k = ++seq;
+    char in[64], out[64], size[32];
+    mkdir("cache", 0755);
+    snprintf(in, sizeof in, "cache/oodle-%u.in", k);
+    snprintf(out, sizeof out, "cache/oodle-%u.out", k);
+    snprintf(size, sizeof size, "%llu", (unsigned long long)raw);
+    uint64_t r = 0;
+    FILE *f = fopen(in, "wb");
+    bool wrote = f && fwrite((const void *)(uintptr_t)src, 1, (size_t)n, f) == n;
+    if (f) fclose(f);
+    if (wrote) {
+        const char *argv[] = {tool, in, out, size, NULL};
+        uint64_t t0 = plat_now_ns();
+        PlatProc p = plat_spawn(argv, "cache/oodle.log", true);
+        int code = p ? plat_proc_wait(p, true) : -1;
+        f = code == 0 ? fopen(out, "rb") : NULL;
+        if (f) {
+            uint8_t *tmp = malloc((size_t)raw);  // (all or nothing into the game's buffer)
+            if (tmp && fread(tmp, 1, (size_t)raw, f) == raw) memcpy((void *)(uintptr_t)dst, tmp, (size_t)raw), r = raw;
+            free(tmp);
+            fclose(f);
+        }
+        LOG("[oodle] decoded outside the game (oodec, %llu ms): %s\n", (unsigned long long)((plat_now_ns() - t0) / 1000000),
+            r ? "ok" : code == 1 ? "it can't decode these bytes either" : "it didn't run (cache/oodle.log)");
+    } else
+        LOG("[oodle] can't write %s for oodec\n", in);
+    remove(in), remove(out);
+    return r;
+}
 void rt_za_oodle_call(Cpu *c, uint64_t target) {
     static int tries = -1;
     if (tries < 0) { const char *e = getenv("LARECOMP_OODLE_RETRY"); tries = e ? atoi(e) : 2; }
@@ -970,6 +1096,29 @@ void rt_za_oodle_call(Cpu *c, uint64_t target) {
     }
     if (own) ST64(c->sp + 0x18, st[3]);  // (the caller's own argument back)
     free(own_raw);
+    // Still failed: the block decoded outside the game (oodle_native, #248). LARECOMP_OODLE_NATIVE=0 off.
+    // (test) LARECOMP_TEST_OODLE_FAIL with LARECOMP_OODLE_RETRY=0: every forced failure lands here on a block the game
+    // did decode, and oodec's bytes are compared with the game's - "[oodle] test: ... the same" / "DIFFER"
+    static int native = -1;
+    if (native < 0) { const char *e = getenv("LARECOMP_OODLE_NATIVE"); native = !e || atoi(e) != 0; }
+    if (c->x[0] == 0 && x[3] != 0 && native && x[0] && x[1] && x[1] <= (64u << 20) && x[2] && x[3] <= (256u << 20)) {
+        static long every = -1;
+        if (every < 0) { const char *e = getenv("LARECOMP_TEST_OODLE_FAIL"); every = e ? atol(e) : 0; }
+        uint8_t *game = NULL;
+        if (every > 0 && (game = malloc((size_t)x[3]))) memcpy(game, (const void *)(uintptr_t)x[2], (size_t)x[3]);
+        uint64_t r = oodle_native(x[0], x[1], x[2], x[3]);
+        if (game) {
+            bool same = r == x[3] && !memcmp(game, (const void *)(uintptr_t)x[2], (size_t)x[3]);
+            LOG("[oodle] test: oodec's %llu bytes against the game's own decode: %s\n", (unsigned long long)x[3],
+                same ? "the same" : "DIFFER");
+            free(game);
+        }
+        if (r) {
+            memcpy(c->x, x, sizeof x);  // (the call's result: the bytes decoded, as OodleLZ_Decompress returns)
+            c->x[0] = r, c->x[30] = lr;
+            rt_game_data_bad = false;
+        }
+    }
 }
 
 static int recent_read_restore(uint64_t src, uint64_t n, char *what, size_t what_size) {

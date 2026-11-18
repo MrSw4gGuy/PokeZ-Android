@@ -44,6 +44,13 @@ ap.add_argument('--party-icons', metavar='DIR', help="the Pokémon box icons int
 ap.add_argument('--maxlod', metavar='DIR', help='DIR/romfs: every model at its full detail (lod_mod.py; then make nothing else)')
 ap.add_argument('--drawdist', metavar='DIR', help='DIR/romfs: the scene parts with draw distances x --factor (draw_dist.py)')
 ap.add_argument('--factor', type=float, default=2, help='with --drawdist: the distances times this')
+ap.add_argument('--content', metavar='DIR', help='DIR/romfs: the tables F1 > Content changes (content_mod.py)')
+ap.add_argument('--content-what', default='stones,tradeevo', help='with --content: stones, tradeevo or both')
+ap.add_argument('--verify', metavar='FILE', help="data.trpfs checked pack by pack against the known good copies "
+                                                  '(verify_files.py): the result into FILE (then make nothing else)')
+ap.add_argument('--shader-code', metavar='FILE', help="the code of the shaders --shader-need names, from the game's packs, "
+                                                       'into FILE (then make nothing else)')
+ap.add_argument('--shader-need', metavar='FILE', help='with --shader-code: the shaders wanted, one hex code hash a line')
 ap.add_argument('--xbox-attack-layout', action='store_true', help='prepare the optional battle layout during setup')
 ap.add_argument('--xbox-attack-layout-only', action='store_true', help='prepare only the battle layout (release smoke test)')
 ap.add_argument('--xbox-attack-layout-version', action='store_true', help='check the frozen helper includes battle layout support')
@@ -265,8 +272,9 @@ def deswizzle_np(src, wb, hb, bpb, bh_log2):  # deswizzle() with numpy: the same
 
 # ------------------------------------------------------------------ full-detail models (--maxlod)
 # F1 > Full-detail models (runtime/ui/launcher.mm launcher_maxlod_kick): tools/za/lod_mod.py on the player's own game
-# files, into DIR.new and then swapped in whole; DIR/.made holds data.trpfs's size, which runtime/services/fs.c checks
-# against the game it serves (another version's models are never layered over it).
+# files, into DIR.new (.made last), which runtime/services/fs.c cache_take_new swaps in whole at the game's next start -
+# never here: the game may be playing from DIR now (#266). DIR/.made holds data.trpfs's size, which runtime/services/fs.c
+# checks against the game it serves (another version's models are never layered over it).
 # F1 > Draw distance (runtime/ui/launcher.mm launcher_drawdist_kick): tools/za/draw_dist.py, the world's LOD and
 # culling distances times --factor, into DIR (.made: data.trpfs's size and the factor, checked by runtime/services/fs.c)
 if args.drawdist:
@@ -277,8 +285,44 @@ if args.drawdist:
     files, dists, miss = draw_dist.make(trpfs, trpfd, unpack, new, args.factor, log=lambda *a: print(*a, flush=True))
     if not files: sys.exit(1)
     with open(os.path.join(new, '.made'), 'w') as f: f.write('%d %d\n' % (len(trpfs), round(args.factor * 100)))
-    shutil.rmtree(args.drawdist, ignore_errors=True)
-    os.replace(new, args.drawdist)
+    sys.exit(0)  # (DIR.new: taken in by the game at its next start, runtime/services/fs.c cache_take_new - #266)
+
+# F1 > Content (runtime/ui/launcher.mm launcher_content_kick): tools/za/content_mod.py, the ranked Mega Stones in the
+# Mega Shard exchange and the trade evolutions without a trade, into DIR.new (.made: data.trpfs's size and what was
+# asked for, checked by runtime/services/fs.c)
+if args.content:
+    import shutil, content_mod
+    trpfs, trpfd = open_game(args.romfs[0])
+    new = args.content.rstrip('/\\') + '.new'
+    shutil.rmtree(new, ignore_errors=True)
+    what = sorted(set(args.content_what.split(',')) & {'stones', 'tradeevo'})
+    paths = ([content_mod.P_ITEM, content_mod.P_LINEUP] if 'stones' in what else []) + \
+            ([content_mod.P_PERSONAL, content_mod.P_PLIB] if 'tradeevo' in what else [])
+    got = content_mod.game_files(trpfs, trpfd, unpack, paths)
+    if len(got) != len(paths):
+        print('not in the game files:', sorted(set(paths) - set(got)), flush=True)
+        sys.exit(1)
+    try:
+        files = content_mod.make(got.__getitem__, new, 'stones' in what, 'tradeevo' in what,
+                                 log=lambda *a: print(*a, flush=True))
+    except (ValueError, StopIteration, KeyError, IndexError, struct.error) as e:
+        print('tables not as expected (another game version?):', repr(e), flush=True)
+        sys.exit(1)
+    if not files: sys.exit(1)
+    with open(os.path.join(new, '.made'), 'w') as f: f.write('%d %s\n' % (len(trpfs), '+'.join(what)))
+    sys.exit(0)
+
+# The start screen's one check of the game files (runtime/ui/launcher.mm launcher_verify_kick, #294 #301): FILE's first
+# line "ok <version>", "damaged <version> <packs>" (then the packs' names, one a line) or "unknown"
+if args.verify:
+    import verify_files, lod_mod
+    trpfs, trpfd = open_game(args.romfs[0])
+    version, bad = verify_files.check(trpfs, lod_mod.pack_names(trpfd), log=lambda *a: print(*a, flush=True))
+    head = 'unknown' if not version else 'damaged %s %d' % (version, len(bad)) if bad else 'ok ' + version
+    lines = [head] + [n for _, n in bad]
+    print(*lines, sep='\n', flush=True)
+    with open(args.verify + '.tmp', 'w', newline='\n') as f: f.write('\n'.join(lines) + '\n')
+    os.replace(args.verify + '.tmp', args.verify)
     sys.exit(0)
 
 if args.maxlod:
@@ -289,8 +333,6 @@ if args.maxlod:
     made, miss = lod_mod.make(trpfs, trpfd, unpack, new, log=lambda *a: print(*a, flush=True))
     if not made: sys.exit(1)
     with open(os.path.join(new, '.made'), 'w') as f: f.write('%d\n' % len(trpfs))
-    shutil.rmtree(args.maxlod, ignore_errors=True)
-    os.replace(new, args.maxlod)
     sys.exit(0)
 
 if args.party_icons:
@@ -329,6 +371,91 @@ if args.party_icons:
     if made:
         with open(os.path.join(args.party_icons, '.made'), 'w') as f: f.write('%d\n' % made)
     sys.exit(0 if made else 1)
+
+
+# ------------------------------------------------------------------ shader code (--shader-code)
+# The shader preparation (runtime/nvn/shader_prep.c) finds a record's shaders by the hash of their code in the BNSH
+# shader containers of the game files - which Pokémon Z-A keeps inside its Oodle-compressed packs, where the runtime
+# can't read (it doesn't load ooz: GPLv3). So once per game files (runtime/ui/launcher.mm shader_code_kick) every pack
+# is unpacked here and the code of each shader the shipped list names is written out in shader_code.bin's format
+# (runtime/nvn/shader_prep.h ShaderCodeHdr: hash, size, constants' offset and size, then the bytes). The player's own
+# data, made from their own files, never shipped. ~1.5 min on a fast CPU.
+def bnsh_stages(d, b):  # one BNSH container at d[b:] -> (code offset, code + constants' length, constants' offset, size)
+    rd32 = lambda o: struct.unpack_from('<I', d, o)[0]  # (the same walk, and checks, as shader_prep.c idx_bnsh)
+    rd64 = lambda o: struct.unpack_from('<Q', d, o)[0]
+    n = len(d)
+    if b + 0x20 > n or d[b + 0xC:b + 0xE] != b'\xff\xfe': return
+    fsz = rd32(b + 0x1C)
+    if fsz < 0x40 or b + fsz > n: return
+    first = d[b + 0x16] | d[b + 0x17] << 8
+    if first + 0x28 > fsz or d[b + first:b + first + 4] != b'grsc': return
+    nvar, pvar = rd32(b + first + 0x1C), rd64(b + first + 0x20)
+    if pvar >= fsz or nvar > (fsz - pvar) // 0x40: return
+    for v in range(nvar):
+        pbin = rd64(b + pvar + v * 0x40 + 0x10)
+        if not pbin or pbin + 0x38 > fsz: continue
+        for s in range(6):
+            pc = rd64(b + pbin + 8 + 8 * s)
+            if not pc or pc + 0x20 > fsz: continue
+            pctl, pcode, csz = rd64(b + pc + 8), rd64(b + pc + 0x10), rd32(b + pc + 0x18)
+            if pctl + 0x750 > fsz or pcode >= fsz or csz > fsz - pcode: continue
+            coff, cs = rd32(b + pctl + 0x700), rd32(b + pctl + 0x6FC)
+            if not coff or coff > csz or cs > csz - coff: continue
+            yield b + pcode, coff + cs, coff, cs
+
+
+if args.shader_code:
+    if hasattr(ooz, 'ooz_fnv64'):
+        ooz.ooz_fnv64.argtypes, ooz.ooz_fnv64.restype = [ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint64
+        fnv64 = lambda b: ooz.ooz_fnv64(b, len(b))
+    else:  # (an older ooz: slow)
+        def fnv64(b):
+            h = 0xcbf29ce484222325
+            for c in b: h = ((h ^ c) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+            return h
+    need = set()
+    with open(args.shader_need) as f:
+        for line in f:
+            if line.strip() and not line.startswith('#'): need.add(int(line, 16))  # ('#': the game files' identity)
+    got, files = {}, 0
+    for romfs in args.romfs:
+        m = open_game(romfs)[0]
+        fb = FB(m)
+        root = fb.u64(8)
+        n, op = fb.vec(fb.table(root + fb.u32(root))[1])
+        for i in range(n):
+            off = fb.u64(op + 8 * i)
+            nf, fp = fb.vec(fb.table(off + fb.u32(off))[1])
+            for j in range(nf):
+                e = fp + 4 * j
+                ft = fb.table(e + fb.u32(e))
+                comp = m[ft[1]] if len(ft) > 1 and ft[1] else 0xFF
+                size = fb.u64(ft[3]) if len(ft) > 3 and ft[3] else 0
+                if size > 64 << 20: continue
+                dn, dp = fb.vec(ft[4])
+                try:
+                    d = unpack(comp, size, m[dp:dp + dn])
+                except ValueError:
+                    continue
+                files += 1
+                b = d.find(b'BNSH\0\0\0\0')
+                while b >= 0:
+                    if b % 8 == 0:  # (containers are aligned)
+                        for at, ln, coff, cs in bnsh_stages(d, b):
+                            code = d[at:at + ln]
+                            h = fnv64(code)
+                            if h in need and h not in got: got[h] = (code, coff, cs)
+                    b = d.find(b'BNSH\0\0\0\0', b + 8)
+    tmp = args.shader_code + '.tmp'
+    with open(tmp, 'wb') as f:
+        for h, (code, coff, cs) in got.items():
+            f.write(struct.pack('<QIIII', h, len(code), coff, cs, 0) + code)
+    os.replace(tmp, args.shader_code)  # (whole or not at all: the runtime reads it at its next start)
+    if got:  # (done for this request: the start screen asks again only for another one)
+        import shutil
+        shutil.copyfile(args.shader_need, args.shader_code + '.made')
+    print('shader code: %d of %d shaders found, %d files unpacked' % (len(got), len(need), files), flush=True)
+    sys.exit(0 if got else 1)
 
 
 # ------------------------------------------------------------------ labels

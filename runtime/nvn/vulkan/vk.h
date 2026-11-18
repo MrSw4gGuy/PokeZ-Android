@@ -245,6 +245,7 @@ typedef struct TexBackend {
     bool prefetched;  // (uploaded at its registration, not drawn yet: textures.c backend_prefetch_texture)
     struct TexBackend *cube;  // (a square 2D image a shader samples as a cube: its 6-face copy, textures.c vk_cube_of_2d)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint64_t name_hash;  // (textures.c: the name pack textures go by - hash_full; data_hash may be the fast hash)
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented, shown;  // (shown: presented itself, not only copied into a presented image)
     uint64_t touched_frame, frame_cleared;

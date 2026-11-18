@@ -191,6 +191,21 @@ static void ir_note(uint64_t pa, const uint32_t *p, uint64_t vs) {
 typedef struct { uint64_t seq, ms, draws, passes, dispatches, vs, fs, cs; uint32_t w, h, ncolor, color0, depth; } SubRec;
 static SubRec subr[SUBR_N], subr_now;
 static uint64_t subr_n;
+// Every pipeline drawn, in order, with the submission it went into - always on, runs of the same pair counted once:
+// a GPU that never finishes a submission (#284: an RTX 5080 on Linux, Snarl in Wild Zone 6) showed only the last pair of
+// each submission, not the draw it was stuck on. The pairs of the unfinished ones are logged with the hang; their
+// hashes are the shader_seen ones, so the shaders can be found and translated again from the game's own files.
+#define PRR_N 4096  // (a power of two)
+static struct { uint64_t seq, vs, fs; uint32_t n; } prr[PRR_N];
+static unsigned prr_n;
+static void prr_note(uint64_t vs, uint64_t fs) {
+    uint64_t seq = submit_seq + 1;
+    if (prr_n) {
+        typeof(prr[0]) *e = &prr[(prr_n - 1) & (PRR_N - 1)];
+        if (e->seq == seq && e->vs == vs && e->fs == fs) { e->n++; return; }
+    }
+    prr[prr_n++ & (PRR_N - 1)] = (typeof(prr[0])){seq, vs, fs, 1};
+}
 void vk_builds_log(void);
 static void lost_report(uint64_t done) {
     static bool once;
@@ -203,6 +218,17 @@ static void lost_report(uint64_t done) {
             (unsigned long long)e->seq, e->seq > done ? " (unfinished)" : "", (unsigned long long)e->ms, (unsigned long long)e->draws,
             (unsigned long long)e->passes, (unsigned long long)e->dispatches, (unsigned long long)e->vs, (unsigned long long)e->fs,
             (unsigned long long)e->cs, e->w, e->h, e->ncolor, e->color0, e->depth);
+    }
+    {   // every pipeline the unfinished submissions draw with, in order (runs of one pair as one line)
+        unsigned lo = prr_n > PRR_N ? prr_n - PRR_N : 0, shown = 0;
+        LOG("[vk] pipelines in the unfinished submissions, in order (submission: vs fs x draws):\n");
+        for (unsigned k = lo; k < prr_n && shown < 200; k++) {
+            const typeof(prr[0]) *e = &prr[k & (PRR_N - 1)];
+            if (e->seq <= done) continue;
+            LOG("[vk]   %llu: vs %llx fs %llx x%u\n", (unsigned long long)e->seq, (unsigned long long)e->vs,
+                (unsigned long long)e->fs, e->n);
+            shown++;
+        }
     }
     vk_log_memory("device lost");
     vk_builds_log();
@@ -581,6 +607,7 @@ static void gw_explain(uint64_t pa) {
 
 static char gp_label[512][112];
 static uint32_t gp_draws[512];
+static uint64_t gp_cs[512];  // (a dispatch's row: its shader's content hash - the compute sweep)
 // LARECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with LARECOMP_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 #define DL_N 4096  // (a power of two)
@@ -645,15 +672,72 @@ static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     vsnprintf(gp_label[gp_n], sizeof gp_label[0], fmt, ap);
     va_end(ap);
     gp_draws[gp_n] = 0;
+    gp_cs[gp_n] = 0;
     gp_n++;
+}
+// (the compute sweep, below with the compute programs: #315)
+static int csw_state, csw_variant, csw_samples;  // (csw_samples: the variant's profiled frames so far)
+static bool gp_sweep;
+static bool csw_tick(void);
+static void csw_start(const double *ms, const uint64_t *cs, int n);
+static void csw_measured(const double *ms, const uint64_t *cs, int n);
+// A slow frame the GPU held up (slowframe.c asks): the frame after it is profiled as LARECOMP_GPUPROF_AT does, and only
+// its heaviest rows go to the log - which pass / dispatch / shader costs the time, on GPUs we can't test here (#299:
+// RX 6700 XT on Linux at 17 fps, #315: RX 580, one view at 18 fps even at 25% resolution). At most 3 a session, a minute
+// apart; one frame waits for its timestamps (a hitch of one frame). LARECOMP_GPUPROF_AUTO=0: off.
+static int gp_auto_want, gp_auto_n;
+static bool gp_auto;
+static uint64_t gp_auto_last;
+void vk_gpuprof_request(void) {
+    static int off = -1;
+    if (off < 0) off = ENV("LARECOMP_GPUPROF_AUTO") && !atoi(ENV("LARECOMP_GPUPROF_AUTO"));
+    uint64_t now = plat_now_ns();
+    if (off || gp_auto_n >= 3 || (gp_auto_last && now - gp_auto_last < 60000000000ull)) return;
+    gp_auto_last = now, gp_auto_n++;
+    __atomic_store_n(&gp_auto_want, 1, __ATOMIC_RELEASE);
+}
+bool vk_gpuprof_take_request(void) {  // (device.c, at a frame's start)
+    if (csw_tick()) { gp_auto = true; return true; }
+    if (!__atomic_exchange_n(&gp_auto_want, 0, __ATOMIC_ACQ_REL)) return false;
+    gp_auto = true;
+    return true;
+}
+static int gp_cmp_ms(const void *a, const void *b) {
+    double x = ((const double *)a)[0], y = ((const double *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
 }
 void renderer_flush(void);
 void vk_gpuprof_report(void) {
-    if (!gp_n) return;
+    if (!gp_n) { gp_auto = false; return; }
     renderer_flush();
     uint64_t t[512];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
+        if (gp_auto) {  // (the heaviest rows, heaviest first)
+            static double rows[512][2], rms[512];
+            static uint64_t rcs[512];
+            int n = 0;
+            for (int i = 0; i + 1 < gp_n; i++) rows[n][0] = rms[n] = (t[i + 1] - t[i]) * per, rcs[n] = gp_cs[i], rows[n][1] = i, n++;
+            if (gp_sweep) {  // (the compute sweep's frame: its numbers only)
+                LOG("[cs-sweep] variant %d, frame %d: GPU %.2f ms\n", csw_variant, csw_samples + 1, total);
+                csw_measured(rms, rcs, n);
+                gp_sweep = gp_auto = false;
+                gp_n = 0;
+                return;
+            }
+            csw_start(rms, rcs, n);
+            qsort(rows, (size_t)n, sizeof rows[0], gp_cmp_ms);
+            LOG("[gpuprof] slow frame: GPU %.2f ms in %d rows; the heaviest (LARECOMP_GPUPROF_AUTO=0: off)\n", total, n);
+            for (int k = 0; k < n && k < 12; k++) {
+                int i = (int)rows[k][1];
+                LOG("[gpuprof] %6.3f ms %5.1f%%  %s", rows[k][0], 100 * rows[k][0] / (total > 0 ? total : 1), gp_label[i]);
+                if (gp_draws[i]) LOG(", %u draws", gp_draws[i]);
+                LOG("\n");
+            }
+            gp_auto = false;
+            gp_n = 0;
+            return;
+        }
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
         for (int i = 0; i + 1 < gp_n; i++) {
             double ms = (t[i + 1] - t[i]) * per;
@@ -661,6 +745,7 @@ void vk_gpuprof_report(void) {
             if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
         }
     }
+    gp_auto = false;
     gp_n = 0;
 }
 
@@ -1062,146 +1147,7 @@ static bool ib_guard_on(void) {  // (LARECOMP_IB_GUARD=0: draws with parameters 
 }
 
 // ================================================================== worker threads (shader / pipeline builds)
-// First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
-// LARECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
-// state: what the build sets when done (a draw waiting on it can run it itself: run_queued_now)
-typedef struct Job { void (*fn)(void *); void *arg; _Atomic int *state; struct Job *next; } Job;
-static Job *jobs_head, *jobs_tail;
-static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
-// when each thread's current job started (0: idle) - wait_built says which one a stalled draw is stuck behind
-#define MAX_WORKERS 16
-static _Atomic uint64_t worker_t0[MAX_WORKERS], translator_t0;
-static _Atomic int nworkers;
-static _Atomic uint64_t builds_done;  // (shaders / pipelines built, all session: renderer_shader_builds)
-// Shader work for runtime/hle/framepace.c (seconds spent building shaders don't count against 60 fps): the builds
-// done so far, top bit set while one is being built
-uint64_t renderer_shader_builds(void) {
-    uint64_t n = atomic_load(&builds_done);
-    if (atomic_load(&translator_t0)) n |= 1ull << 63;
-    for (int i = 0; i < atomic_load(&nworkers); i++) if (atomic_load(&worker_t0[i])) n |= 1ull << 63;
-    return n;
-}
-
-static __thread int t_worker = -1;   // (this thread's worker slot; -1: not a worker. vk_compile_abandon)
-static __thread bool t_prep_job;     // (a shader preparation job: counted in prep_pending)
-static __thread _Atomic int *t_build_state;  // (the Pipe being built: its state)
-static __thread int t_build_slot;
-static void *worker(void *a) {
-    int me = (int)(intptr_t)a;
-    t_worker = me;
-    for (;;) {
-        pthread_mutex_lock(&jobs_lock);
-        while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
-        Job *j = jobs_head;
-        jobs_head = j->next;
-        if (!jobs_head) jobs_tail = NULL;
-        pthread_mutex_unlock(&jobs_lock);
-        atomic_store(&worker_t0[me], SDL_GetTicksNS());
-        j->fn(j->arg);
-        atomic_store(&worker_t0[me], 0);
-        free(j);
-    }
-    return NULL;
-}
-
-static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = ENV("LARECOMP_SYNC_SHADERS") != NULL;
-    return v;
-}
-
-// Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
-// translating on the game thread cost up to ~90 ms per frame on entering an area). Compiles go on to the workers.
-static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (compute shaders translate on the game thread)
-static Job *tjobs_head, *tjobs_tail;
-static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
-static void *translator(void *a) {
-    (void)a;
-    for (;;) {
-        pthread_mutex_lock(&tjobs_lock);
-        while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
-        Job *j = tjobs_head;
-        tjobs_head = j->next;
-        if (!tjobs_head) tjobs_tail = NULL;
-        pthread_mutex_unlock(&tjobs_lock);
-        atomic_store(&translator_t0, SDL_GetTicksNS());
-        j->fn(j->arg);
-        atomic_store(&translator_t0, 0);
-        free(j);
-    }
-    return NULL;
-}
-static bool sync_shaders(void);
-static void run_translate(void (*fn)(void *), void *arg, _Atomic int *state) {
-    if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
-    Job *j = malloc(sizeof *j);
-    j->fn = fn; j->arg = arg; j->state = state; j->next = NULL;
-    pthread_mutex_lock(&tjobs_lock);
-    if (tjobs_tail) tjobs_tail->next = j; else tjobs_head = j;
-    tjobs_tail = j;
-    pthread_cond_signal(&tjobs_cond);
-    pthread_mutex_unlock(&tjobs_lock);
-}
-
-static void run_job(void (*fn)(void *), void *arg, _Atomic int *state) {
-    if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) {
-        started = true;
-        // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
-        int n = plat_cpu_count();  // (the process's affinity mask: a process held to a few cores, few workers)
-        if (n <= 0) n = SDL_GetNumLogicalCPUCores();
-        n -= 4;
-        if (n < 4) n = 4;
-        if (n > MAX_WORKERS) n = MAX_WORKERS;
-        nworkers = n;
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, (void *)(intptr_t)i); }
-    }
-    Job *j = malloc(sizeof *j);
-    j->fn = fn; j->arg = arg; j->state = state; j->next = NULL;
-    pthread_mutex_lock(&jobs_lock);
-    if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
-    jobs_tail = j;
-    pthread_cond_signal(&jobs_cond);
-    pthread_mutex_unlock(&jobs_lock);
-}
-
-// A draw that has to wait for its build (wait_built) takes it out of the queues - the translator's, then the
-// workers' - and runs it on its own thread: queued behind the dozens a new area or effect brings, it waited for all
-// of them (over a second, a frozen frame). false: not queued (running, or done).
-// The queued job building state, taken out of its queue (take) or moved to its front, for the next free thread: a draw
-// skipped for it (wait_scene) gets it in a build or two, not after every build queued before it.
-static Job *queued_job(_Atomic int *state, bool take) {
-    for (int q = 0; q < 2; q++) {
-        pthread_mutex_t *lock = q ? &jobs_lock : &tjobs_lock;
-        Job **head = q ? &jobs_head : &tjobs_head, **tail = q ? &jobs_tail : &tjobs_tail, *prev = NULL;
-        pthread_mutex_lock(lock);
-        for (Job **pj = head; *pj; prev = *pj, pj = &(*pj)->next) {
-            Job *j = *pj;
-            if (j->state != state) continue;
-            if (take || pj != head) {
-                *pj = j->next;
-                if (*tail == j) *tail = prev;
-                if (!take) j->next = *head, *head = j;
-            }
-            pthread_mutex_unlock(lock);
-            return j;
-        }
-        pthread_mutex_unlock(lock);
-    }
-    return NULL;
-}
-static bool run_queued_now(_Atomic int *state) {
-    Job *j = queued_job(state, true);
-    if (!j) return false;
-    j->fn(j->arg);
-    free(j);
-    return true;
-}
+#include "build_threads.h"
 
 // ================================================================== state
 typedef struct {
@@ -2677,6 +2623,7 @@ typedef struct {
     struct PipeMemo *pmemo;     // (render thread) draw_'s pipeline key memo for this program
     bool reuse;                 // set reuse (stage_set): some uniform buffers are dynamic, sets are kept while their contents repeat
     struct SetCache *scache[2]; // (render thread) stage_set's last set per set index
+    struct PrepPipe *prep_wait; // (shader preparation, under prep_lock) its records' pipelines, queued once it is built
 } Prog;
 static void fullcap_draw(Prog *pr, CmdRec *r, bool indexed, uint32_t inst, int ndraw, bool gpu_params);  // (full capture)
 static void fullcap_before(void);  // (full capture: the targets just before a draw)
@@ -2859,13 +2806,25 @@ static inline const GWin *gwin(void) {
 static uint64_t gwin_want(void) { return gwin()->phys ? gwin_.max : kernel_heap_size(); }
 
 static void gmem_window_get(uint64_t *lo, uint64_t *len);  // (the guest-heap import window, below)
-// Translates both stages (false: failed, logged). Holds the translator for the whole program.
-static bool translate_program_now(Prog *p) {
+// The translator's window for this thread's next translations (translate.c: per thread)
+static void translate_globals_set(void) {
     uint64_t wl, wn;
     gmem_window_get(&wl, &wn);
-    pthread_mutex_lock(&translate_lock);  // (the globals too: the render thread translates as well - run_queued_now)
     maxwell_gmem_base = gwin_base + wl, maxwell_gmem_size = wn;
     maxwell_gmem_chunk_shift = gmem_chunk_shift();
+    // (translate.c maxwell_gmem_bda) compute shaders by the import's device address: the windows of one import with an
+    // address (AMD: g_vk.gmem_addr), starting where the shaders' offsets do. LARECOMP_VK_CS_BDA=0: the windows; =1 on
+    // any GPU with windows.
+    extern bool maxwell_gmem_bda;
+    extern uint64_t g_gmem_va, g_gmem_guest;
+    static int on = -1;
+    if (on < 0) { const char *e = ENV("LARECOMP_VK_CS_BDA"); on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x1002; }
+    extern bool maxwell_gmem_lazy;
+    maxwell_gmem_bda = on && !maxwell_gmem_lazy && maxwell_gmem_chunk_shift && g_gmem_va && g_gmem_guest == maxwell_gmem_base;
+}
+// Translates both stages (false: failed, logged)
+static bool translate_program_now(Prog *p) {
+    translate_globals_set();
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
@@ -2888,7 +2847,6 @@ static bool translate_program_now(Prog *p) {
             }
         }
     }
-    pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
@@ -2905,7 +2863,10 @@ static bool translate_program_now(Prog *p) {
 
 static void translate_program(void *arg) {
     Prog *p = arg;
-    if (!translate_program_now(p)) return;
+    pthread_mutex_lock(&translate_lock);  // (the render thread translates as well - run_queued_now)
+    bool ok = translate_program_now(p);
+    pthread_mutex_unlock(&translate_lock);
+    if (!ok) return;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     run_job(compile_program, p, &p->state);
@@ -2940,7 +2901,8 @@ static void note_code(const NvnShaderStage *s, uint64_t fp, const char *stage) {
 
 // ================================================================== prepared objects (shader_prep.h)
 // Built before the game from the shipped variant list; found by content (code hashes + keys) at first use, as code
-// addresses differ from run to run. Kept for the whole process (reboots included). prep_lock guards the tables.
+// addresses differ from run to run. Kept for the whole process (reboots included), or let go once built on a PC with
+// little RAM (prep_release). prep_lock guards the tables.
 static pthread_mutex_t prep_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t key; void *obj; } PrepEnt;
 static PrepEnt *prep_progs, *prep_pipes, *prep_cs;  // program / pipeline / compute content key -> Prog / Pipe / CsProg
@@ -3636,6 +3598,9 @@ static void build_pipeline(void *arg) {
         long e = -1;
         if (atomic_compare_exchange_strong(&left, &e, ENV("LARECOMP_TEST_COMPILE_CRASH") ? atol(ENV("LARECOMP_TEST_COMPILE_CRASH")) : 0)) {}
         if (atomic_load(&left) > 0 && atomic_fetch_sub(&left, 1) == 1) *(volatile int *)(uintptr_t)8 = 1;
+        static _Atomic int urgent_once;  // LARECOMP_TEST_COMPILE_CRASH_URGENT=1: the first build a draw waits on (#251)
+        if (t_worker == MAX_WORKERS && ENV("LARECOMP_TEST_COMPILE_CRASH_URGENT") && !atomic_exchange(&urgent_once, 1))
+            *(volatile int *)(uintptr_t)8 = 1;
     }
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &c.pi, NULL, &pp->pipe);
     t_build_vs = t_build_fs = 0;
@@ -3668,11 +3633,7 @@ bool vk_compile_abandon(void) {
     atomic_fetch_add(&builds_done, 1);
     atomic_store(t_build_state, 2);
     if (t_prep_job) prep_pending--;
-    atomic_store(&worker_t0[t_worker], 0);
-    pthread_t t;
-    pthread_create(&t, NULL, worker, (void *)(intptr_t)t_worker);
-    t_worker = -1;
-    return true;
+    return build_thread_leave();
 }
 
 // Dynamic vertex input (g_vk.vids): the draw's layout, as build_pipeline would bake it in
@@ -4909,6 +4870,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         if (stage == 5) {
             for (int i = 0; i < 16; i++) key.ub[i][0] = st.ubuf[5][i].addr, key.ub[i][1] = st.ubuf[5][i].size;
             key.g[0] = gx, key.g[1] = gy, key.g[2] = gz;
+            extern uint64_t g_gmem_va;
+            key.g[3] = (uint32_t)(g_gmem_va >> 8);  // (a new import: another address in the constants)
         }
         // A compute shader reads its uniform buffers through the table below with global memory loads, which reach
         // only the guest memory window: one outside it read zero (Pokémon Z-A: the rain's particle update read its
@@ -4954,6 +4917,14 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 u[0] = (uint32_t)ua; u[1] = (uint32_t)(ua >> 32); u[2] = (uint32_t)us;
                 uint32_t *e = &drv[(0x310 + 16 * i) / 4];
                 e[0] = (uint32_t)sb[i].addr; e[1] = (uint32_t)(sb[i].addr >> 32); e[2] = (uint32_t)sb[i].size;
+            }
+            extern uint64_t g_gmem_va, g_gmem_guest, g_gmem_va_size;  // (translate.c maxwell_gmem_bda: the heap by address)
+            uint64_t wl_, wn_;
+            gmem_window_get(&wl_, &wn_);
+            if (g_gmem_va && g_gmem_guest == gwin_base + wl_) {
+                uint32_t *e = &drv[GMEM_BDA_OFF / 4];
+                uint64_t words = g_gmem_va_size / 4;
+                e[0] = (uint32_t)g_gmem_va; e[1] = (uint32_t)(g_gmem_va >> 32); e[2] = words > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)words;
             }
         } else {
             uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
@@ -7333,7 +7304,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 }
 
 // ================================================================== compute
-typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; uint64_t code, gh; _Atomic int used; } CsProg;  // (gh: the GLSL's hash, first_use)
+typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3], shared; uint64_t code, gh; _Atomic int used; int variant; } CsProg;  // (variant: the compute sweep's)  // (gh: the GLSL's hash, first_use)
 
 // Compute programs run in 32-lane subgroups, as Maxwell's warps do. The game's compute shaders use ballot / shuffle / vote on a 32-lane warp (Pokémon Z-A's GPU culling
 // counts the visible instances of a batch with ballot + a leader's atomicAdd); AMD drivers run compute in 64-lane waves by default (RADV), where those counts are wrong:
@@ -7360,7 +7331,10 @@ static void build_compute(void *arg) {
     uint64_t t0 = SDL_GetTicksNS();
     int bs = build_begin("pipeline cs", cp->code, 0);
     size_t n = 0;
+    extern __thread int vk_spirv_opt_perf;
+    vk_spirv_opt_perf = 0;  // (the compute sweep tried the SPIR-V optimizer: 10-30x slower on an RX 580)
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
+    vk_spirv_opt_perf = 0;
     if (!spv) { atomic_store(&cp->p.state, 2); build_end(bs); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
@@ -7415,25 +7389,31 @@ static void build_compute(void *arg) {
 }
 
 
-static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3]) {
+static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3], uint32_t shared) {
     uint64_t h = code_hash;
     for (int i = 0; i < 3; i++) { h ^= local[i]; h *= 0x100000001B3ull; }
-    return h;
+    return (h ^ shared) * 0x100000001B3ull;
 }
 
 static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint64_t addr) {
-    uint64_t wl, wn;
-    gmem_window_get(&wl, &wn);
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);  // (the globals too: the render thread translates as well - run_queued_now)
-    maxwell_gmem_base = gwin_base + wl, maxwell_gmem_size = wn;
-    maxwell_gmem_chunk_shift = gmem_chunk_shift();
+    translate_globals_set();
+    // (unknown: a record from before the size was kept - the most the hardware has, 48 KB, or what this GPU allows)
+    uint32_t smax = g_vk.props.limits.maxComputeSharedMemorySize;
+    maxwell_shared_bytes = cp->shared ? cp->shared : smax < 0xC000 ? smax : 0xC000;
+    extern bool maxwell_cs_no_gfast;
+    extern bool maxwell_cs_uniform_pc;
+    maxwell_cs_no_gfast = cp->variant & 1;  // (the compute sweep: heap only)
+    maxwell_cs_uniform_pc = (cp->variant & 2) != 0;  // (... and one pc a turn)
     cp->si = maxwell_translate(code, max, STAGE_COMPUTE, &k);
+    maxwell_cs_no_gfast = maxwell_cs_uniform_pc = false;
     if (ENV("LARECOMP_DUMP_GLSL")) {  // (debug) build/glsl/<code address>.comp
         mkdir("build/glsl", 0755);
         char path[96];
-        snprintf(path, sizeof path, "build/glsl/%llx.comp", (unsigned long long)addr);
+        if (cp->variant) snprintf(path, sizeof path, "build/glsl/%llx_v%d.comp", (unsigned long long)addr, cp->variant);  // (a sweep variant)
+        else snprintf(path, sizeof path, "build/glsl/%llx.comp", (unsigned long long)addr);
         FILE *f = fopen(path, "wb");
         if (f) { fputs(cp->si->msl ? cp->si->msl : cp->si->error, f); fclose(f); }
     }
@@ -7445,6 +7425,114 @@ static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint6
         return false;
     }
     return true;
+}
+
+// ---- compute sweep (#315): an RX 580's [gpuprof] rows put Lumiose's three crowd dispatches at 23 + 16 + 9 ms a
+// frame (0.3-0.7 ms on an RTX 4060 Ti), and the first guess - their storage slots in video memory - changed nothing.
+// Rather than a test build per guess, the game times the guesses itself: when a slow frame's profile has compute
+// dispatches over CSW_MS, each such shader (by content, up to CSW_T) gets variants built beside it - 1: loads, stores
+// and atomics on the heap only (no gfast copy / gfind table search per access), 2: its switch (pc) state machine one
+// pc a turn for the subgroup (translate.c maxwell_cs_uniform_pc), 3: both - and
+// each variant in turn replaces it (only once built: the original runs meanwhile), for a profiled frame every
+// CSW_WAIT. The log gets a [cs-sweep] table; a variant at least 30% faster than the original stays in use. Once a
+// session. The variants compute the same thing as the original. LARECOMP_CS_SWEEP=0: off, LARECOMP_CS_SWEEP_MS: the bar.
+#define CSW_T 3
+#define CSW_N 4
+#define CSW_MS (ENV("LARECOMP_CS_SWEEP_MS") ? atof(ENV("LARECOMP_CS_SWEEP_MS")) : 3.0)  // (tests: a lower bar)
+#define CSW_WAIT 6000000000ull
+static uint64_t csw_hash[CSW_T];      // the shaders swept (content hash)
+static int csw_nt;                    // (csw_state: 0 not yet, 1 sweeping, 2 done; csw_variant: the one in use, 0 the original)
+static int csw_pick[CSW_T];           // after the sweep: each shader's variant
+static double csw_ms[CSW_T][CSW_N];   // GPU ms a frame, by variant (0: not measured)
+static uint64_t csw_since;            // when this variant went in, or its last sample (ns)
+#define CSW_SAMPLES 3
+static CsProg *csw_prog[CSW_T][CSW_N];
+// (dispatch) the program to run for cp: a variant of a swept shader when it's built, else cp
+static CsProg *csw_choose(CsProg *cp, NvnShaderStage *ss, uint64_t *hash_out) {
+    uint64_t h = shader_stage_hash(ss);
+    *hash_out = h;
+    if (!csw_state || !h) return cp;
+    int t = 0;
+    while (t < csw_nt && csw_hash[t] != h) t++;
+    if (t == csw_nt) return cp;
+    // (every variant built at once, at the shader's first dispatch in the sweep: AMD's compiler took 23-45 s for each
+    // optimized one of these on an RX 580, and one after the other ran past the wait. The SPIR-V optimizer variants
+    // timed 10-30x slower there: replaced by the uniform pc ones.)
+    for (int k = 1; csw_state == 1 && k < CSW_N; k++) {
+        if (csw_prog[t][k]) continue;
+        CsProg *w = csw_prog[t][k] = calloc(1, sizeof *w);
+        memcpy(w->local, cp->local, sizeof w->local);
+        w->shared = cp->shared, w->code = cp->code, w->variant = k;
+        if (translate_compute(w, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr))
+            run_job(build_compute, w, &w->p.state);
+    }
+    int v = csw_state == 2 ? csw_pick[t] : csw_variant;
+    CsProg *w = v ? csw_prog[t][v] : NULL;
+    return w && atomic_load(&w->p.state) == 1 ? w : cp;
+}
+static void csw_start(const double *ms, const uint64_t *cs, int n) {  // (a slow frame's rows)
+    static int off = -1;
+    if (off < 0) off = ENV("LARECOMP_CS_SWEEP") && !atoi(ENV("LARECOMP_CS_SWEEP"));
+    if (off || csw_state) return;
+    for (int i = 0; i < n && csw_nt < CSW_T; i++) {
+        if (!cs[i] || ms[i] < CSW_MS) continue;
+        int t = 0;
+        while (t < csw_nt && csw_hash[t] != cs[i]) t++;
+        if (t == csw_nt) csw_hash[csw_nt++] = cs[i];
+    }
+    if (!csw_nt) return;
+    csw_state = 1, csw_variant = 0, csw_samples = 0, csw_since = plat_now_ns() - CSW_WAIT;  // (v0, the original, first)
+    LOG("[cs-sweep] %d slow compute shader%s: timing the original (v0) and variants 1-%d (1 heap only, 2 "
+        "one pc a turn, 3 both), %d frames each (LARECOMP_CS_SWEEP=0: off)\n", csw_nt, csw_nt == 1 ? "" : "s", CSW_N - 1,
+        CSW_SAMPLES);
+}
+static void csw_end(void) {
+    csw_state = 2, csw_variant = 0;
+    for (int t = 0; t < csw_nt; t++) {
+        char b[200];
+        int n = snprintf(b, sizeof b, "[cs-sweep] cs %016llx:", (unsigned long long)csw_hash[t]);
+        int best = 0;
+        for (int v = 0; v < CSW_N; v++) {
+            if (csw_ms[t][v] > 0) n += snprintf(b + n, sizeof b - n, " v%d %.2f ms", v, csw_ms[t][v]);
+            else n += snprintf(b + n, sizeof b - n, " v%d -", v);
+            if (v && csw_ms[t][v] > 0 && csw_ms[t][v] < csw_ms[t][best]) best = v;
+        }
+        csw_pick[t] = best && csw_ms[t][best] < 0.7 * csw_ms[t][0] ? best : 0;
+        if (ENV("LARECOMP_CS_VARIANT")) csw_pick[t] = atoi(ENV("LARECOMP_CS_VARIANT")) & 3;  // (tests: this one, whatever the times)
+        LOG("%s -> v%d in use\n", b, csw_pick[t]);
+    }
+}
+// (vk_gpuprof_take_request) the sweep's next profile, when the variant has been in long enough and is built
+static bool csw_tick(void) {
+    if (csw_state != 1 || plat_now_ns() - csw_since < (csw_samples ? 1000000000ull : CSW_WAIT)) return false;
+    bool built = true, failed = false;
+    for (int t = 0; t < csw_nt && csw_variant; t++) {
+        int s = csw_prog[t][csw_variant] ? atomic_load(&csw_prog[t][csw_variant]->p.state) : 0;
+        if (s != 1) built = false;
+        if (s == 2) failed = true;
+    }
+    // (not built yet: waited up to 2 minutes - a failed build or a shader no longer dispatched is skipped)
+    if (!built && !failed && plat_now_ns() - csw_since < 120000000000ull) return false;
+    if (!built) {
+        LOG("[cs-sweep] variant %d: %s, skipped\n", csw_variant, failed ? "its build failed" : "not built in 2 minutes");
+        if (++csw_variant == CSW_N) csw_end();
+        csw_since = plat_now_ns();
+        return false;
+    }
+    gp_sweep = true;
+    return true;
+}
+// (vk_gpuprof_report) the sweep's profile: this variant's GPU time per shader
+static void csw_measured(const double *ms, const uint64_t *cs, int n) {
+    for (int t = 0; t < csw_nt; t++) {
+        double sum = 0;
+        for (int i = 0; i < n; i++) if (cs[i] == csw_hash[t]) sum += ms[i];
+        csw_ms[t][csw_variant] += sum / CSW_SAMPLES;
+    }
+    csw_since = plat_now_ns();
+    if (++csw_samples < CSW_SAMPLES) return;
+    csw_samples = 0;
+    if (++csw_variant == CSW_N) csw_end();
 }
 
 // Compute programs by code address and fingerprint (cs_kv), and by content - code hash and workgroup size
@@ -7465,8 +7553,10 @@ static CsProg *compute_program(NvnProgram *np) {
         local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
         if (!local[i]) local[i] = 1;
     }
+    uint32_t shared = ss->control ? *(const uint32_t *)(ss->control + 0x754) : 0;  // (shared memory bytes: LDS / STS)
     uint64_t fp = code_fp(ss);
     fp ^= ((uint64_t)local[0] | (uint64_t)local[1] << 21 | (uint64_t)local[2] << 42) * 0x9E3779B97F4A7C15ull;
+    fp ^= (uint64_t)shared * 0xC2B2AE3D27D4EB4Full;
     uint64_t ak = (ss->code_addr * 0xff51afd7ed558ccdull) ^ fp;
     if (!ak) ak = 1;
     KvEnt *ae = kv_find(&cs_kv, ak);
@@ -7477,12 +7567,12 @@ static CsProg *compute_program(NvnProgram *np) {
         LOG("[compute] 256 code addresses for %u compute programs (the same shaders loaded again elsewhere)\n", cs_content_kv.n);
     }
     if (shader_rec_recording()) {
-        ShaderRec rec = {.kind = 'C', .vs = shader_stage_hash(ss), .local = {local[0], local[1], local[2]}};
+        ShaderRec rec = {.kind = 'C', .vs = shader_stage_hash(ss), .local = {local[0], local[1], local[2]}, .shared = shared};
         shader_rec_note(&rec);
         shader_seen_code(rec.vs, ss);  // (its code for the next start's preparation: shader_prep.h)
     }
     uint64_t ch = shader_stage_hash(ss);
-    uint64_t ck = ch ? cs_content_key(ch, local) : 0;
+    uint64_t ck = ch ? cs_content_key(ch, local, shared) : 0;
     KvEnt *ce = ck ? kv_find(&cs_content_kv, ck) : NULL;
     CsProg *cp = ce && ce->key ? ce->val : NULL;  // (this shader, already met at another address)
     if (!cp && ch && prep_cs_n) cp = PREP_GET(prep_cs, ck);  // prepared before the game
@@ -7500,6 +7590,7 @@ static CsProg *compute_program(NvnProgram *np) {
     kv_set(&cs_kv, ae, ak, cp);
     if (ck) kv_set(&cs_content_kv, kv_find(&cs_content_kv, ck), ck, cp);
     memcpy(cp->local, local, sizeof local);
+    cp->shared = shared;
     if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr))
         return cp;
     save_glsl(cp->si->msl, ss->code_addr, "cs");
@@ -7508,8 +7599,8 @@ static CsProg *compute_program(NvnProgram *np) {
 }
 
 // ================================================================== shader preparation (shader_prep.h)
-// Each record: translated here (one thread, the translator isn't re-entrant), compiled and built on the worker
-// threads (run_job), kept in the prep_* tables for the game.
+// Each record: translated (graphics: prep_translate; compute here), compiled and built on the worker threads (run_job),
+// kept in the prep_* tables for the game.
 typedef struct { void (*fn)(void *); void *arg; } PrepJob;
 static void prep_job_run(void *a) {
     PrepJob *j = a;
@@ -7527,6 +7618,7 @@ static void prep_job(void (*fn)(void *), void *arg) {
 }
 
 static _Atomic int prep_pipe_dups;  // records whose pipeline another record already made
+static _Atomic int prep_tr_failed;  // programs whose translation failed (prep_translate)
 // (Pokémon Z-A: only once the game has set up its physical memory window - the translations bake its base and size
 // in, and before that it's Link's Awakening's heap: the start screen's preparation would have made every program with
 // the wrong one. Z-A's runs at its start instead, shader_prep.c shader_prep_boot)
@@ -7535,6 +7627,8 @@ bool renderer_prepare_begin(void) { return g_vk.dev != VK_NULL_HANDLE && (gwin()
 int renderer_prepare_pending(void) { return prep_pending; }
 static void gpl_probe(void);
 static void gpl_probe_note(Pipe *pp);
+static bool prep_release_on(void);
+static void prep_release(void);
 void renderer_prepare_end(void) {
     vk_pipeline_cache_save();  // (otherwise only kept at exit)
     static bool logged;        // (the counts: once per process, the background preparation runs once)
@@ -7543,19 +7637,61 @@ void renderer_prepare_end(void) {
         pthread_mutex_lock(&prep_lock);
         size_t n = prep_pipes_n;
         pthread_mutex_unlock(&prep_lock);
-        LOG("[vk] prepared %zu pipelines (%d records shared one, vertex input %s)\n", n, atomic_load(&prep_pipe_dups),
-            g_vk.vids ? "dynamic" : "in each pipeline");
+        LOG("[vk] prepared %zu pipelines (%d records shared one, vertex input %s; %d programs failed to translate)\n", n,
+            atomic_load(&prep_pipe_dups), g_vk.vids ? "dynamic" : "in each pipeline", atomic_load(&prep_tr_failed));
         if (g_vk.gpl_probe) gpl_probe();
     }
+    if (prep_release_on()) prep_release();
 }
 
-typedef struct { Pipe *pp; ShaderRec r; } PrepPipe;
+// Under 12 GB of RAM the prepared programs and pipelines are let go once built (#222: an 8 GB laptop, the game at
+// 9.1 GB, Windows paging it out - stalls of 1-7 s in battles). Kept, they cost ~2.3 GB of process memory (4261 pipelines
+// from 4404 programs, most of it the driver's: Lumiose walk, RTX 2080 Ti, 9.7 -> 7.4 GB) for the ~240 one area uses.
+// Their builds stay in the pipeline cache (saved just before) and the driver's own: the game makes what it uses again
+// at first use, a cache hit each (entering Lumiose: 314 in about a second, one 98 ms frame). Graphics only - the few
+// compute programs stay. Only while no game runs (the preparation's own rule, shader_prep.h): nothing has taken one yet.
+// LARECOMP_SHADER_PREP_KEEP=1 keeps them, =0 lets them go on any PC; F1 > Compatibility > Prepare shaders at start: On
+// keeps them too.
+static bool prep_release_on(void) {
+    const char *e = ENV("LARECOMP_SHADER_PREP_KEEP");
+    if (e && *e) return atoi(e) == 0;
+    return g_settings.gpu_compat[GPU_SHADER_PREP] != GPU_ON && SDL_GetSystemRAM() < 12 * 1024;
+}
+static void prep_release(void) {
+    pthread_mutex_lock(&prep_lock);
+    size_t np = 0, ng = 0;
+    for (size_t i = 0; i < prep_pipes_cap; i++) {
+        Pipe *p = prep_pipes[i].obj;
+        if (!prep_pipes[i].key || !p) continue;
+        if (p->pipe) vkDestroyPipeline(g_vk.dev, p->pipe, NULL);
+        free(p), np++;
+    }
+    for (size_t i = 0; i < prep_progs_cap; i++) {
+        Prog *p = prep_progs[i].obj;
+        if (!prep_progs[i].key || !p) continue;
+        VkShaderModule m[3] = {p->vs, p->fs, p->fs_late};
+        for (int j = 0; j < 3; j++) if (m[j]) vkDestroyShaderModule(g_vk.dev, m[j], NULL);
+        if (p->layout) vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
+        for (int j = 0; j < 2; j++)  // ([2]: the shared heap chunk set's, gmem_chunk_layout)
+            if (p->set_layout[j]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[j], NULL);
+        maxwell_free(p->vi);
+        maxwell_free(p->fi);
+        free(p), ng++;
+    }
+    free(prep_pipes), free(prep_progs);
+    prep_pipes = prep_progs = NULL;
+    prep_pipes_cap = prep_progs_cap = prep_pipes_n = prep_progs_n = 0;
+    pthread_mutex_unlock(&prep_lock);
+    LOG("[vk] prepared shaders let go (%d MB RAM%s): %zu pipelines, %zu programs - the game builds what it uses from the "
+        "warm caches\n", SDL_GetSystemRAM(), ENV("LARECOMP_SHADER_PREP_KEEP") ? ", LARECOMP_SHADER_PREP_KEEP=0" : ", under 12 GB",
+        np, ng);
+}
+
+typedef struct PrepPipe { Pipe *pp; ShaderRec r; struct PrepPipe *next; } PrepPipe;
 static void prep_pipeline(void *arg) {
     PrepPipe *a = arg;
     Prog *pr = a->pp->k.prog;
-    // its program's compile was queued before (the queue is first in, first out): wait for it to finish
-    while (atomic_load(&pr->state) == 0) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
-    if (atomic_load(&pr->state) != 1) { atomic_store(&a->pp->state, 2); free(a); return; }
+    if (atomic_load(&pr->state) != 1) { free(a->pp); free(a); return; }  // (its program failed: queued only once built)
     const ShaderRec *r = &a->r;
     // the pass's attachment formats as begin_pass makes them for these targets
     VkFormat color[8] = {0}, depth = VK_FORMAT_UNDEFINED, stencil = VK_FORMAT_UNDEFINED;
@@ -7590,13 +7726,31 @@ static void prep_pipeline(void *arg) {
     free(a);
 }
 
+// A prepared program translated and compiled on a worker - on the preparing thread alone, a first start after a
+// translator update took 100-124 s behind the logos (#297 #298; 18.0 -> 7.1 s on an i7-9700K). Its records' pipelines
+// wait on it (prep_wait) and are queued once it is built: a worker waiting for it held up the translations.
+static void prep_translate(void *arg) {
+    Prog *p = arg;
+    bool ok = translate_program_now(p);
+    free((void *)(uintptr_t)p->code[0]), free((void *)(uintptr_t)p->code[1]);
+    p->code[0] = p->code[1] = 0;
+    if (ok) compile_program(p);
+    else atomic_fetch_add(&prep_tr_failed, 1);
+    pthread_mutex_lock(&prep_lock);  // (its state is set: renderer_prepare queues later records itself)
+    PrepPipe *w = p->prep_wait;
+    p->prep_wait = NULL;
+    pthread_mutex_unlock(&prep_lock);
+    for (PrepPipe *n; w; w = n) n = w->next, prep_job(prep_pipeline, w);  // (a failed program's: freed there)
+}
+
 bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlob *fsb) {
     if (r->kind == 'C') {
-        uint64_t ck = cs_content_key(r->vs, r->local);
+        uint64_t ck = cs_content_key(r->vs, r->local, r->shared);
         if (PREP_GET(prep_cs, ck)) return true;
         CsProg *cp = calloc(1, sizeof *cp);
         cp->code = r->vs;  // (prepared: its content hash, for the build logs)
         memcpy(cp->local, r->local, sizeof cp->local);
+        cp->shared = r->shared;
         if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, 0)) return false;
         PREP_PUT(prep_cs, ck, cp);
         prep_job(build_compute, cp);
@@ -7615,26 +7769,32 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
     Prog *p = PREP_GET(prep_progs, ck);
     if (!p) {
         p = calloc(1, sizeof *p);
-        p->code[0] = (uintptr_t)vsb->code;
-        p->code[1] = (uintptr_t)fsb->code;
         p->cmax[0] = vsb->const_offset ? vsb->const_offset : 0x10000;
         p->cmax[1] = fsb->const_offset ? fsb->const_offset : 0x10000;
         p->vkey = vkey;
         p->fkey = fkey;
         p->prep_vh = r->vs, p->prep_fh = r->fs;
         p->hash[0] = r->vs, p->hash[1] = r->fs;
-        bool ok = translate_program_now(p);
-        p->code[0] = p->code[1] = 0;  // (the game files' copies are gone after this call)
+        // (the game files' copies are gone after this call: the job gets its own, with blob_read's zero padding)
+        for (int s = 0; s < 2; s++) {
+            const ShaderBlob *b = s ? fsb : vsb;
+            void *d = b->code ? malloc(b->size + 0x100) : NULL;
+            if (d) p->code[s] = (uintptr_t)memcpy(d, b->code, b->size + 0x100);
+        }
         PREP_PUT(prep_progs, ck, p);  // (failed ones too: the game then skips them as it would its own)
-        if (!ok) return false;
-        prep_job(compile_program, p);
+        prep_job(prep_translate, p);
     }
+    // (a translation that fails later counts as prepared here: renderer_prepare_end logs those)
     if (atomic_load(&p->state) == 2) return false;
     PrepPipe *a = calloc(1, sizeof *a);
     a->pp = calloc(1, sizeof *a->pp);
     a->pp->k.prog = p;
     a->r = *r;
-    prep_job(prep_pipeline, a);
+    pthread_mutex_lock(&prep_lock);
+    bool wait = atomic_load(&p->state) == 0;  // (still translating or compiling: prep_translate queues it)
+    if (wait) a->next = p->prep_wait, p->prep_wait = a;
+    pthread_mutex_unlock(&prep_lock);
+    if (!wait) prep_job(prep_pipeline, a);
     return true;
 }
 
@@ -7865,6 +8025,8 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP_CS(!cp ? SK_NO_STAGES : atomic_load(&cp->p.state) == 2 ? SK_CS_FAILED : SK_CS_BUILDING); return; }
+    uint64_t cs_hash = 0;
+    if (g_gpuprof_frame || csw_state) cp = csw_choose(cp, &st.program->stages[5], &cs_hash);  // (#315: the compute sweep)
     {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
         if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
@@ -7888,8 +8050,9 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
-            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d%s", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
+            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem, cp->variant ? " (sweep variant)" : "");
+    if (g_gpuprof_frame && gp_n) gp_cs[gp_n - 1] = cs_hash ? cs_hash : shader_stage_hash(&st.program->stages[5]);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     if (dl_on > 0) vk_checkpoint(cb, dl_n);
     nfeedback = 0;
@@ -7919,8 +8082,12 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     gfast_stores = cp->si->uses_gmem_store;
     {
+        // LARECOMP_GFAST_ALL=1: every bound slot, =0 / unset: the slots the shader reads (si->ssbo_read). (#315: a
+        // compute shader's slots sit at 0x310 in its driver constants, which ssbo_read doesn't count, so compute
+        // dispatches get none copied. Copying all of them on AMD was tried (8a2f62a8): an RX 580's crowd dispatches
+        // stayed at 33-40 ms - the heap across PCIe wasn't what made them slow - so it's off again.)
         static int all = -1;
-        if (all < 0) all = getenv("LARECOMP_GFAST_ALL") != NULL;
+        if (all < 0) { const char *e = getenv("LARECOMP_GFAST_ALL"); all = e && atoi(e) != 0; }
         gfast_mask = all ? 0xFFFF : cp->si->ssbo_read;
     }
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
@@ -8305,7 +8472,7 @@ static void fixed_state(FixedState *f, bool flip_x, bool flip_y, bool native, Vk
 // player's PC as a battle began), and the log says what the shader threads were doing. A full-screen draw runs its
 // own build if it's still queued (run_queued_now): it waits for that build, not for every one queued before it.
 static bool wait_scene(_Atomic int *state) {
-    if (atomic_load(state) == 0) queued_job(state, false);  // (its build next: skipped for a frame or two, not until
+    if (atomic_load(state) == 0) queued_job(state, false, NULL);  // (its build next: skipped for a frame or two, not until
                                                              // the whole queue is done; 2: failed, nothing queued)
     static double budget_ms = -1;
     if (budget_ms < 0) budget_ms = ENV("LARECOMP_VK_SCENE_WAIT_MS") ? atof(ENV("LARECOMP_VK_SCENE_WAIT_MS")) : 6;
@@ -8865,13 +9032,20 @@ static void draw_(CmdRec *r, bool indexed) {
                 reads_scene = true;
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
-        extern bool widescreen_ui_pane_partial(const float *u, uint64_t size);  // (a smaller layout pane: boxed UI)
-        bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad &&
-                               !widescreen_ui_pane_partial((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size);
+        // (a layout pane's bounds on the 16:9 screen, -1..1: runtime/hle/widescreen.c - partial, a smaller pane: boxed UI.
+        // Link's Awakening asks only for full-screen quads.)
+        extern bool widescreen_ui_pane_bounds(const float *u, uint64_t size, float lo[2], float hi[2]);
+        extern bool widescreen_ui_bounds_partial(const float lo[2], const float hi[2]);
+        float b_lo[2] = {0, 0}, b_hi[2] = {0, 0};
+        bool pane = (!g_game_is_la || fullscreen_quad) &&
+                    widescreen_ui_pane_bounds((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size, b_lo, b_hi);
+        bool partial = pane && widescreen_ui_bounds_partial(b_lo, b_hi), za_pane = pane && !g_game_is_la;
+        bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad && !partial;
         if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;
         extern uint64_t renderer_exec_frame(void);  // (the frame being translated)
-        if (reads_scene) wide_frame = renderer_exec_frame();
+        uint64_t fr = renderer_exec_frame();
+        if (reads_scene) wide_frame = fr;
         bool fade_fill = false;
         if (fullscreen_fill && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
             const float *c = (const float *)(uintptr_t)st.ubuf[1][0].addr;
@@ -8880,12 +9054,20 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         // (Pokémon Z-A: its screen fade is a layout pane the size of the screen, 1920x1080, filled from a 16x16 white
         // texture - boxed, it left the sides unfaded through a load's fade-in in the ultrawide view,
-        // runtime/hle/widescreen.c. A pane that big with an image of its own, a menu backdrop, stays in the box.)
-        if (!g_game_is_la && fullscreen_quad && pr->fi->ntex == 1 && tex_wh[1][0][0] <= 64 && tex_wh[1][0][1] <= 64 &&
-            st.ubuf[0][0].addr && st.ubuf[0][0].size == 560 &&
-            !widescreen_ui_pane_partial((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size))
-            fade_fill = true;
-        bool composite = reads_scene || fade_fill || (fullscreen_fill && wide_frame == renderer_exec_frame());
+        // runtime/hle/widescreen.c. A pane that big with an image of its own, a menu's pattern, stays in the box.)
+        bool screen_pane = za_pane && fullscreen_quad && pr->fi->ntex == 1 && !partial;
+        if (screen_pane && tex_wh[1][0][0] <= 64 && tex_wh[1][0][1] <= 64) fade_fill = true;
+        // (and its menus' backdrop, the world blurred: such a pane with a screen-sized image the GPU drew - the blur, made
+        // from the wide scene, so the whole wide view squeezed into 16:9. Boxed, the sides showed what the game draws
+        // under it with a menu up, its scene at 16x8 pixels, stretched: big blocks, #254. It fills the window instead.)
+        static uint64_t whole_frame = ~0ull;  // (a frame with a menu's backdrop or a screen's background: laid out whole)
+        if (screen_pane && tex_wh[1][0][0] == st.rt.color[0]->width && tex_wh[1][0][1] == st.rt.color[0]->height) {
+            NvnTexture *t = hook_pass ? ftex[0] : shader_texture_object(1, &pr->fi->tex[0]);
+            if (t && t->backend && renderer_is_gpu_owned(t)) fade_fill = true, whole_frame = fr;
+        }
+        static uint64_t scene_frame = ~0ull;  // (a frame whose world was drawn into the window: play, not a title / load)
+        if (reads_scene) scene_frame = fr;
+        bool composite = reads_scene || fade_fill || (fullscreen_fill && wide_frame == fr);
         if (!composite) wide_frame = ~0ull;
         if (!composite) {
             int pw, ph;
@@ -8894,6 +9076,35 @@ static void draw_(CmdRec *r, bool indexed) {
             vp_sx = vp_sy = u;
             vp_ox = (pw - st.rt.color[0]->width * u) * 0.5f;
             vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
+            // Pokémon Z-A: a background pane reaches the window's edges, not the 16:9 box's. Bounds in screen units
+            // (the screen is -1..1, 2 wide): one 1.95-3.6 wide (about one to two screens: the title's shading, and its
+            // big glows, whose bounds grow as they turn) running to or past an edge, or a plain one (no image, or a fill
+            // of 64 pixels or less) at least 0.3 wide that ends exactly at the left or right edge (the loading screens'
+            // band, a menu's side panel). Not the minimap's map (1.54 or 5.3 wide, run off the screen and clipped),
+            // images ending at an edge (a menu's title), or small pieces near it (the party's arrow glow, -0.992).
+            float a = fmaxf(b_lo[0], -1), b = fminf(b_hi[0], 1);  // (the pane's part on the 16:9 screen)
+            float wide = b_hi[0] - b_lo[0];
+            bool big = za_pane && wide >= 1.95f && wide <= 3.6f;
+            bool plain = za_pane && (pr->fi->ntex == 0 || (tex_wh[1][0][0] <= 64 && tex_wh[1][0][1] <= 64)) && b - a >= 0.3f;
+            bool at_l = (big && b_lo[0] <= -0.99f) || (plain && fabsf(b_lo[0] + 1) < 0.002f);
+            bool at_r = (big && b_hi[0] >= 0.99f) || (plain && fabsf(b_hi[0] - 1) < 0.002f);
+            if ((at_l || at_r) && b > a + 0.01f && vp[2] > 0) {
+                // (a screen-wide one - not a panel at one edge, which play can show too - means a screen laid out whole)
+                if (big || (at_l && at_r)) whole_frame = fr;
+                // That side stretched out, its other edge (and the text and icons over it, other panes) where it was.
+                float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
+                float L = at_l ? 0 : vx + (a + 1) * 0.5f * vw, R = at_r ? (float)pw : vx + (b + 1) * 0.5f * vw;
+                float nw = 2 * (R - L) / (b - a), nx = L - (a + 1) * 0.5f * nw;
+                vp_sx = nw / vp[2], vp_ox = nx - vp[0] * vp_sx;
+            } else if (!g_game_is_la && g_settings.hud_width > 0 && g_settings.aspect == ASPECT_UNLOCKED &&
+                       scene_frame == fr && whole_frame != fr) {
+                // F1 > HUD width: over the world (not a frame laid out whole), a piece on the left / right side
+                // (widescreen_ui_hud_side) moves out by that share of the extra width (vp_ox: half of it), never
+                // stretched: the minimap, the party, the battle panels reach the corners (and markers over the world there).
+                extern int widescreen_ui_hud_side(const float *u, uint64_t size, bool pane, const float lo[2], const float hi[2]);
+                vp_ox += widescreen_ui_hud_side((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size, za_pane, b_lo,
+                                                b_hi) * vp_ox * (float)g_settings.hud_width / 100.0f;
+            }
         }
     }
     {   // camera-attached effects sized for 16:9 are widened with the view (runtime/hle/widescreen.c)
@@ -9205,6 +9416,7 @@ static void draw_(CmdRec *r, bool indexed) {
     stat_draws++;
     cum_draws++;
     subr_now.draws++, subr_now.vs = pr->hash[0], subr_now.fs = pr->hash[1];
+    prr_note(pr->hash[0], pr->hash[1]);
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
             size_t l = strlen(gp_label[gp_n - 1]);

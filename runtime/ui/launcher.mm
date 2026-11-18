@@ -35,6 +35,7 @@
 #include "imgui_impl_sdl3.h"
 
 extern "C" {
+#include "bugrec.h"
 #include "platform.h"
 #include "paths.h"
 #include "gamebuild.h"
@@ -106,7 +107,7 @@ static const char *build_version(const uint8_t id[8]) {
 static bool build_is_za(const uint8_t id[8]) { return build_version(id) && memcmp(id, BUILD_ID, 8); }
 // The release tag this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read
 // it): ZA Recomp's v<major>.<minor>.<patch> (Hexveil404/PokeZ-ARecomp releases).
-#define LARECOMP_VERSION "v0.1.22"
+#define LARECOMP_VERSION "v0.1.25"
 extern "C" void rt_launcher_log(const char *fmt, ...);  // runtime/launcher_log.c: logs/launcher.log and stderr
 extern "C" const char *rt_version(void) { return LARECOMP_VERSION; }  // (runtime/main.c: the log's first line)
 extern "C" const char *larecomp_version(void) { return LARECOMP_VERSION; }  // (the shader caches' tag)
@@ -865,7 +866,7 @@ extern "C" int launcher_maxlod_state(void) {  // 0 off / nothing to do, 1 being 
         if (plat_proc_wait(g_maxlod_proc, false) < 0) return 1;
         g_maxlod_proc = 0;
     }
-    return file_exists("cache/maxlod/.made") ? 2 : 0;
+    return file_exists("cache/maxlod.new/.made") || file_exists("cache/maxlod/.made") ? 2 : 0;  // (.new: taken in at the start)
 }
 extern "C" void launcher_maxlod_kick(void) {
     char tool[1100];
@@ -877,7 +878,7 @@ extern "C" void launcher_maxlod_kick(void) {
     if (stat(data.c_str(), &sb)) return;
     snprintf(src, sizeof src, "%lld %lld", (long long)sb.st_size, (long long)sb.st_mtime);
     if (FILE *f = fopen("cache/maxlod.src", "rb")) { size_t n = fread(had, 1, sizeof had - 1, f); had[n] = 0; fclose(f); }
-    if (!strcmp(src, had) && file_exists("cache/maxlod/.made")) return;
+    if (!strcmp(src, had) && launcher_maxlod_state() == 2) return;
     if (!rt_resource("zaprompts/zaprompts" PLAT_EXE_SUFFIX, "build/helper/zaprompts/zaprompts" PLAT_EXE_SUFFIX, tool, sizeof tool))
         return;
     mkdir("cache", 0755);
@@ -885,6 +886,120 @@ extern "C" void launcher_maxlod_kick(void) {
     const char *argv[] = {tool, "--romfs", romfs.c_str(), "--maxlod", "cache/maxlod", NULL};
     g_maxlod_proc = plat_spawn(argv, "cache/maxlod.log", false);
     rt_launcher_log("[launcher] full-detail models: %s\n", g_maxlod_proc ? "being made (cache/maxlod.log)" : "zaprompts didn't start");
+}
+
+// The game files checked once, pack by pack, against the known good copies (zaprompts --verify,
+// tools/za/verify_files.py: ~5 s on an SSD) for each data.trpfs (cache/verify.src: its size and time). A damaged
+// download of the 2.0.2 update went around: Scraggy's model pack is broken, and the game crashes where it first loads
+// Scraggy (#173 #223 #233 #294 #301 - zaimport has checked the packages since v0.1.24, files set up before never were).
+// Result in cache/verify.txt ("ok <version>", "damaged <version> <n>" + the packs, "unknown"); log cache/verify.log.
+static PlatProc g_verify_proc;
+static std::string g_damaged;  // (the start screen's notice: the damaged packs, said once per visit)
+static bool g_damaged_looked;
+extern "C" int launcher_verify_state(void) {  // 0 nothing / not checked, 1 checking, 2 ok, 3 damaged, 4 incomplete
+    if (g_verify_proc) {
+        if (plat_proc_wait(g_verify_proc, false) < 0) return 1;
+        g_verify_proc = 0;
+    }
+    char head[64] = "";
+    FILE *f = fopen("cache/verify.txt", "rb");
+    if (!f) return 0;
+    if (!fgets(head, sizeof head, f)) head[0] = 0;
+    fclose(f);
+    return !strncmp(head, "damaged", 7) ? 3 : !strncmp(head, "missing", 7) ? 4 : !strncmp(head, "ok", 2) ? 2 : 0;
+}
+static void launcher_verify_kick(void) {
+    char tool[1100];
+    if (g_root.empty() || g_verify_proc || getenv("LARECOMP_NO_VERIFY")) return;
+    std::string romfs = file_exists(g_root + "/romfs.bin") ? g_root + "/romfs.bin" : g_root + "/romfs";
+    std::string data = romfs + (is_dir(romfs) ? "/arc/data.trpfs" : "");
+    char src[64] = "", had[64] = "";
+    struct stat sb;
+    if (is_dir(romfs) && (stat(data.c_str(), &sb) || sb.st_size < (1 << 20)) && file_exists(romfs + "/arc/data.trpfd")) {
+        // (#311: a folder extracted by another tool, with the index but not the packs: the game crashes as it starts.
+        // runtime/services/fs.c stops there too, with the same words)
+        mkdir("cache", 0755);
+        remove("cache/verify.src");
+        if (FILE *f = fopen("cache/verify.txt", "wb")) fprintf(f, "missing arc/data.trpfs\n"), fclose(f);
+        rt_launcher_log("[launcher] game files: %s/arc/data.trpfs is missing (incomplete game files)\n", romfs.c_str());
+        return;
+    }
+    if (stat(data.c_str(), &sb)) return;
+    snprintf(src, sizeof src, "%lld %lld", (long long)sb.st_size, (long long)sb.st_mtime);
+    if (FILE *f = fopen("cache/verify.src", "rb")) { size_t n = fread(had, 1, sizeof had - 1, f); had[n] = 0; fclose(f); }
+    if (!strcmp(src, had) && file_exists("cache/verify.txt")) return;
+    if (!rt_resource("zaprompts/zaprompts" PLAT_EXE_SUFFIX, "build/helper/zaprompts/zaprompts" PLAT_EXE_SUFFIX, tool, sizeof tool))
+        return;
+    mkdir("cache", 0755);
+    remove("cache/verify.txt");
+    if (FILE *f = fopen("cache/verify.src", "wb")) fputs(src, f), fclose(f);
+    const char *argv[] = {tool, "--romfs", romfs.c_str(), "--verify", "cache/verify.txt", NULL};
+    g_verify_proc = plat_spawn(argv, "cache/verify.log", false);
+    rt_launcher_log("[launcher] game files: %s\n", g_verify_proc ? "being checked (cache/verify.log)" : "zaprompts didn't start");
+}
+static bool begin_question(const char *id, float s);  // (below)
+// (the Play page, each frame) a finished check that found damaged packs: said once per visit, with what to do
+static void damaged_prompt(float s) {
+    static bool missing;  // (state 4: arc/data.trpfs not in the folder, #311)
+    if (!g_damaged_looked && launcher_verify_state() >= 3) {
+        g_damaged_looked = true;
+        missing = launcher_verify_state() == 4;
+        g_damaged.clear();
+        if (FILE *f = fopen("cache/verify.txt", "rb")) {
+            char line[512];
+            int n = 0;
+            while (fgets(line, sizeof line, f)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (n++ == 0) { rt_launcher_log("[launcher] game files: %s (cache/verify.txt)\n", line); continue; }
+                if (n <= 6) g_damaged += std::string(n > 2 ? "\n" : "") + line;
+                else if (n == 7) g_damaged += "\n...";
+            }
+            fclose(f);
+        }
+        ImGui::OpenPopup("##damaged");
+    }
+    if (!begin_question("##damaged", s)) return;
+    ImGui::PushTextWrapPos(0);
+    if (missing) {
+        ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", TR("Your game files are incomplete", "Seus arquivos do jogo estão incompletos"));
+        ImGui::Spacing();
+        ImGui::TextUnformatted(TR("arc/data.trpfs, the file with the game's models, maps and texts (about 4.7 GB), is "
+                                  "missing from the game files' folder (extracted/romfs). The game closes as soon as it "
+                                  "starts without it.",
+                                  "Falta o arc/data.trpfs, o arquivo com os modelos, mapas e textos do jogo (cerca de "
+                                  "4,7 GB), na pasta dos arquivos do jogo (extracted/romfs). Sem ele o jogo fecha assim "
+                                  "que começa."));
+        ImGui::Spacing();
+        ImGui::TextUnformatted(TR("To fix it: Settings > Delete game files, then choose your .xci / .nsp files again - "
+                                  "the setup extracts everything itself.",
+                                  "Para corrigir: Configurações > Apagar arquivos do jogo e escolha seus arquivos .xci / "
+                                  ".nsp de novo - a preparação extrai tudo sozinha."));
+    } else {
+    ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", TR("Your game files are damaged", "Seus arquivos do jogo estão danificados"));
+    ImGui::Spacing();
+    ImGui::TextUnformatted(TR("Part of them differs from a good copy of this version: the download they came from was "
+                              "damaged. The game crashes when it loads these parts (with Scraggy's model: leaving the lab, "
+                              "the sewers, Acris's battle...).",
+                              "Uma parte deles é diferente de uma cópia boa desta versão: o download de onde vieram estava "
+                              "danificado. O jogo fecha quando carrega essas partes (com o modelo do Scraggy: saindo do "
+                              "laboratório, nos esgotos, na batalha da Acris...)."));
+    ImGui::Spacing();
+    ImGui::TextUnformatted(TR("To fix it: get the update (and the base game) again from your own Switch or a new download, "
+                              "then Settings > Delete game files and choose the folder again. The setup checks every package "
+                              "now and names a damaged one.",
+                              "Para corrigir: pegue a atualização (e o jogo base) de novo do seu próprio Switch ou de um "
+                              "download novo, depois Configurações > Apagar arquivos do jogo e escolha a pasta de novo. A "
+                              "preparação agora confere cada pacote e diz qual está danificado."));
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", g_damaged.c_str());
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, 14 * s));
+    ImGui::SetItemDefaultFocus();
+    if (ImGui::Button("OK", ImVec2(300 * s, 44 * s)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+        ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
 }
 
 // F1 > Draw distance (#190): cache/drawdist made by zaprompts --drawdist (tools/za/draw_dist.py: the world's LOD /
@@ -898,7 +1013,9 @@ extern "C" int launcher_drawdist_state(void) {  // 0 nothing to do, 1 being made
     }
     unsigned long long made = 0;
     int pct = 0;
-    if (FILE *f = fopen("cache/drawdist/.made", "rb")) { if (fscanf(f, "%llu %d", &made, &pct) != 2) pct = 0; fclose(f); }
+    FILE *f = fopen("cache/drawdist.new/.made", "rb");  // (made, not taken in yet: runtime/services/fs.c cache_take_new)
+    if (!f) f = fopen("cache/drawdist/.made", "rb");
+    if (f) { if (fscanf(f, "%llu %d", &made, &pct) != 2) pct = 0; fclose(f); }
     return pct && pct == g_settings.draw_dist ? 2 : 0;
 }
 extern "C" void launcher_drawdist_kick(void) {
@@ -923,6 +1040,46 @@ extern "C" void launcher_drawdist_kick(void) {
                     g_drawdist_proc ? "being made (cache/drawdist.log)" : "zaprompts didn't start");
 }
 
+// F1 > Content: cache/content made by zaprompts --content (tools/za/content_mod.py: the item, shop and evolution
+// tables, a second or two) when a choice is on and none was made for this data and choice (cache/content.src).
+// Log: cache/content.log.
+extern "C" const char *content_want(void);  // (runtime/services/fs.c: "stones+tradeevo", "stones", "tradeevo" or "")
+static PlatProc g_content_proc;
+extern "C" int launcher_content_state(void) {  // 0 nothing to do / not made, 1 being made, 2 ready for the choice
+    if (g_content_proc) {
+        if (plat_proc_wait(g_content_proc, false) < 0) return 1;
+        g_content_proc = 0;
+    }
+    unsigned long long made = 0;
+    char what[32] = "";
+    FILE *f = fopen("cache/content.new/.made", "rb");  // (made, not taken in yet: runtime/services/fs.c cache_take_new)
+    if (!f) f = fopen("cache/content/.made", "rb");
+    if (f) { if (fscanf(f, "%llu %31s", &made, what) != 2) what[0] = 0; fclose(f); }
+    return *content_want() && !strcmp(what, content_want()) ? 2 : 0;
+}
+extern "C" void launcher_content_kick(void) {
+    char tool[1100], what[32];
+    if (!*content_want() || g_root.empty() || g_content_proc) return;
+    std::string romfs = file_exists(g_root + "/romfs.bin") ? g_root + "/romfs.bin" : g_root + "/romfs";
+    std::string data = romfs + (is_dir(romfs) ? "/arc/data.trpfs" : "");
+    char src[96] = "", had[96] = "";
+    struct stat sb;
+    if (stat(data.c_str(), &sb)) return;
+    snprintf(src, sizeof src, "%lld %lld %s", (long long)sb.st_size, (long long)sb.st_mtime, content_want());
+    if (FILE *f = fopen("cache/content.src", "rb")) { size_t n = fread(had, 1, sizeof had - 1, f); had[n] = 0; fclose(f); }
+    if (!strcmp(src, had) && launcher_content_state() == 2) return;
+    if (!rt_resource("zaprompts/zaprompts" PLAT_EXE_SUFFIX, "build/helper/zaprompts/zaprompts" PLAT_EXE_SUFFIX, tool, sizeof tool))
+        return;
+    mkdir("cache", 0755);
+    if (FILE *f = fopen("cache/content.src", "wb")) fputs(src, f), fclose(f);
+    snprintf(what, sizeof what, "%s", content_want());
+    for (char *p = what; *p; p++) if (*p == '+') *p = ',';
+    const char *argv[] = {tool, "--romfs", romfs.c_str(), "--content", "cache/content", "--content-what", what, NULL};
+    g_content_proc = plat_spawn(argv, "cache/content.log", false);
+    rt_launcher_log("[launcher] content (%s): %s\n", content_want(),
+                    g_content_proc ? "being made (cache/content.log)" : "zaprompts didn't start");
+}
+
 // runtime/main.c, a set-up copy booting straight into the game: the icons made in the background if they never were,
 // or were made for other bindings
 extern "C" void launcher_prompts_kick(const char *root) {
@@ -932,6 +1089,8 @@ extern "C" void launcher_prompts_kick(const char *root) {
     if (prompts_wanted()) make_prompts(false);
     launcher_maxlod_kick();
     launcher_drawdist_kick();
+    launcher_content_kick();
+    launcher_verify_kick();
 }
 // runtime/ui/controls_ui.mm, a binding changed (larecomp.ini saved): the icons made again for it, from the next start
 extern "C" void launcher_prompts_refresh(void) {
@@ -2113,6 +2272,28 @@ static void reveal_folder(const std::string &dir) {
 // fonts (import / back to the substitute)
 static SDL_Window *g_launcher_win;
 static bool g_files_deleted;  // set here: the start screen goes back to setting the game files up
+// ---- a bug recording was packed (runtime/bugrec.c writes bug-reports/new.txt at the window's close or, after a crash,
+// at this start): where its zip is, once
+static std::string g_bug_zip;
+static bool g_bug_looked;  // (bug-reports/new.txt read on this visit to the start screen)
+static void bugreport_prompt(float s) {
+    if (!begin_question("##bugreport", s)) return;
+    ImGui::PushTextWrapPos(0);
+    ImGui::Text(TR("Bug report saved: %s", "Relatório salvo: %s"), g_bug_zip.c_str());
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", TR("Attach it to your GitHub issue.", "Anexe na sua issue do GitHub."));
+    ImGui::PopTextWrapPos();
+    ImGui::Dummy(ImVec2(0, 14 * s));
+    if (ImGui::Button(TR("Open the folder", "Abrir a pasta"), ImVec2(300 * s, 44 * s)))
+        reveal_folder(std::string(rt_data_root()) + "/bug-reports");
+    ImGui::SameLine(0, 20 * s);
+    ImGui::SetItemDefaultFocus();
+    if (ImGui::Button("OK", ImVec2(300 * s, 44 * s)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+        ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 static void prelaunch_tab(float sc) {
     const ImVec4 gold(0.95f, 0.71f, 0.27f, 1);
     auto heading = [&](const char *t) {
@@ -2122,6 +2303,25 @@ static void prelaunch_tab(float sc) {
         ImGui::Separator();
         ImGui::Spacing();
     };
+    // "Record for a bug report" (runtime/bugrec.c): this Play only - the save copied, what is pressed and the pacing
+    // recorded, packed into bug-reports/<time>.zip at the window's close. Only the first Play of a run of ZA Recomp
+    // (bugrec_can_start): the recorder and the clock read their settings once, so a later Play couldn't be replayed.
+    heading(TR("Bug report", "Relatar um bug"));
+    bool can = bugrec_can_start();
+    if (!can) ImGui::BeginDisabled();
+    ImGui::Checkbox(TR("Record for a bug report", "Gravar para relatar um bug"), &g_bugrec_want);
+    if (!can) ImGui::EndDisabled();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", !can ? TR("The game already ran once: restart ZA Recomp to record.", "O jogo já rodou uma vez: reinicie o ZA Recomp para gravar.")
+        : TR("Records this session so the developers can replay it: a copy of your save (with your trainer name), your "
+             "settings and what you press. Keep it short: start, show the bug (press F8), close the game. The zip goes "
+             "in the bug-reports folder.",
+             "Grava esta sessão para os desenvolvedores reproduzirem: uma cópia do seu save (com seu nome de treinador), "
+             "suas configurações e o que você aperta. Seja breve: comece, mostre o bug (aperte F8), feche o jogo. O zip "
+             "vai para a pasta bug-reports."));
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::Spacing();
     heading(TR("Game files", "Arquivos do jogo"));
     static double gb = -1;
     if (gb < 0) gb = rt_game_files_size(g_root.c_str()) / 1e9;
@@ -2408,6 +2608,59 @@ static void party_icons_kick(void) {  // made when missing (3 tries: cache/party
                     !same_data ? " (for this game data: none yet, or it changed since they were made)" : "");
 }
 
+// The code of the shipped list's Pokémon Z-A shaders (runtime/nvn/shader_variants_za.txt), taken out of the player's
+// romfs.bin by zaprompts --shader-code into SHADER_GAME_CODE (runtime/nvn/shader_prep.h: the game's packs are
+// Oodle-compressed, which only that GPLv3 helper reads): the next start's shader preparation (shader_prep_boot) then
+// has them before they're ever drawn - a fresh install's first play without the compile hitches of everything new.
+// ~30 s - 1.5 min, in the background, once per game files and list: SHADER_GAME_CODE ".need" is what was asked for
+// (the game files' size and date, then each code hash), copied to ".made" when done; 3 tries for each request.
+#define SHADER_GAME_CODE "cache/shader_code_game.bin"
+extern "C" const char *shader_prep_shipped_list_za(void);  // runtime/nvn/shader_prep.c
+static void shader_code_kick(void) {
+    static bool asked;  // (once a start)
+    char tool[1100];
+    if (asked) return;
+    asked = true;
+    std::string romfs = file_exists(g_root + "/romfs.bin") ? g_root + "/romfs.bin" : g_root + "/romfs";
+    struct stat sb;
+    if (stat(romfs.c_str(), &sb) || !file_exists(romfs + (is_dir(romfs) ? "/arc/data.trpfs" : "")) ||
+        !rt_resource("zaprompts/zaprompts" PLAT_EXE_SUFFIX, "build/helper/zaprompts/zaprompts" PLAT_EXE_SUFFIX, tool, sizeof tool))
+        return;
+    char line[64];
+    snprintf(line, sizeof line, "# %llx %llx\n", (unsigned long long)sb.st_size, (unsigned long long)sb.st_mtime);
+    std::string need = line;
+    for (const char *p = shader_prep_shipped_list_za(); (p = strstr(p, "s=")); p += 2) {  // (vs= fs= cs=)
+        unsigned long long h;
+        if ((p[-1] == 'v' || p[-1] == 'f' || p[-1] == 'c') && p[-2] == ' ' && sscanf(p + 2, "%16llx", &h) == 1 && h)
+            snprintf(line, sizeof line, "%016llx\n", h), need += line;
+    }
+    auto read = [](const char *path) {
+        std::string s;
+        if (FILE *f = fopen(path, "rb")) {
+            char b[65536];
+            for (size_t n; (n = fread(b, 1, sizeof b, f)) > 0;) s.append(b, n);
+            fclose(f);
+        }
+        return s;
+    };
+    if (read(SHADER_GAME_CODE ".made") == need) return;
+    uint64_t id = 0xcbf29ce484222325ull;  // (the request's tries: counted again for another one)
+    for (unsigned char ch : need) id = (id ^ ch) * 0x100000001b3ull;
+    unsigned long long had = 0;
+    int tries = 0;
+    if (FILE *f = fopen(SHADER_GAME_CODE ".tried", "rb")) {
+        if (fscanf(f, "%d %llx", &tries, &had) != 2 || had != id) tries = 0;
+        fclose(f);
+    }
+    if (tries >= 3) return;
+    mkdir("cache", 0755);
+    if (FILE *f = fopen(SHADER_GAME_CODE ".tried", "wb")) fprintf(f, "%d %llx", tries + 1, (unsigned long long)id), fclose(f);
+    if (FILE *f = fopen(SHADER_GAME_CODE ".need", "wb")) fwrite(need.data(), 1, need.size(), f), fclose(f);
+    const char *argv[] = {tool, "--romfs", romfs.c_str(), "--shader-code", SHADER_GAME_CODE, "--shader-need", SHADER_GAME_CODE ".need", NULL};
+    PlatProc p = plat_spawn(argv, SHADER_GAME_CODE ".log", false);
+    rt_launcher_log("[launcher] shader code: %s\n", p ? "being taken from the game files (" SHADER_GAME_CODE ".log)" : "zaprompts didn't start");
+}
+
 #ifdef __APPLE__
 static uint64_t party_texture(const void *rgba, int w, int h) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
@@ -2503,10 +2756,14 @@ static float party_panel(ImDrawList *dl, float x, float y, float w) {
 extern "C" void launcher_run(const char *root) {
     g_root = root;
     g_start_screen = 1;
+    g_bug_looked = false;  // (each visit: a recording packed on the way back to the title is said here)
     settings_load();
     lang_update();
     launcher_maxlod_kick();  // (F1 > Full-detail models on and none made for this game yet: made now, in the background)
     launcher_drawdist_kick();  // (F1 > Draw distance: the same)
+    launcher_content_kick();   // (F1 > Content: the same)
+    launcher_verify_kick();    // (the game files checked once for each copy: damaged_prompt)
+    g_damaged_looked = false;
     static bool update_checked;  // (once per launch, not again after a "Title screen" reboot)
     if (!update_checked && !getenv("LARECOMP_NO_UPDATE_CHECK")) {
         update_checked = true;
@@ -2810,6 +3067,28 @@ extern "C" void launcher_run(const char *root) {
                      tab_names[i]);
                 tx += tw + 4;
             }
+            {  // close (#258: in fullscreen, with a controller, there was no way out but F11 or Alt+F4). Like closing the
+               // window: the same quit event. Not while the game is being set up (busy), as the window's own close.
+                float cs = 30, cx = W_ - 24 - 92 - 12 - cs, cy = 17;
+                ImGui::SetCursorScreenPos(P(cx, cy));
+                ImGui::BeginDisabled(busy);
+                if (ui_invisible_button("##close", S(cs, cs), ImGuiButtonFlags_EnableNav)) {
+                    settings_save();
+                    SDL_Event q = {};
+                    q.type = SDL_EVENT_QUIT;
+                    SDL_PushEvent(&q);
+                }
+                ImGui::EndDisabled();
+                bool hot = item_hot() && !busy;
+                if (hot) {
+                    dl->AddCircleFilled(P(cx + cs / 2, cy + cs / 2), cs / 2 * g_s, IM_COL32(220, 70, 60, 200));
+                    ImGui::SetTooltip("%s", TR("Close ZA Recomp", "Fechar o ZA Recomp"));
+                } else dl->AddCircleFilled(P(cx + cs / 2, cy + cs / 2), cs / 2 * g_s, IM_COL32(255, 255, 255, 18));
+                float a = 6, mx = cx + cs / 2, my = cy + cs / 2;
+                ImU32 xc = busy ? IM_COL32(159, 179, 194, 110) : hot ? C_TEXT : C_SOFT;
+                dl->AddLine(P(mx - a, my - a), P(mx + a, my + a), xc, 2 * g_s);
+                dl->AddLine(P(mx - a, my + a), P(mx + a, my - a), xc, 2 * g_s);
+            }
             {  // PT | EN
                 float sw = 92, sx = W_ - 24 - sw, sy = 17, sh = 30;
                 dl->AddRectFilled(P(sx, sy), P(sx + sw, sy + sh), IM_COL32(255, 255, 255, 18), sh / 2 * g_s);
@@ -3036,6 +3315,7 @@ extern "C" void launcher_run(const char *root) {
                         pthread_mutex_unlock(&g_lock);
                     }
                     party_icons_kick();
+                    shader_code_kick();
                     party_panel(dl, x, ty + 68 + 34, w);
                     if (g_play_pending) pressed = true, g_play_pending = false;
                     // (a settings file from before the recommendation that already holds it: nothing to offer)
@@ -3049,6 +3329,21 @@ extern "C" void launcher_run(const char *root) {
                         else if (!g_settings.menu_tip_seen) ImGui::OpenPopup("##menutip");
                         else play = true;
                     }
+                    {   // a bug report packed since the last look (runtime/bugrec.c): said once
+                        if (!g_bug_looked) {
+                            g_bug_looked = true;
+                            char z[300] = "";
+                            if (FILE *f = fopen("bug-reports/new.txt", "rb")) {
+                                if (!fgets(z, sizeof z, f)) z[0] = 0;
+                                fclose(f);
+                                remove("bug-reports/new.txt");
+                            }
+                            z[strcspn(z, "\r\n")] = 0;
+                            if (z[0]) g_bug_zip = z, ImGui::OpenPopup("##bugreport");
+                        }
+                        bugreport_prompt(s);
+                    }
+                    damaged_prompt(s);  // (the game files' check found damaged packs: launcher_verify_kick)
                     if (g_tip_test) ImGui::OpenPopup(g_settings.aspect_asked ? "##menutip" : "##aspect"), g_tip_test = false;
                     if (g_video_test && g_video_rec.known) ImGui::OpenPopup("##videorec"), g_video_test = false;
                     if (video_prompt(s)) {
