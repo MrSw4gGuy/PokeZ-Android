@@ -498,6 +498,8 @@ static void log_to_file(void) {
     mkdir(dir, 0755);
     session_log_open(dir, g_log_path, sizeof g_log_path);
 }
+// This session's log file (runtime/bugrec.c packs it into a recorded bug report); "" without one
+const char *rt_log_file(void) { return g_log_path; }
 
 // runtime/paths.c works out the data folder from $HOME, which on Android points nowhere useful. The app's own
 // directories are what it should use, and paths.c already honours LARECOMP_DATA_ROOT, so setting that is the whole
