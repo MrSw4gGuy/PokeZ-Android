@@ -102,8 +102,6 @@ typedef struct {
     int shadow_sharp;  // 1-4: the game's shadow filter that many times narrower, up to shadow_res (vulkan/exec.c)
     int shadow_distance;  // SHADOW_DISTANCE_*: render the distant sun-shadow cascade too, or only the near one (vulkan/exec.c)
     int thermal_profile;  // THERMAL_PROFILE_*: adaptive render-scale curve for cooler / no cooler (platform/android.c)
-    int gpu_turbo;        // Android, Adreno: the GPU at its highest clock - 0 off, 1 while frames are late, 2 always
-                          // (platform/android.c gpu_turbo_tick; LARECOMP_GPU_TURBO=0 / 1 / 2 overrides it)
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool rumble;         // controller vibration from the game (runtime/hle/input.c)
     int rumble_strength; // its intensity, percent (25 / 50 / 75 / 100)

@@ -228,7 +228,7 @@ int plat_protect(uint64_t addr, uint64_t size, int prot) {
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
 
-// ---- GPU turbo (F1 > Graphics > GPU turbo, settings gpu_turbo; LARECOMP_GPU_TURBO=0 / 1 / 2 overrides it): Adreno's GPU
+// ---- GPU turbo (test only: LARECOMP_GPU_TURBO=1 while frames are late, 2 always): Adreno's GPU
 // at its highest clock (the thermal limits still apply), through the KGSL power-control property libadrenotools'
 // adrenotools_set_turbo sets: off on /dev/kgsl-3d0, the governor's again when the setting goes off, the app goes to the
 // background or ends (the property is device-wide and outlives the app). Taken from nx2androidX's perf_android.c
@@ -237,6 +237,10 @@ typedef struct APerformanceHintSession APerformanceHintSession;
 // 1 (when needed): on once 4 of the last 64 frames came later than their budget, off again after a hold (20 s, doubled
 // up to 5 min when it is needed again within 30 s of going off) in which no frame was late. A device without KGSL or one
 // that refuses the ioctl is tried once and left alone. Any Vulkan driver on KGSL: Qualcomm's and Turnip.
+// NOT an option: on the Galaxy S25+ (2026-11-18) power control off held the GPU at the clock it had - 525 MHz of 1200 -
+// and the station went 35 -> 16 fps (GPU 22 -> 52 ms a frame), Turnip and Qualcomm's driver alike. And it outlived the
+// app: a process killed (adb's force-stop: no atexit, no event) left it off for every later start, so each start gives
+// the power control back to the governor first.
 static int g_turbo_on, g_turbo_dead;
 static int turbo_set(int want) {
     struct { unsigned type; void *value; size_t size; } prop;
@@ -263,8 +267,12 @@ static void gpu_turbo_tick(uint64_t target_ns) {
     static uint64_t late_bits;  // (the last 64 frames: 1 = came later than its budget)
     static int env = -2;
     if (g_turbo_dead) return;
-    if (env == -2) { const char *e = getenv("LARECOMP_GPU_TURBO"); env = e ? atoi(e) : -1; }
-    int mode = env >= 0 ? env : g_settings.gpu_turbo;
+    if (env == -2) {
+        const char *e = getenv("LARECOMP_GPU_TURBO");
+        env = e ? atoi(e) : 0;
+        if (!turbo_set(0)) fprintf(stderr, "[turbo] the GPU's power control given back to the governor at start\n");
+    }
+    int mode = env;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec, dt = last ? now - last : 0;
