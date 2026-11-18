@@ -1005,6 +1005,14 @@ static void tab_display(bool in_game) {
         opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 2, THERMAL_PROFILE_COOLER,
                    TR("Choose the curve for your setup. With cooler: starts scaling down at headroom 0.80, in steps to 60%. Without cooler: reacts at 0.70, can drop to 50%, and recovers only below 0.45. This does not detect a cooler; select the matching profile yourself.",
                       "Escolha a curva conforme seu uso. Com cooler: começa a reduzir a escala no headroom 0,80, em degraus até 60%. Sem cooler: reage em 0,70, pode cair até 50% e só recupera abaixo de 0,45. O app não detecta o cooler; selecione o perfil correspondente manualmente."));
+        const char *turbo[] = {TR("Off", "Desligado"), TR("When needed", "Quando precisar"), TR("Always", "Sempre")};
+        opt_choice(TR("GPU turbo", "Turbo da GPU"), &g_settings.gpu_turbo, turbo, 3, 0,
+                   TR("The GPU at its highest clock instead of the phone's own choice (the system's limits for heat still apply). "
+                      "When needed: only while frames are late, back to normal once they keep up for a while. More frame rate in "
+                      "busy places; more heat and battery. Adreno GPUs only.",
+                      "A GPU no clock máximo em vez do que o celular escolhe (os limites de temperatura do sistema continuam valendo). "
+                      "Quando precisar: só enquanto quadros atrasam; volta ao normal quando o jogo acompanha por um tempo. Mais fps "
+                      "em lugares cheios; mais calor e bateria. Só em GPUs Adreno."));
     }
 #endif
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)

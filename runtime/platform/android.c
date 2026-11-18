@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -226,7 +227,71 @@ int plat_protect(uint64_t addr, uint64_t size, int prot) {
 // frame rate). Only the thread that first calls in. LARECOMP_PERF_HINT=0: off.
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
+
+// ---- GPU turbo (F1 > Graphics > GPU turbo, settings gpu_turbo; LARECOMP_GPU_TURBO=0 / 1 / 2 overrides it): Adreno's GPU
+// at its highest clock (the thermal limits still apply), through the KGSL power-control property libadrenotools'
+// adrenotools_set_turbo sets: off on /dev/kgsl-3d0, the governor's again when the setting goes off, the app goes to the
+// background or ends (the property is device-wide and outlives the app). Taken from nx2androidX's perf_android.c
+// (DM_GPU_TURBO=auto): a Galaxy Z Fold7 (Adreno 830) with an ADPF session had its GPU held at 160 MHz, 222-443 MHz
+// without, and the busy course of Super Mario Bros. Wonder dropped 3 of 300 frames at the highest clock against 31-115.
+// 1 (when needed): on once 4 of the last 64 frames came later than their budget, off again after a hold (20 s, doubled
+// up to 5 min when it is needed again within 30 s of going off) in which no frame was late. A device without KGSL or one
+// that refuses the ioctl is tried once and left alone. Any Vulkan driver on KGSL: Qualcomm's and Turnip.
+static int g_turbo_on, g_turbo_dead;
+static int turbo_set(int want) {
+    struct { unsigned type; void *value; size_t size; } prop;
+    uint32_t enable = !want;  // (kgsl.h: KGSL_PROP_PWRCTRL 0xE, 0 = power control off)
+    prop.type = 0xE, prop.value = &enable, prop.size = sizeof enable;
+    int fd = open("/dev/kgsl-3d0", O_RDWR);
+    int r = fd < 0 ? -1 : ioctl(fd, _IOW(0x09, 0x32, prop), &prop);  // IOCTL_KGSL_SETPROPERTY
+    int err = errno;
+    if (fd >= 0) close(fd);
+    errno = err;
+    return r;
+}
+static bool turbo_release(void *ud, SDL_Event *e) {  // (an event watch: the app going away gives the clock back)
+    (void)ud;
+    if ((e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_TERMINATING) && g_turbo_on && !turbo_set(0)) {
+        g_turbo_on = 0;
+        fprintf(stderr, "[turbo] the GPU's own clock control again (the app left the front)\n");
+    }
+    return true;
+}
+static void turbo_exit(void) { if (g_turbo_on) turbo_set(0); }
+static void gpu_turbo_tick(uint64_t target_ns) {
+    static int64_t last, since, off_at, hold = 20000000000ll;
+    static uint64_t late_bits;  // (the last 64 frames: 1 = came later than its budget)
+    static int env = -2;
+    if (g_turbo_dead) return;
+    if (env == -2) { const char *e = getenv("LARECOMP_GPU_TURBO"); env = e ? atoi(e) : -1; }
+    int mode = env >= 0 ? env : g_settings.gpu_turbo;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec, dt = last ? now - last : 0;
+    last = now;
+    late_bits = late_bits << 1 | (dt > (int64_t)target_ns * 5 / 4 && dt < 1000000000ll);  // (a second or more: a load)
+    int late = __builtin_popcountll(late_bits), want = g_turbo_on;
+    if (mode == 2) want = 1;
+    else if (mode != 1) want = 0;
+    else if (!g_turbo_on && late >= 4) {
+        if (off_at && now - off_at < 30000000000ll) hold = hold * 2 > 300000000000ll ? 300000000000ll : hold * 2;
+        since = now, want = 1;
+    } else if (g_turbo_on && now - since >= hold && !late) off_at = now, want = 0;
+    if (want == g_turbo_on) return;
+    if (turbo_set(want)) {
+        g_turbo_dead = 1;
+        fprintf(stderr, "[turbo] the GPU's power control could not be set (%s): not tried again\n", strerror(errno));
+        return;
+    }
+    static bool hooked;
+    if (!hooked) hooked = true, SDL_AddEventWatch(turbo_release, NULL), atexit(turbo_exit);
+    g_turbo_on = want;
+    fprintf(stderr, "[turbo] %s (%s, %d of the last 64 frames late)\n", want ? "the GPU at its highest clock" : "the GPU's own clock control again",
+            mode == 2 ? "always" : mode == 1 ? "when needed" : "off", late);
+}
+
 void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) {
+    gpu_turbo_tick(target_ns);
     static int state = -1;  // (-1 not tried, 0 none, 1 on)
     static APerformanceHintSession *s;
     static int64_t cur_target;

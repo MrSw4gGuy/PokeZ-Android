@@ -373,6 +373,7 @@ void settings_load(void) {
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "shadow_distance")) g_settings.shadow_distance = (atoi(val) >= SHADOW_DISTANCE_FULL && atoi(val) <= SHADOW_DISTANCE_OFF) ? atoi(val) : SHADOW_DISTANCE_FULL;
         else if (!strcmp(key, "thermal_profile")) g_settings.thermal_profile = atoi(val) == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
+        else if (!strcmp(key, "gpu_turbo")) { int v = atoi(val); g_settings.gpu_turbo = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "za_lod")) { int v = atoi(val); g_settings.za_lod = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "texture_quality")) { int v = atoi(val); g_settings.tex_quality = v < 0 ? 0 : v > 2 ? 2 : v; }
@@ -561,6 +562,7 @@ void settings_save(void) {
     fprintf(f, "shadow_sharpness = %d\n", g_settings.shadow_sharp);
     fprintf(f, "shadow_distance = %d\n", g_settings.shadow_distance);
     fprintf(f, "thermal_profile = %d\n", g_settings.thermal_profile);
+    fprintf(f, "gpu_turbo = %d\n", g_settings.gpu_turbo);
     fprintf(f, "ambient_occlusion = %d\n", g_settings.gtao);
     fprintf(f, "texture_quality = %d\n", g_settings.tex_quality);
     fprintf(f, "za_lod = %d\n", g_settings.za_lod);
