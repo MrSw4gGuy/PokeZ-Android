@@ -55,7 +55,7 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
 | Cenas da introdução, trem, Lumiose | Funciona, com o pop-in do próprio jogo; em Lumiose o jogo ainda pode parar com um erro de GPU (abaixo) |
-| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch). 60 fps: 60 estáveis em cenas mais leves (a estação com pouca gente) com sombras a 50%; cenas cheias pedem cerca de 22-25 ms de GPU por quadro, então ali o **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e tenta 60 de novo depois das trocas de cena |
+| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch). 60 fps: 60 estáveis em cenas mais leves (a estação com pouca gente) com sombras a 50%; as mais cheias pedem mais tempo de GPU que os 16,7 ms de um quadro - a estação cheia roda a 43-44 fps (38-39 antes de uma correção na tradução dos shaders, em 2026-11-24) e Lumiose à noite a cerca de 38 -, então ali o **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e tenta 60 de novo depois das trocas de cena |
 | Textos e caixas de diálogo | Funciona |
 | Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
 | Controles de toque | Funciona (direcional testado nos menus do jogo; o resto em teste) |
@@ -67,8 +67,9 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 
 **Bugs conhecidos** (em correção):
 - Lumiose: algum tempo depois de chegar, o jogo pode parar com "device lost" (a GPU desistiu). Alguns desenhos
-  indiretos leem os parâmetros quando a memória do jogo ali já tem outros dados. Acontece de vez em quando no driver
-  da Qualcomm e, até agora, sempre com um driver Turnip personalizado.
+  indiretos leem os parâmetros quando a memória do jogo ali já tem outros dados. Acontecia de vez em quando no driver
+  da Qualcomm e sempre com um driver Turnip personalizado; nos testes mais recentes (2026-11-24) aconteceu uma vez no
+  driver da Qualcomm e nenhuma com o Turnip.
 - Olhos: corrigidos no driver da Qualcomm desde o ZA Recomp v0.1.22 (a correção da íris precisa do quad control do
   driver). Os drivers Turnip personalizados (v39, PurpleVK T30) não têm quad control, então a íris ainda aparece em
   quadradinhos neles.
@@ -124,8 +125,9 @@ celular esquenta (até cerca de 45%). Em **Configurações > Vídeo**:
   mais suave).
 - **Resolução interna**: *Igual à tela* (100%) para uma imagem mais nítida, ao custo de mais calor (e por isso mais
   degraus depois).
-- **Resolução das sombras**: *50%* (o padrão no Android), *75%*, a *do jogo* (1024 x 1024) ou maior. As sombras do sol
-  são cerca de metade do tempo da GPU em cada quadro num celular; a 50% as bordas ficam um pouco mais grossas.
+- **Resolução das sombras**: a *do jogo* (1024 x 1024, o padrão), maior, ou *75%* / *50%*. Abaixo do tamanho do jogo
+  as bordas viram degraus e as sombras finas viram fileiras de pontos, quase sem economizar GPU: no celular de teste as
+  duas cascatas de sombra do sol levaram cerca de 2 ms por quadro na estação, tanto a 50% quanto no tamanho do jogo.
 - **Efeitos do jogo** (Pokémon Z-A 2.0.2, mudam na hora): *Nível de detalhe* Alto mantém os modelos detalhados até
   mais longe (menos pop-in, mais tempo da GPU); *Bloom*, *Profundidade de campo* e o *FXAA* do jogo podem ser
   desligados (o bloom desligado também pula a passada dele). Os pontos no jogo foram encontrados pelos

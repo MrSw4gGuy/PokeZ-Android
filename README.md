@@ -55,7 +55,7 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
 | Intro cutscenes, train, Lumiose City | Works, with the game's own pop-in; Lumiose can still stop with a GPU error (below) |
-| Frame rate | A steady 30 fps (the game's own rate on the Switch). 60 fps: a steady 60 in lighter scenes (the station with few people) with 50% shadows; crowded scenes need a GPU time per frame of about 22-25 ms, so there **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and tries 60 again after scene changes |
+| Frame rate | A steady 30 fps (the game's own rate on the Switch). 60 fps: a steady 60 in lighter scenes (the station with few people) with 50% shadows; busier ones need more GPU time than a frame's 16.7 ms - the crowded station runs at 43-44 fps (38-39 before a shader translation fix on 2026-11-24) and Lumiose at night at about 38 - so there **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and tries 60 again after scene changes |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
 | Touch controls | Works (D-pad tested in the game's menus; the rest in progress) |
@@ -67,8 +67,9 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 
 **Known bugs** (being worked on):
 - Lumiose City: some time after arriving, the game can stop with "device lost" (the GPU gave up). Some indirect draws
-  read their parameters after the game's memory there already holds other data. It happens on Qualcomm's driver now
-  and then, and every time so far with a custom Turnip driver.
+  read their parameters after the game's memory there already holds other data. It used to happen now and then on
+  Qualcomm's driver and every time with a custom Turnip driver; in the latest tests (2026-11-24) it happened once on
+  Qualcomm's driver and not at all with Turnip.
 - Eyes: fixed on Qualcomm's driver since ZA Recomp v0.1.22 (its iris fix needs the driver's quad control). Custom
   Turnip drivers (v39, PurpleVK T30) have no quad control, so the iris still shows squares there.
 - Faint straight light strips over faces and bodies in some close-up cutscenes (seen in one run).
@@ -122,8 +123,9 @@ time the phone warms up (down to about 45%). In **Settings > Video**:
 - **Upscaler**: *Snapdragon GSR* (the default: Qualcomm's own, made for Adreno), *AMD FSR 1*, or *Bilinear* (softest).
 - **Internal resolution**: *Match display* (100%) for a sharper picture, at the cost of more heat (and so more steps
   down later).
-- **Shadow resolution**: *50%* (the Android default), *75%*, the *game's* (1024 x 1024) or higher. The sun's shadows are
-  about half of the GPU's time in each frame on a phone; at 50% their edges are a little coarser.
+- **Shadow resolution**: the *game's* (1024 x 1024, the default), higher, or *75%* / *50%*. Below the game's size the
+  edges turn into stair steps and thin shadows into rows of dots, for almost no GPU time: on the test phone the sun's
+  two shadow cascades took about 2 ms a frame at the station at 50% and at the game's size alike.
 - **Game effects** (Pokémon Z-A 2.0.2, change at once): *Level of detail* High keeps the detailed models farther
   away (less pop-in, more GPU time); *Bloom*, *Depth of field* and the game's *FXAA* can be turned off (bloom off also
   skips its pass). Their sites in the game were found by [Fl4sh9174's mods](https://github.com/Fl4sh9174/Switch-Emulator-Ultrawide-FPS-Mods).

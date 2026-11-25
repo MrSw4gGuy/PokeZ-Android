@@ -68,6 +68,13 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
   Reduzida = cascata distante na metade do tamanho real do mapa (já escalado pela resolução de sombras do F1: com 50%,
   256×256), copiada para o layer 1 do mapa do jogo por um passe de render (a Adreno não faz blit no D32 do jogo). O
   mapa de IDs de objeto é R8_UINT: a cópia dele usa shader inteiro (`shadow_far_idu.frag`).
+- **Resolução das sombras**: padrão do jogo (1024) no Android também, desde 2026-11-24. Medição alternada na estação
+  (50, 100, 50, 100; `LARECOMP_SHADOW_SCALE`): as duas cascatas somam ~1,9–2,2 ms por quadro nos dois tamanhos, e o
+  tempo de GPU e o fps não mudam além do ruído. A 50% as sombras finas viram fileiras de pontos. O "metade do quadro"
+  que levou aos 50% era o passe do G-buffer, lido errado.
+- **Testes não devem gravar no ini do usuário**: o app salva as configurações a cada início com as substituições de
+  ambiente aplicadas (`LARECOMP_FRAME_DT=0` de um replay desligou a "Velocidade constante" do usuário). Rodar testes com
+  `LARECOMP_SETTINGS=<files>/larecomp-test.ini`, uma cópia do `larecomp.ini`.
 - **Perfil térmico (F1 > Vídeo)**: Com cooler / Sem cooler — muda os degraus e a recuperação de
   `plat_thermal_scale` (com cooler 100/85/70/60, baixa com margem 0,90 e sobe abaixo de 0,70, os valores medidos;
   sem cooler até 50%, baixa com 0,85, sobe abaixo de 0,65 e recupera mais devagar).
@@ -156,6 +163,5 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
 
 - 40 fps: testar no celular (sensação, velocidade do mundo, a cadência 16,7 / 33,3 ms com `LARECOMP_FG_TIMING`).
 - Glitch nos olhos: shader/textura do olho no backend.
-- Na pasta de testes: limpar `files/save` e `env.txt` do celular e restaurar `shadow_resolution = 0.5` no ini
-  (o usuário aprovou copiar/apagar saves de teste).
+- Na pasta de testes: limpar `files/save` e `env.txt` do celular (o usuário aprovou copiar/apagar saves de teste).
 - Do BytArch GTA V (GPL-3.0): usar só IDEIAS, não código (licenças: este projeto MIT, aquele GPL-3.0).
