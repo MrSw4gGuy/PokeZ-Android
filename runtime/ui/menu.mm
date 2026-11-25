@@ -1019,13 +1019,15 @@ static void tab_display(bool in_game) {
         const char *profiles[] = {TR("With cooler (60 fps)", "Com cooler (60 fps)"), TR("Without cooler (30 fps)", "Sem cooler (30 fps)")};
         if (opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 2, THERMAL_PROFILE_COOLER,
                        TR("Pick what matches how you play; the app can't tell whether a cooler is attached. With cooler: 60 "
-                          "fps, and the resolution drops in steps to 60% only near the phone's throttling point (headroom "
-                          "0.90), back up below 0.70. Without cooler: 30 fps, for playing anywhere - the resolution drops a "
-                          "little earlier (0.85), down to 50%, and comes back more slowly. Sets the Frame rate too.",
+                          "fps, and the resolution drops one step, to 85%, only near the phone's throttling point (headroom "
+                          "0.90), back up below 0.70 - lower would cool next to nothing in this game and only blur cutscenes "
+                          "and text. Without cooler: 30 fps, for playing anywhere - the resolution drops a little earlier "
+                          "(0.85), in steps down to 50%, and comes back more slowly. Sets the Frame rate too.",
                           "Escolha conforme o seu uso; o app não sabe se há um cooler. Com cooler: 60 fps, e a resolução cai "
-                          "em degraus até 60% só perto do limite de aquecimento do aparelho (folga 0,90), voltando abaixo de "
-                          "0,70. Sem cooler: 30 fps, para jogar em qualquer lugar - a resolução cai um pouco antes (0,85), "
-                          "até 50%, e volta mais devagar. Muda a Taxa de quadros também."))) {
+                          "um degrau, para 85%, só perto do limite de aquecimento do aparelho (folga 0,90), voltando abaixo "
+                          "de 0,70 - menos que isso quase não esfria neste jogo e só borra cutscenes e textos. Sem cooler: 30 "
+                          "fps, para jogar em qualquer lugar - a resolução cai um pouco antes (0,85), em degraus até 50%, e "
+                          "volta mais devagar. Muda a Taxa de quadros também."))) {
             g_settings.fps40 = false;
             g_settings.fps60 = g_settings.thermal_profile == THERMAL_PROFILE_COOLER;
         }
