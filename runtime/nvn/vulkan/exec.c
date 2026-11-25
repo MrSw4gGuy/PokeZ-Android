@@ -121,6 +121,16 @@ static int passes_in_sub;  // render passes in the submission being recorded (LA
 // (cq_resolve keeps it host side and no longer writes the game's memory late - the game may have reused the slot).
 // LARECOMP_GPU_OVERLAP=0: off (the wait on the fence's own submission, as before); =1: on.
 #define VK_OVERLAP_DEFAULT 1  // on where the write watch can run (overlap_on: off by itself without page write tracking)
+// Android: on without the watch (no app gets page write tracking there - platform/android.c), the one-frame hash probe
+// standing in for it. Off, every frame cost CPU + GPU in series: the game waited ~1.3 s of every 2 s for the GPU.
+// Galaxy S25+, Qualcomm driver, 60 fps mode, 75%: the station 32 -> 60 fps, Lumiose ~29 -> ~51 fps, same-view
+// screenshots identical, and a live play from a fresh save to the city showed nothing wrong (2026-11-25).
+// F1 > Compatibility or LARECOMP_GPU_OVERLAP=0: off.
+#ifdef __ANDROID__
+#define ANDROID_OVERLAP_UNTRACKED 1
+#else
+#define ANDROID_OVERLAP_UNTRACKED 0
+#endif
 static uint64_t deferred_seq[2];  // (seq_lock) the latest two fences the game waited on, newest first (overlap_defer)
 static uint64_t present_seq[2];   // (seq_lock) the game's latest two presents' submissions, newest first: frames' ends
 static uint64_t stat_deferred;  // SyncWaits returned without waiting (stats)
@@ -148,7 +158,7 @@ static bool overlap_on(void) {
             on = 0;
             LOG("[vk] GPU overlap off on this AMD GPU (#39; F1 > Compatibility or LARECOMP_GPU_OVERLAP=1: on)\n");
             return on;
-        } else if (VK_OVERLAP_DEFAULT && !tracked) {
+        } else if (VK_OVERLAP_DEFAULT && !tracked && !ANDROID_OVERLAP_UNTRACKED) {
             on = 0;
             LOG("[vk] GPU overlap off: no page write tracking on this system (%s); LARECOMP_GPU_OVERLAP=1 forces it on\n",
                 w && atoi(w) == 0 ? "LARECOMP_OVERLAP_WATCH=0" : heap_tracking_reason());

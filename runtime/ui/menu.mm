@@ -745,7 +745,21 @@ static void tab_display(bool in_game) {
                               "não tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção)."))) {
                 g_settings.fps60 = fr == 2;
                 g_settings.fps40 = fr == 1;
+#ifdef __ANDROID__
+                // (the thermal profile goes with the rate: 60 is the cooler's mode, 30 the one for playing without it -
+                // the Thermal profile row below sets the rate the same way; 40 keeps whichever profile was picked)
+                if (fr != 1) g_settings.thermal_profile = fr == 2 ? THERMAL_PROFILE_COOLER : THERMAL_PROFILE_NO_COOLER;
+#endif
             }
+#ifdef __ANDROID__
+            if (g_settings.fps60 && !g_settings.fps40) {  // (2026-11-25: 60 fps took the S25+ to the throttling point in ~3 minutes)
+                ImGui::PushTextWrapPos(0);  // (the phone's narrow rows: one line would be cut off)
+                ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
+                                   TR("Recommended only with a phone cooler: at 60 fps the phone heats up.",
+                                      "Recomendado só com cooler de celular: a 60 fps o aparelho esquenta."));
+                ImGui::PopTextWrapPos();
+            }
+#endif
             bool fall = !g_settings.fps60_lock;
             ImGui::BeginDisabled(!g_settings.fps60 || g_settings.fps40);
             if (opt_toggle(TR("Dynamic 30 / 60 fps", "30 / 60 fps dinâmico"), &fall, false,
@@ -842,6 +856,7 @@ static void tab_display(bool in_game) {
         g_settings.fps60 = true;
         g_settings.fps40 = false;
         g_settings.fps60_lock = false;
+        g_settings.thermal_profile = THERMAL_PROFILE_COOLER;  // (60 fps goes with the cooler's profile: the Frame rate row)
         g_settings.game_drs = true;
         g_settings.shadow_distance = SHADOW_DISTANCE_REDUCED;
         g_settings.za_lod = 2;
@@ -1000,11 +1015,20 @@ static void tab_display(bool in_game) {
             g_settings.res_mode = res_mode[ri], g_settings.res_auto = false;
     }
 #ifdef __ANDROID__
-    {
-        const char *profiles[] = {TR("With cooler", "Com cooler"), TR("Without cooler", "Sem cooler")};
-        opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 2, THERMAL_PROFILE_COOLER,
-                   TR("Choose the curve for your setup. With cooler: starts scaling down at headroom 0.80, in steps to 60%. Without cooler: reacts at 0.70, can drop to 50%, and recovers only below 0.45. This does not detect a cooler; select the matching profile yourself.",
-                      "Escolha a curva conforme seu uso. Com cooler: começa a reduzir a escala no headroom 0,80, em degraus até 60%. Sem cooler: reage em 0,70, pode cair até 50% e só recupera abaixo de 0,45. O app não detecta o cooler; selecione o perfil correspondente manualmente."));
+    {   // (platform/android.c plat_thermal_scale: the curves; the frame rate goes with the profile - Frame rate row above)
+        const char *profiles[] = {TR("With cooler (60 fps)", "Com cooler (60 fps)"), TR("Without cooler (30 fps)", "Sem cooler (30 fps)")};
+        if (opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 2, THERMAL_PROFILE_COOLER,
+                       TR("Pick what matches how you play; the app can't tell whether a cooler is attached. With cooler: 60 "
+                          "fps, and the resolution drops in steps to 60% only near the phone's throttling point (headroom "
+                          "0.90), back up below 0.70. Without cooler: 30 fps, for playing anywhere - the resolution drops a "
+                          "little earlier (0.85), down to 50%, and comes back more slowly. Sets the Frame rate too.",
+                          "Escolha conforme o seu uso; o app não sabe se há um cooler. Com cooler: 60 fps, e a resolução cai "
+                          "em degraus até 60% só perto do limite de aquecimento do aparelho (folga 0,90), voltando abaixo de "
+                          "0,70. Sem cooler: 30 fps, para jogar em qualquer lugar - a resolução cai um pouco antes (0,85), "
+                          "até 50%, e volta mais devagar. Muda a Taxa de quadros também."))) {
+            g_settings.fps40 = false;
+            g_settings.fps60 = g_settings.thermal_profile == THERMAL_PROFILE_COOLER;
+        }
     }
 #endif
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)

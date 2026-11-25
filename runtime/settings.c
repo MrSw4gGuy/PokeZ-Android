@@ -281,6 +281,10 @@ void settings_video_apply_recommended(void) {
     g_settings.res_mode = r->res_mode, g_settings.res_auto = false;
     g_settings.fps60 = g_settings.fps60_lock = r->fps60;  // (60 fps: "always", not the experimental fallback)
     g_settings.aniso16 = r->aniso16;
+#ifdef __ANDROID__
+    // (the thermal profile goes with the rate on a phone - menu.mm's Frame rate and Thermal profile rows)
+    g_settings.thermal_profile = r->fps60 ? THERMAL_PROFILE_COOLER : THERMAL_PROFILE_NO_COOLER;
+#endif
 }
 
 bool settings_video_matches_recommended(void) {
