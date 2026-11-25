@@ -72,13 +72,10 @@ Settings g_settings = {
     .tex_hd = true,
     .tex_hd_cache_mb = 512,
     .taa_render = 100,
-#ifdef __ANDROID__
-    // (a phone: the cascades' depth pass was about half the GPU's frame; at 50% an empty station holds 60 fps where the
-    // game's size held 53 - its shadow edges a little coarser)
-    .shadow_res = SHADOW_RES_HALF,
-#else
+    // (the game's size on a phone too: at the crowded station - Galaxy S25+, 2026-11-24, alternated runs - 50% saved
+    // nothing measurable (the two cascades ~1.9-2.2 ms a frame at either size: their cost is their geometry) and broke
+    // thin shadows into rows of dots. The "half the GPU's frame" it was chosen for was the G-buffer pass, misread)
     .shadow_res = 1,
-#endif
     .shadow_sharp = 1,
     .shadow_distance = SHADOW_DISTANCE_FULL,
     .thermal_profile = THERMAL_PROFILE_COOLER,

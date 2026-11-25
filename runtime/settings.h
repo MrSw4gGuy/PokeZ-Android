@@ -98,7 +98,7 @@ typedef struct {
     int tex_hd_cache_mb;    // HD pack images kept in memory once read (MB; 0: none): vulkan/textures.c hd_pending_process
     bool tex_hd, tex_dump;  // HD texture packs (textures/hd) on; dump the game's textures (textures/dump): vulkan/textures.c
     int shadow_res;    // 1-4: shadow maps drawn at that many times the game's size, from the next start (vulkan/textures.c);
-                       // SHADOW_RES_HALF / _3Q: 50% / 75% of it (a phone: their pass is about half its GPU's frame)
+                       // SHADOW_RES_HALF / _3Q: 50% / 75% of it (blockier edges; on a phone they save almost no GPU time)
     int shadow_sharp;  // 1-4: the game's shadow filter that many times narrower, up to shadow_res (vulkan/exec.c)
     int shadow_distance;  // SHADOW_DISTANCE_*: render the distant sun-shadow cascade too, or only the near one (vulkan/exec.c)
     int thermal_profile;  // THERMAL_PROFILE_*: adaptive render-scale curve for cooler / no cooler (platform/android.c)

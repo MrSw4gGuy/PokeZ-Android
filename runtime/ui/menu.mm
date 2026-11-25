@@ -1062,20 +1062,16 @@ static void tab_display(bool in_game) {
         static const int code[] = {SHADOW_RES_HALF, SHADOW_RES_3Q, 1, 2, 3, 4};
         int si = 2;
         for (int i = 0; i < 6; i++) if (code[i] == g_settings.shadow_res) si = i;
-#ifdef __ANDROID__
-        const int sdef = 0;
-#else
-        const int sdef = 2;
-#endif
-        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, sz, 6, sdef,
+        if (opt_choice(TR("Shadow resolution", "Resolução das sombras"), &si, sz, 6, 2,
                        TR("The size of the map the sun's shadows are drawn from (the game's: 1024 x 1024). Higher: smoother "
                           "shadow edges, without the stair steps, at a little GPU time and more GPU memory (4x: about 240 MB, "
-                          "2x: 60 MB). 50% / 75%: a little coarser edges, for less GPU time - on a phone the shadows are "
-                          "about half of each frame. From the next start.",
+                          "2x: 60 MB). 50% / 75%: blockier edges and thin shadows broken into dots, for very little GPU "
+                          "time (the shadows cost their geometry more than their size). From the next start.",
                           "O tamanho do mapa de onde saem as sombras do sol (o do jogo: 1024 x 1024). Maior: bordas das "
                           "sombras mais lisas, sem os degraus, por um pouco de tempo da GPU e mais memória da GPU (4x: uns "
-                          "240 MB, 2x: 60 MB). 50% / 75%: bordas um pouco mais grossas, por menos tempo da GPU - num "
-                          "celular as sombras são cerca de metade de cada quadro. A partir do próximo início.")))
+                          "240 MB, 2x: 60 MB). 50% / 75%: bordas em degraus e sombras finas quebradas em pontos, por muito "
+                          "pouco tempo da GPU (o custo das sombras é mais a geometria que o tamanho). A partir do próximo "
+                          "início.")))
             g_settings.shadow_res = code[si];
         int sh = g_settings.shadow_sharp - 1;
         const char *shd = TR("How soft the edges of the sun's shadows are: the game's own blur, or 2-4 times narrower - "

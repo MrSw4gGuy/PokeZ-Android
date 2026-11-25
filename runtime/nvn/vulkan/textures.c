@@ -237,9 +237,10 @@ static bool tex_scalable(const NvnTexture *t) {
 // quarter of the bigger map was drawn), so square render-target arrays of 2-4 layers are scaled too, depth or not.
 // Z-A at 4x: 4096x4096 x 3, ~240 MB of GPU memory for the two (15 MB at the game's size); RTX 4060, 1.5x, the shadow
 // passes 3.1-3.4 -> 3.7 ms a frame. 1 (the game's size) by default.
-// Below the game's size too (F1's 50% / 75%: SHADOW_RES_HALF / _3Q; LARECOMP_SHADOW_SCALE takes a fraction): on a phone
-// the cascades' depth pass was ~half of the GPU's frame (Galaxy S25+, 1440x810: 6.0 + 1.9 ms of 16; at 50% the frame
-// 16 -> 14.4 ms and the station at a steady 60 fps - the pass is bound by its geometry more than by its size).
+// Below the game's size too (F1's 50% / 75%: SHADOW_RES_HALF / _3Q; LARECOMP_SHADOW_SCALE takes a fraction), but it
+// buys little: the cascades' passes are bound by their geometry (Galaxy S25+, the crowded station, 2026-11-24: near +
+// far ~1.9-2.2 ms a frame at 50% and at the game's size alike - the "6.0 + 1.9 ms of 16" once read here was the
+// G-buffer pass), while 50% breaks thin shadows into rows of dots. The game's size by default on Android too.
 static float tex_shadow_scale(const NvnTexture *t) {
     static float k = -1;
     if (k < 0) {
