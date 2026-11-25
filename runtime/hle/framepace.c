@@ -80,8 +80,10 @@ uint32_t rt_frame_steps(uint32_t interval) {
 #define FPS60_FLICKER_S 20
 bool g_za_frame_hook;    // (the game is Pokémon Z-A: exec.c leaves its GPU timing counters alone)
 bool g_fps60_fell_back;  // (60 fps chosen, but the game is at 30 now: runtime/ui/menu.mm says so)
-bool g_fps40_on;         // (the 40 fps mode is running, rt_za_frame_cfg: nvn/objects.c present_pace, nvn/pace.c's frame
-                         // budget, vulkan/device.c's display hint and frame generation)
+bool g_fps40_on;         // (the 40 or the 45 fps mode is running - frames of one and two world steps mixed -,
+                         // rt_za_frame_cfg: nvn/objects.c present_pace, nvn/pace.c's frame budget, vulkan/device.c's
+                         // display hint and frame generation)
+bool g_fps45_on;         // (of those, the 45 fps mode: nvn/pace.c's frame budget)
 static bool fps60_holds(void) {
     extern uint64_t renderer_present_count(void);
     extern void menu_notice(const char *text, int seconds);
@@ -89,7 +91,7 @@ static bool fps60_holds(void) {
     static bool retry;  // (60 again after a fall back: the shorter test)
     static uint64_t t0, p0, back_at, seen_hitch;
     if (dyn < 0) dyn = !ENV("LARECOMP_FPS60_DYNAMIC") || atoi(ENV("LARECOMP_FPS60_DYNAMIC")) != 0;
-    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps40 << 2;  // (the 40 mode: 60's state fresh)
+    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps40 << 2 | g_settings.fps45 << 3;  // (40 / 45: 60's state fresh)
     if (last_setting != setting) {  // (chosen again in F1: a new try)
         last_setting = setting;
         g_fps60_fell_back = retry = false, warm = slow = held_s = 0, backoff = 1, t0 = back_at = 0;
@@ -587,17 +589,26 @@ int32_t rt_za_frame_cfg(int32_t cfg) {
     // on the 60 Hz display, each shown exactly as long as the world time it stepped (nvn/objects.c present_pace waits
     // the frame's own interval before it, g_fps40_on), at the right speed, and a frame every 25 ms on average for the
     // GPU instead of 16.7. Not even (16.7 / 33.3 ms) like a 120 Hz display could be, but the game has no 25 ms step.
+    // The 45 fps mode (fps45) is the same with one two-step frame in three (one, one, two: 16.7 / 16.7 / 33.3 ms, 22.2 on
+    // average) - between 30's battery and 60's heat, for playing without a cooler. (The S25+'s display has no 90 or 45
+    // Hz mode, and its 48 Hz one has no whole-vsync world step: 60 Hz with mixed frames is the only even-speed way.)
+    // f40 below stands for either: the mixed modes go the same way everywhere but in their cycle and frame budget.
     // LARECOMP_FPS wins (tests).
-    bool f40 = !e && g_settings.fps40;
-    static bool was40;
-    if (f40 != was40) {
-        was40 = f40;
-        LOG("[pace] 40 fps mode %s: one and two world steps in turn, each shown that long\n", f40 ? "on" : "off");
+    bool f45 = !e && g_settings.fps45 && !g_settings.fps40, f40 = (!e && g_settings.fps40) || f45;
+    static int was_mix = -1;
+    int mix = f45 ? 45 : f40 ? 40 : 0;
+    if (mix != was_mix) {
+        if (mix || was_mix > 0)
+            LOG("[pace] %d fps mode %s: %s world steps in turn, each shown that long\n", mix ? mix : was_mix, mix ? "on" : "off",
+                (mix ? mix : was_mix) == 45 ? "one, one and two" : "one and two");
+        was_mix = mix;
     }
     g_fps40_on = f40;
+    g_fps45_on = f45;
     static int phase;
     const PaceRec *pr = pace_replayed();
-    bool on = pr ? pr->on != 0 : e ? atoi(e) >= 60 : f40 ? (phase ^= 1) != 0 : fps60_holds();
+    // (the mixed modes' cycle: 40 = 60 fps mode, 30 fps mode; 45 = 60, 60, 30)
+    bool on = pr ? pr->on != 0 : e ? atoi(e) >= 60 : f45 ? (phase = (phase + 1) % 3) != 0 : f40 ? (phase ^= 1) != 0 : fps60_holds();
     static int dyn = -1;
     if (dyn < 0) dyn = ENV("LARECOMP_FRAME_MODE_DYN") ? atoi(ENV("LARECOMP_FRAME_MODE_DYN")) : 1;
     // Only with the per-channel hook (rt_za_frame_step: game code built with tools/za_patches.py FRAME_STEP, which

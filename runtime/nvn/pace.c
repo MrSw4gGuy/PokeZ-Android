@@ -103,7 +103,7 @@ static bool hold_30(bool on) {
 // for the next vsync, not one already passed). Held, a frame that started after vsync S may not let the game start
 // the next one before S + 2: if vsync S + 1 hasn't come yet, wait for it here. (The time counts as blocked: idle.)
 extern volatile uint64_t g_vsync_count, g_vsync_ns;  // runtime/hle/vi.c
-extern bool g_fps40_on;  // runtime/hle/framepace.c rt_za_frame_cfg: the 40 fps mode (its frame budget, below)
+extern bool g_fps40_on, g_fps45_on;  // runtime/hle/framepace.c rt_za_frame_cfg: the 40 / 45 fps modes (their frame budget, below)
 static void hold_cadence(bool held) {
     static uint64_t v_exit;  // the vsync count when the game last went on from here (its next frame: from the vsync after)
     if (held && v_exit) {
@@ -256,7 +256,7 @@ void pace_frame(void) {
     // 30 fps mode, its period over 25 ms, else 16.7. CPU time, not busy time: Pokémon Z-A's wait for its next frame
     // counts as busy, and a frame reported as filling its budget kept the clocks up. platform.h plat_perf_hint, a no-op
     // elsewhere)
-    plat_perf_hint(tc ? tc : 1, g_fps40_on ? 25000000ull : p > 25000000ull ? 33333333ull : 16666667ull);
+    plat_perf_hint(tc ? tc : 1, g_fps45_on ? 22222222ull : g_fps40_on ? 25000000ull : p > 25000000ull ? 33333333ull : 16666667ull);
     // What the frame would cost at 60 fps: a frame of the game's 30 fps mode (two vsyncs or more) runs its world twice,
     // and the second step - about half this thread's CPU time then (measured: 3.0 -> 6.0 ms, 4.9 -> 9.3 ms) - is work
     // a 60 fps frame doesn't have. Without that, the 30 fps mode's frames looked 3-5 ms slower than they would be at 60

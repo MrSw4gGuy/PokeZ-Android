@@ -283,7 +283,8 @@ void settings_video_apply_recommended(void) {
     g_settings.aniso16 = r->aniso16;
 #ifdef __ANDROID__
     // (the thermal profile goes with the rate on a phone - menu.mm's Frame rate and Thermal profile rows)
-    g_settings.thermal_profile = r->fps60 ? THERMAL_PROFILE_COOLER : THERMAL_PROFILE_NO_COOLER;
+    g_settings.thermal_profile = r->fps60 ? THERMAL_PROFILE_COOLER : THERMAL_PROFILE_ECONOMY;
+    g_settings.fps40 = g_settings.fps45 = false;
 #endif
 }
 
@@ -342,6 +343,7 @@ void settings_load(void) {
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
         else if (!strcmp(key, "fps40")) g_settings.fps40 = atoi(val) != 0;
+        else if (!strcmp(key, "fps45")) g_settings.fps45 = atoi(val) != 0;
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) != 0;
         else if (!strcmp(key, "frame_dt")) g_settings.frame_dt = atoi(val) != 0;
         else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
@@ -373,7 +375,7 @@ void settings_load(void) {
         else if (!strcmp(key, "tex_hd_cache_mb")) { int v = atoi(val); g_settings.tex_hd_cache_mb = v < 0 ? 0 : v > 8192 ? 8192 : v; }
         else if (!strcmp(key, "shadow_sharpness")) { int v = atoi(val); g_settings.shadow_sharp = v < 1 ? 1 : v > 4 ? 4 : v; }
         else if (!strcmp(key, "shadow_distance")) g_settings.shadow_distance = (atoi(val) >= SHADOW_DISTANCE_FULL && atoi(val) <= SHADOW_DISTANCE_OFF) ? atoi(val) : SHADOW_DISTANCE_FULL;
-        else if (!strcmp(key, "thermal_profile")) g_settings.thermal_profile = atoi(val) == THERMAL_PROFILE_NO_COOLER ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_COOLER;
+        else if (!strcmp(key, "thermal_profile")) { int v = atoi(val); g_settings.thermal_profile = v >= THERMAL_PROFILE_COOLER && v <= THERMAL_PROFILE_ECONOMY ? v : THERMAL_PROFILE_COOLER; }
         else if (!strcmp(key, "ambient_occlusion")) { int v = atoi(val); g_settings.gtao = v < 0 ? 0 : v > 3 ? 3 : v; }
         else if (!strcmp(key, "za_lod")) { int v = atoi(val); g_settings.za_lod = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (!strcmp(key, "texture_quality")) { int v = atoi(val); g_settings.tex_quality = v < 0 ? 0 : v > 2 ? 2 : v; }
@@ -530,6 +532,7 @@ void settings_save(void) {
     fprintf(f, "fps60 = %d\n", g_settings.fps60);
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
     fprintf(f, "fps40 = %d\n", g_settings.fps40);
+    fprintf(f, "fps45 = %d\n", g_settings.fps45);
     fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
     fprintf(f, "frame_dt = %d\n", g_settings.frame_dt);
     fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);
