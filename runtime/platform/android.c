@@ -392,12 +392,13 @@ void plat_restart_app(void) {
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
 // next forecast seconds, to its severe throttling point - 1.0 is that point. The thermal profile selects the render
-// scale curve: the cooler profile (60 fps) steps to 85% only; the no-cooler profile (30 fps) reacts earlier and goes
-// 100/85/70/60/50%. The cooler's curve was 100/85/70/60% until 2026-11-25: on the Galaxy S25+ the headroom stayed
-// 0.83-0.95 at 60% as at 100% (this game's GPU cost hardly follows the pixel count; the heat is the 60 fps itself), so
-// the lower steps only made cutscenes and text blocky. The API wants a call a second at most (more often it answers
-// NaN). A "[thermal]" line every 30 s and on each step. LARECOMP_THERMAL=0: off.
-static const double thermal_steps_cooler[] = {1.0, 0.85};
+// scale curve: the cooler profile (60 fps) keeps the chosen resolution (its headroom is only logged); the no-cooler
+// profile (30 fps) steps 100/85/70/60/50%. The cooler's curve was 100/85/70/60% until 2026-11-25: on the Galaxy S25+
+// the headroom stayed 0.83-0.95 at 60% as at 100% (this game's GPU cost hardly follows the pixel count; the heat is the
+// 60 fps itself), so the steps only made cutscenes and text blocky - even one step to 85% did, the phone starting a
+// session warm (the system's own throttling still guards the device). The API wants a call a second at most (more
+// often it answers NaN). A "[thermal]" line every 30 s and on each step. LARECOMP_THERMAL=0: off.
+static const double thermal_steps_cooler[] = {1.0};
 static const double thermal_steps_no_cooler[] = {1.0, 0.85, 0.7, 0.6, 0.5};
 
 static double thermal_scale_cache = 1.0;  // (the scale above, for plat_thermal_throttled)
