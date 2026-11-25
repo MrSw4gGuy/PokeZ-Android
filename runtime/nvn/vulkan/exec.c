@@ -1865,6 +1865,11 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     rec_CmdEndRendering(vk_cmd());
     in_pass = false;
+    {   // LARECOMP_GPUPROF_SPLIT=1: what follows a pass, until the next mark, a row of its own
+        static int split = -1;
+        if (split < 0) split = ENV("LARECOMP_GPUPROF_SPLIT") && atoi(ENV("LARECOMP_GPUPROF_SPLIT")) != 0;
+        if (split && g_gpuprof_frame) { vk_full_barrier(vk_cmd()); gp_mark(vk_cmd(), "  (after the pass)"); }
+    }
     if (g_debug_frame && !probe_busy && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
@@ -2333,8 +2338,8 @@ static void begin_pass(void) {
         log_passes = getenv("LARECOMP_VK_LOG_PASSES") ? atol(getenv("LARECOMP_VK_LOG_PASSES")) : 0;
         if (log_passes == 1) log_passes = 300;
     }
-    if (log_passes > 0) {
-        log_passes--;
+    if (log_passes > 0 || g_debug_frame) {  // (and every pass of a debug frame: the G-buffer's load ops and images)
+        if (log_passes > 0) log_passes--;
         LOG("[vk] pass %ux%u: %u color", minw, minh, pass_ncolor);
         for (uint32_t i = 0; i < pass_ncolor; i++) {
             TexBackend *b = !placed && st.rt.color[i] ? st.rt.color[i]->backend : NULL;
@@ -2352,6 +2357,29 @@ static void begin_pass(void) {
                 has_d ? da.imageLayout : sa.imageLayout, has_d ? da.loadOp : -1, has_s ? sa.loadOp : -1);
         else LOG(", no depth / stencil");
         LOG(", samples %u\n", pass_samples);
+    }
+    // LARECOMP_GPUPROF_SPLIT=1: the work recorded since the pass's mark (its targets' views and uploads) gets the row
+    // above, and the pass itself one of its own from here
+    static int split = -1;
+    if (split < 0) split = ENV("LARECOMP_GPUPROF_SPLIT") && atoi(ENV("LARECOMP_GPUPROF_SPLIT")) != 0;
+    if (split && g_gpuprof_frame) { vk_full_barrier(cb); gp_mark(cb, "  (begin rendering: the pass above)"); }
+    // (test, 2026-11-22) LARECOMP_VK_PASSTEST=<bits>, passes with 4+ color targets only (Z-A's G-buffer): 1 colors
+    // not cleared (DONT_CARE), 2 depth / stencil not loaded (DONT_CARE), 4 colors not stored, 8 depth / stencil not
+    // stored, 16 no stencil attachment, 32 no depth / stencil at all, 64 no color attachment. Wrong images on purpose:
+    // which of the pass's own costs is the slow one
+    static int ptest = -1;
+    if (ptest < 0) ptest = ENV("LARECOMP_VK_PASSTEST") ? atoi(ENV("LARECOMP_VK_PASSTEST")) : 0;
+    if (ptest && pass_ncolor >= 4) {
+        for (uint32_t i = 0; i < pass_ncolor; i++) {
+            if (!ca[i].imageView) continue;
+            if (ptest & 1) ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            if (ptest & 4) ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        }
+        if (ptest & 2) da.loadOp = sa.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        if (ptest & 8) da.storeOp = sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        if (ptest & 16) ri.pStencilAttachment = NULL;
+        if (ptest & 32) ri.pDepthAttachment = ri.pStencilAttachment = NULL;
+        if (ptest & 64) ri.colorAttachmentCount = 0, ri.pColorAttachments = NULL;
     }
     rec_CmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
@@ -7395,7 +7423,8 @@ static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3], uint
     return (h ^ shared) * 0x100000001B3ull;
 }
 
-static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint64_t addr) {
+// (blob: the code's bytes with its constants after it, for LARECOMP_DUMP_GLSL's .bin; max when unknown)
+static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint64_t addr, size_t blob) {
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);  // (the globals too: the render thread translates as well - run_queued_now)
@@ -7409,13 +7438,21 @@ static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint6
     maxwell_cs_uniform_pc = (cp->variant & 2) != 0;  // (... and one pc a turn)
     cp->si = maxwell_translate(code, max, STAGE_COMPUTE, &k);
     maxwell_cs_no_gfast = maxwell_cs_uniform_pc = false;
-    if (ENV("LARECOMP_DUMP_GLSL")) {  // (debug) build/glsl/<code address>.comp
+    if (ENV("LARECOMP_DUMP_GLSL")) {  // (debug) build/glsl/<code address>.comp; prepared ones (no address): <content hash>.comp
         mkdir("build/glsl", 0755);
         char path[96];
-        if (cp->variant) snprintf(path, sizeof path, "build/glsl/%llx_v%d.comp", (unsigned long long)addr, cp->variant);  // (a sweep variant)
-        else snprintf(path, sizeof path, "build/glsl/%llx.comp", (unsigned long long)addr);
+        unsigned long long name = addr ? addr : cp->code;  // (renderer_prepare: cp->code is the content hash, gpuprof's "hash")
+        if (cp->variant) snprintf(path, sizeof path, "build/glsl/%llx_v%d.comp", name, cp->variant);  // (a sweep variant)
+        else snprintf(path, sizeof path, "build/glsl/%llx.comp", name);
         FILE *f = fopen(path, "wb");
         if (f) { fputs(cp->si->msl ? cp->si->msl : cp->si->error, f); fclose(f); }
+        // (and the Maxwell code itself with its constants - the jump tables - for translating it off the phone with a
+        // host build of translate.c; the game's own code, never committed - and its disassembly)
+        char bpath[112];
+        snprintf(bpath, sizeof bpath, "%.*s.bin", (int)strlen(path) - 5, path);
+        if (!cp->variant && (f = fopen(bpath, "wb"))) { fwrite(code, 1, blob, f); fclose(f); }
+        snprintf(bpath, sizeof bpath, "%.*s.asm", (int)strlen(path) - 5, path);
+        if (!cp->variant && (f = fopen(bpath, "wb"))) { maxwell_disassemble(code, max, STAGE_COMPUTE, f); fclose(f); }
     }
     pthread_mutex_unlock(&translate_lock);
     cp->p.vi = cp->si;
@@ -7463,7 +7500,8 @@ static CsProg *csw_choose(CsProg *cp, NvnShaderStage *ss, uint64_t *hash_out) {
         CsProg *w = csw_prog[t][k] = calloc(1, sizeof *w);
         memcpy(w->local, cp->local, sizeof w->local);
         w->shared = cp->shared, w->code = cp->code, w->variant = k;
-        if (translate_compute(w, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr))
+        if (translate_compute(w, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr,
+                              ss->const_offset ? ss->const_offset + ss->const_size : 0x10000))
             run_job(build_compute, w, &w->p.state);
     }
     int v = csw_state == 2 ? csw_pick[t] : csw_variant;
@@ -7591,7 +7629,8 @@ static CsProg *compute_program(NvnProgram *np) {
     if (ck) kv_set(&cs_content_kv, kv_find(&cs_content_kv, ck), ck, cp);
     memcpy(cp->local, local, sizeof local);
     cp->shared = shared;
-    if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr))
+    if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr,
+                           ss->const_offset ? ss->const_offset + ss->const_size : 0x10000))
         return cp;
     save_glsl(cp->si->msl, ss->code_addr, "cs");
     run_job(build_compute, cp, &cp->p.state);
@@ -7751,7 +7790,7 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
         cp->code = r->vs;  // (prepared: its content hash, for the build logs)
         memcpy(cp->local, r->local, sizeof cp->local);
         cp->shared = r->shared;
-        if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, 0)) return false;
+        if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, 0, vsb->size)) return false;
         PREP_PUT(prep_cs, ck, cp);
         prep_job(build_compute, cp);
         return true;
@@ -8027,10 +8066,19 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP_CS(!cp ? SK_NO_STAGES : atomic_load(&cp->p.state) == 2 ? SK_CS_FAILED : SK_CS_BUILDING); return; }
     uint64_t cs_hash = 0;
     if (g_gpuprof_frame || csw_state) cp = csw_choose(cp, &st.program->stages[5], &cs_hash);  // (#315: the compute sweep)
-    {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
+    {   // LARECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does;
+        // h<content hash hex> (the gpuprof row's "hash"): the same across runs, where the code address is not
         static uint64_t skip = ~0ull;
-        if (skip == ~0ull) { const char *e = getenv("LARECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
-        if (skip && st.program->stages[5].code_addr == skip) { SKIP_CS(SK_DEBUG_SKIP); return; }
+        static bool by_hash;
+        if (skip == ~0ull) {
+            const char *e = getenv("LARECOMP_SKIP_CS");
+            by_hash = e && *e == 'h';
+            skip = e ? strtoull(e + by_hash, NULL, 16) : 0;
+        }
+        if (skip && (by_hash ? shader_stage_hash(&st.program->stages[5]) : st.program->stages[5].code_addr) == skip) {
+            SKIP_CS(SK_DEBUG_SKIP);
+            return;
+        }
     }
     if (g_debug_frame && g_fullcap) fullcap_dispatch(false, gx, gy, gz);
     if (cp->si->uses_gmem && ENV("LARECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
@@ -8050,8 +8098,10 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d%s", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
-            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem, cp->variant ? " (sweep variant)" : "");
+    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx hash %016llx gmem %d%s", gx, gy, gz, cp->local[0], cp->local[1],
+            cp->local[2], (unsigned long long)st.program->stages[5].code_addr,
+            g_gpuprof_frame ? (unsigned long long)shader_stage_hash(&st.program->stages[5]) : 0ull, cp->si->uses_gmem,
+            cp->variant ? " (sweep variant)" : "");
     if (g_gpuprof_frame && gp_n) gp_cs[gp_n - 1] = cs_hash ? cs_hash : shader_stage_hash(&st.program->stages[5]);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     if (dl_on > 0) vk_checkpoint(cb, dl_n);
@@ -8097,12 +8147,19 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     if (gc_shift && cp->si->uses_gmem) gmem_chunk_bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, GMEM_CHUNK_SET(STAGE_COMPUTE), 1u << STAGE_COMPUTE);
     rec_CmdDispatch(cb, gx, gy, gz);
+    // LARECOMP_GPUPROF_SPLIT=1 (debug): rows of their own for the dispatch's copy-back and for whatever follows it, each
+    // behind a full barrier. Qualcomm's ALL_COMMANDS timestamp doesn't wait for a dispatch: Z-A's 26-group compute
+    // before the G-buffer read 0.006 ms, and the G-buffer row kept ~5 ms with none of its draws left (2026-11-22)
+    static int split = -1;
+    if (split < 0) split = ENV("LARECOMP_GPUPROF_SPLIT") && atoi(ENV("LARECOMP_GPUPROF_SPLIT")) != 0;
+    if (split && g_gpuprof_frame) { vk_full_barrier(cb); gp_mark(cb, "  (the dispatch's copy-back)"); }
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) snap_merge_back(cb), vc_mark_sbufs(5);
     stat_dispatches++;
     subr_now.dispatches++, subr_now.cs = cp->code;
     if (g_debug_frame && g_fullcap) fullcap_dispatch(true, gx, gy, gz);  // (after: gfast's copy back included)
     ia_refresh(cb);  // (the instance counts it may have written, into the private records; under the overlap only)
+    if (split && g_gpuprof_frame) { vk_full_barrier(cb); gp_mark(cb, "  (after the dispatch, before the next mark)"); }
 }
 
 // ================================================================== draws
@@ -8737,11 +8794,11 @@ static void draw_(CmdRec *r, bool indexed) {
             last_fs = fs;
             last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
         }
-        static uint64_t skip[16];
+        static uint64_t skip[64];  // (64: every material of Z-A's G-buffer pass, ~31 in the station)
         static int nskip = -1;
         if (nskip < 0) {
             nskip = 0;
-            for (const char *p = ENV("LARECOMP_SKIP_FSHASH"); p && *p && nskip < 16;) {
+            for (const char *p = ENV("LARECOMP_SKIP_FSHASH"); p && *p && nskip < 64;) {
                 skip[nskip++] = strtoull(p, (char **)&p, 16);
                 while (*p == ',') p++;
             }
