@@ -22,7 +22,10 @@ static char *slurp(const char *path) {
     fseek(f, 0, SEEK_SET);
     char *b = malloc((size_t)n + 1);
     if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
-    if (b) b[n] = 0;
+    if (b) {
+        for (long i = 0; i < n; i++) if (!b[i]) b[i] = '\n';  // (as runtime/services/nsp_list.c nsp_slurp_fd)
+        b[n] = 0;
+    }
     fclose(f);
     return b;
 }
@@ -41,7 +44,38 @@ static ssize_t ref_read(int fd, void *b, size_t n, off_t off) {
     return (ssize_t)got;
 }
 
+// --list <prod.keys> <title.keys|-> <package>...: what each package is (nsp_classify, with the keys and without), its
+// NCAs and tickets, and whether title.keys has a title key for each rights id (yes / no: the key is never printed)
+static int list_mode(int argc, char **argv) {
+    static const char *const kinds[] = {"not a package", "xci", "unknown", "base game", "update", "DLC", "another game"};
+    char *pk = slurp(argv[2]), *tk = strcmp(argv[3], "-") ? slurp(argv[3]) : NULL;
+    for (char *p = tk; p && *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
+    for (int i = 4; i < argc; i++) {
+        int fd = open(argv[i], O_RDONLY);
+        const char *nm = strrchr(argv[i], '/') ? strrchr(argv[i], '/') + 1 : argv[i];
+        if (fd < 0) { printf("%s: can't open\n", nm); continue; }
+        char rep[4096];
+        uint64_t t1 = 0, t2 = 0;
+        int k1 = nsp_classify(fd, pk, &t1, rep, sizeof rep), k2 = nsp_classify(fd, NULL, &t2, NULL, 0);
+        printf("%s\n  with keys: %s (%016llx); without keys: %s (%016llx)\n", nm, kinds[k1], (unsigned long long)t1,
+               kinds[k2], (unsigned long long)t2);
+        for (char *l = rep, *e; *l; l = e + 1) {
+            e = strchr(l, '\n');
+            if (!e) break;
+            *e = 0;
+            char *r = strstr(l, "rights id ");
+            int has = r && strlen(r + 10) == 32 && tk && strstr(tk, r + 10);
+            printf("    %s%s\n", l, r && strlen(r + 10) == 32 ? (has ? " - in title.keys: yes" : " - in title.keys: no") : "");
+        }
+        close(fd);
+    }
+    if (pk) memset(pk, 0, strlen(pk));
+    if (tk) memset(tk, 0, strlen(tk));
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 4 && !strcmp(argv[1], "--list")) return list_mode(argc, argv);
     if (argc < 7) {
         fprintf(stderr, "usage: nsp_check <prod.keys> <title.keys|-> <romfs.bin> <exefs dir> <out dir> [--quick] <nsp>...\n");
         return 2;
@@ -142,8 +176,13 @@ int main(int argc, char **argv) {
             if (f2) fclose(f2);
         }
     }
-    for (int i = 0; i < nsp_aoc_count(g); i++)
-        printf("DLC %016llx: %llu bytes\n", (unsigned long long)nsp_aoc_title(g, i), (unsigned long long)nsp_aoc_size(g, i));
+    for (int i = 0; i < nsp_aoc_count(g); i++) {
+        unsigned char h[8] = {0};  // (a RomFS starts with its header size, 0x50: a wrong key gives noise there)
+        int ok = nsp_aoc_read(g, i, h, 8, 0) == 8 && h[0] == 0x50 && !h[1] && !h[2] && !h[3] && !h[4];
+        printf("DLC %016llx: %llu bytes, RomFS header %s\n", (unsigned long long)nsp_aoc_title(g, i),
+               (unsigned long long)nsp_aoc_size(g, i), ok ? "ok" : "WRONG (bad key?)");
+        bad |= !ok;
+    }
     nsp_close(g);
     printf(bad ? "RESULT: FAILED\n" : "RESULT: OK\n");
     return bad;

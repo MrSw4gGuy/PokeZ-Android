@@ -1196,10 +1196,8 @@ static bool nsp_setup(const std::vector<std::string> &picks, std::string &err, i
         close(fd);
         std::string t = text ? text : "";
         if (text) memset(text, 0, t.size()), free(text);
-        // (title.keys: "<32 hex> = <32 hex>" lines; prod.keys: named keys, header_key among them)
-        bool rid = t.size() > 66 && strspn(t.c_str(), "0123456789abcdefABCDEF") == 32;
-        if (t.find("header_key") != std::string::npos) pk = t;
-        else if (rid) tk = t;
+        if (nsp_text_is_prod_keys(t.c_str())) pk = t;
+        else if (nsp_text_is_title_keys(t.c_str())) tk = t;
         else rt_launcher_log("[launcher] %s: not a package or a keys file, left out\n", nm);
         drop(t);
     }
@@ -1410,34 +1408,107 @@ static void SDLCALL picked(void *, const char *const *files, int) {
 // keeps it: Android's picker takes several files only from one folder, and the keys rarely sit with the games. Each
 // pick is checked as it comes - a game package (PFS0) on the game rows, a keys file on the keys row - so a wrong file
 // is said on its row, not after the setup started. nsp_setup gets them all together, g_picks.)
+// A row takes only its own kind (nsp_classify): the update picked on the DLC row is refused there, saying what it is.
+// Without keys a package without a ticket (the base game's, a DLC dumped without one) can't be told yet: it is taken
+// as "to be checked", and picking the keys checks every row again - a wrong one is taken out, said on its row.
 enum { PICK_BASE, PICK_UPD, PICK_DLC, PICK_KEYS, PICK_N };
 static std::vector<std::string> g_pick[PICK_N];
-static std::string g_pick_note[PICK_N];  // (the picked files' names, or the one that doesn't fit)
-static bool g_pick_bad[PICK_N];
+static std::string g_pick_note[PICK_N];  // (the picked files' names, or why the last pick was refused)
+static bool g_pick_bad[PICK_N], g_pick_unsure[PICK_N];
+
+static const char *kind_said(int k) {
+    switch (k) {
+    case NSP_BASE: return TR("it's the base game", "é o jogo base");
+    case NSP_UPDATE: return TR("it's the update", "é a atualização");
+    case NSP_DLC: return TR("it's a DLC", "é uma DLC");
+    case NSP_OTHER_GAME: return TR("it's another game", "é de outro jogo");
+    case NSP_XCI: return TR("it's an .xci: choose the .nsp", "é um .xci: escolha o .nsp");
+    default: return TR("not a game package (.nsp)", "não é um pacote do jogo (.nsp)");
+    }
+}
+
+// the prod.keys text the checks can use: the keys row's (picked), else the copy a setup kept; "" when neither
+static std::string known_prod_keys(const std::vector<std::string> &key_picks) {
+    std::vector<std::string> srcs = key_picks;
+    srcs.push_back(g_root + "/keys/prod.keys");
+    for (auto &s : srcs) {
+        int fd = nsp_open_source(s.c_str(), false);
+        char *t = nsp_slurp_fd(fd, 1 << 20);
+        if (fd >= 0) close(fd);
+        std::string r = t && nsp_text_is_prod_keys(t) ? t : "";
+        if (t) memset(t, 0, strlen(t)), free(t);
+        if (!r.empty()) return r;
+    }
+    return "";
+}
+
+// files checked for a game row (want: NSP_BASE / NSP_UPDATE / NSP_DLC): those that fit, their names, the refusal
+static void check_packages(const std::vector<std::string> &files, int want, const std::string &pk, bool keep,
+                           std::vector<std::string> &ok, std::string &names, std::string &refused, bool &unsure) {
+    for (auto &f : files) {
+        char nm[160];
+        nsp_source_name(f.c_str(), nm, sizeof nm);
+        int fd = nsp_open_source(f.c_str(), keep);
+        uint64_t tid = 0;
+        char rep[2048];
+        int k = fd < 0 ? NSP_NOT_PACKAGE : nsp_classify(fd, pk.empty() ? NULL : pk.c_str(), &tid, rep, sizeof rep);
+        if (fd >= 0) close(fd);
+        rt_launcher_log("[launcher] %s: kind %d, title %016llx\n%s", nm, k, (unsigned long long)tid, rep);
+        if (k == want || k == NSP_UNKNOWN) {
+            unsure = unsure || k == NSP_UNKNOWN;
+            ok.push_back(f), names += (names.empty() ? "" : ", ") + std::string(nm);
+        } else refused = std::string(nm) + ": " + kind_said(k);
+    }
+}
+
 static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
+    static const int want[PICK_N] = {NSP_BASE, NSP_UPDATE, NSP_DLC, 0};
     int slot = (int)(intptr_t)ud;
     if (!files || !files[0] || slot < 0 || slot >= PICK_N) return;
-    std::vector<std::string> v;
-    std::string names, bad;
-    for (int i = 0; files[i]; i++) {
-        char nm[160];
-        nsp_source_name(files[i], nm, sizeof nm);
-        int fd = nsp_open_source(files[i], true);
-        char head[16] = {0};
-        bool pkg = fd >= 0 && pread(fd, head, 16, 0) == 16 && !memcmp(head, "PFS0", 4), keys = false;
-        if (fd >= 0 && !pkg && slot == PICK_KEYS) {
-            char *t = nsp_slurp_fd(fd, 1 << 20);  // (prod.keys: header_key among its lines; title.keys: "<32 hex> = ...")
-            keys = t && (strstr(t, "header_key") || strspn(t, "0123456789abcdefABCDEF") == 32);
+    std::vector<std::string> picked;
+    for (int i = 0; files[i]; i++) picked.push_back(files[i]);
+    pthread_mutex_lock(&g_lock);
+    std::vector<std::string> rows[PICK_N];
+    for (int k = 0; k < PICK_N; k++) rows[k] = g_pick[k];
+    pthread_mutex_unlock(&g_lock);
+    std::vector<std::string> ok[PICK_N];
+    std::string names[PICK_N], refused[PICK_N];
+    bool unsure[PICK_N] = {false}, recheck[PICK_N] = {false};
+    if (slot == PICK_KEYS) {  // (keys: prod.keys / title.keys by content; then every game row checked with them)
+        for (auto &f : picked) {
+            char nm[160];
+            nsp_source_name(f.c_str(), nm, sizeof nm);
+            int fd = nsp_open_source(f.c_str(), true);
+            char *t = nsp_slurp_fd(fd, 1 << 20);
+            if (fd >= 0) close(fd);
+            bool fits = t && (nsp_text_is_prod_keys(t) || nsp_text_is_title_keys(t));
             if (t) memset(t, 0, strlen(t)), free(t);
+            if (fits) ok[slot].push_back(f), names[slot] += (names[slot].empty() ? "" : ", ") + std::string(nm);
+            else refused[slot] = std::string(nm) + TR(": not a keys file", ": não é um arquivo de keys");
         }
-        if (fd >= 0) close(fd);
-        if (slot == PICK_KEYS ? keys : pkg) v.push_back(files[i]), names += (names.empty() ? "" : ", ") + std::string(nm);
-        else bad = nm;
+        std::string pk = ok[slot].empty() ? "" : known_prod_keys(ok[slot]);
+        if (!ok[slot].empty() && pk.empty()) {  // (only a title.keys: the prod.keys is still needed)
+            refused[slot] = TR("no prod.keys among them (title.keys alone isn't enough)",
+                               "nenhum prod.keys entre eles (só o title.keys não basta)");
+            ok[slot].clear(), names[slot].clear();
+        }
+        for (int k = 0; k < PICK_KEYS && !pk.empty(); k++)
+            if (!rows[k].empty())
+                recheck[k] = true, check_packages(rows[k], want[k], pk, false, ok[k], names[k], refused[k], unsure[k]);
+        std::fill(pk.begin(), pk.end(), 0);
+    } else {
+        std::string pk = known_prod_keys(rows[PICK_KEYS]);
+        check_packages(picked, want[slot], pk, true, ok[slot], names[slot], refused[slot], unsure[slot]);
+        std::fill(pk.begin(), pk.end(), 0);
     }
     pthread_mutex_lock(&g_lock);
-    if (!v.empty()) g_pick[slot] = v;
-    g_pick_bad[slot] = v.empty();
-    g_pick_note[slot] = v.empty() ? bad : names;
+    for (int k = 0; k < PICK_N; k++) {
+        if (k != slot && !recheck[k]) continue;
+        g_pick[k] = ok[k];
+        g_pick_bad[k] = !refused[k].empty();
+        g_pick_unsure[k] = unsure[k];
+        g_pick_note[k] = refused[k].empty() ? names[k] : refused[k] + (names[k].empty() ? "" : " - " + names[k]);
+    }
     g_picks.clear();
     for (auto &p : g_pick) g_picks.insert(g_picks.end(), p.begin(), p.end());
     g_src = g_pick[PICK_BASE].empty() ? "" : g_pick_note[PICK_BASE];  // (the page's "something chosen")
@@ -3442,16 +3513,17 @@ extern "C" void launcher_run(const char *root) {
                                                                      "3. DLC (.nsp, opcional)", "4. prod.keys (+ title.keys)"};
                         for (int k = 0; k < PICK_N; k++) {
                             pthread_mutex_lock(&g_lock);
-                            bool have = !g_pick[k].empty(), bad = g_pick_bad[k];
+                            bool have = !g_pick[k].empty(), bad = g_pick_bad[k], unsure = g_pick_unsure[k];
                             std::string note = g_pick_note[k];
                             pthread_mutex_unlock(&g_lock);
                             panel(dl, x, ty, w, 64, C_PANEL);
-                            icon(dl, have && !bad ? IC_CHECK : IC_FOLDER, x + 30, ty + 32, 22, bad ? C_RED : have ? C_GREEN : C_MUTED);
-                            std::string sub = bad ? note + TR(": not a game package (.nsp)", ": não é um pacote do jogo (.nsp)")
-                                            : have ? note
+                            icon(dl, have && !bad ? IC_CHECK : IC_FOLDER, x + 30, ty + 32, 22,
+                                 bad ? C_RED : have && !unsure ? C_GREEN : have ? C_TEAL : C_MUTED);
+                            std::string sub = bad || have ? note
                                             : k == PICK_KEYS && kept_keys ? TR("Kept from the last setup", "Guardado da última preparação")
                                             : TR("Not chosen", "Não escolhido");
-                            if (bad && k == PICK_KEYS) sub = note + TR(": not a keys file", ": não é um arquivo de keys");
+                            if (have && unsure && !bad)
+                                sub += TR(" (checked when the keys are chosen)", " (conferido quando as keys forem escolhidas)");
                             dl->PushClipRect(P(x + 50, ty), P(x + w - 150, ty + 64), true);
                             text(dl, F_LABEL, 15, x + 52, ty + 10, C_TEXT, g_pt ? label_pt[k] : label_en[k]);
                             text(dl, F_BODY, 14, x + 52, ty + 34, bad ? C_RED : have ? C_SOFT : C_MUTED, sub.c_str());

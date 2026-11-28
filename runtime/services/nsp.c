@@ -561,7 +561,7 @@ struct NspGame {
     Image *aoc;
     int naoc;
     int own[16], nown;  // (nsp_adopt_fds: closed by nsp_close)
-    char desc[128];
+    char desc[512];
 };
 
 // n bytes at off of the update's section bytes: by AesCtrEx range, each with its own generation
@@ -718,10 +718,14 @@ NspGame *nsp_open(const int *fds, const char *const *names, int n, const char *p
     // a DLC without its key is left out, not the game (it runs without it: zaimport needed EXCLUDE= for a DLC dumped
     // without its ticket - tools/linux/android-port/import_za.sh)
     int skipped = 0;
+    char skip_why[256] = "";
     for (int k = 0; k < g->naoc;) {
         char dw[256];
         if (nca_keyed((Nca *)g->aoc[k].nca, &ks, tk, ntk, dw, sizeof dw)) k++;
-        else memmove(&g->aoc[k], &g->aoc[k + 1], sizeof *g->aoc * (size_t)(g->naoc - k - 1)), g->naoc--, skipped++;
+        else {
+            if (!skipped++) snprintf(skip_why, sizeof skip_why, "%s", dw);
+            memmove(&g->aoc[k], &g->aoc[k + 1], sizeof *g->aoc * (size_t)(g->naoc - k - 1)), g->naoc--;
+        }
     }
     if (!data_section(g->base, &g->bs) || odd_storage(g->bs.fsh)) {
         say(why, wn, "%s: its game data is in a form this reader doesn't handle", g->base->name);
@@ -766,8 +770,8 @@ NspGame *nsp_open(const int *fds, const char *const *names, int n, const char *p
             goto fail;
         }
     }
-    snprintf(g->desc, sizeof g->desc, "%s, %d DLC%s, AES %s", g->upd ? "base game + update" : "base game", g->naoc,
-             skipped ? " (+ DLC left out: no title key for it)" : "", g_ctr_name);
+    snprintf(g->desc, sizeof g->desc, "%s, %d DLC%s%s%s, AES %s", g->upd ? "base game + update" : "base game", g->naoc,
+             skipped ? " (+ DLC left out: " : "", skip_why, skipped ? ")" : "", g_ctr_name);
     free(tk);
     keys_free(&ks);
     return g;
@@ -777,6 +781,70 @@ fail:
     keys_free(&ks);
     nsp_close(g);
     return NULL;
+}
+
+// ---- one package on its own (nsp.h nsp_classify / nsp_report): what it holds, for the start screen's steps
+static int kind_of(uint64_t tid, int ctype, bool patch) {
+    if ((tid & ~0x1FFFull) != ZA_BASE) return NSP_OTHER_GAME;
+    if (ctype == 0) return patch ? NSP_UPDATE : tid == ZA_BASE ? NSP_BASE : NSP_OTHER_GAME;
+    return ctype == 5 ? NSP_DLC : NSP_UNKNOWN;
+}
+// (from a ticket's name, "<rights id: title id + 0 + key generation>.tik", when there are no keys to open the NCAs)
+static int kind_of_tid(uint64_t tid) {
+    if ((tid & ~0x1FFFull) != ZA_BASE) return NSP_OTHER_GAME;
+    return tid == ZA_BASE ? NSP_BASE : tid == ZA_BASE + 0x800 ? NSP_UPDATE : NSP_DLC;
+}
+
+int nsp_classify(int fd, const char *prod_keys, uint64_t *tid_out, char *report, size_t rn) {
+    uint64_t tid_seen = 0;
+    if (report && rn) report[0] = 0;
+    size_t rl = 0;
+#define REP(...) do { if (report && rl < rn) rl += (size_t)snprintf(report + rl, rn - rl, __VA_ARGS__); } while (0)
+    PfsFile *f;
+    int nf = pfs0_list(plain_read, &fd, 0, &f);
+    if (nf < 0) {
+        uint8_t m[4] = {0};
+        return rd(fd, m, 4, 0x100) && !memcmp(m, "HEAD", 4) ? NSP_XCI : NSP_NOT_PACKAGE;
+    }
+    int kind = NSP_UNKNOWN, rank = 0;  // (a program NCA says more than a data one, either more than a ticket)
+    Keys ks = {0};
+    keys_parse(&ks, prod_keys);
+    const uint8_t *hk = key_get(&ks, "header_key", 32);
+    if (hk && aes_init(NULL, 0)) {
+        for (int i = 0; i < nf; i++) {
+            if (!ends_with(f[i].name, ".nca") || f[i].size < NCA_HDR) continue;
+            Nca c;
+            memset(&c, 0, sizeof c);
+            c.fd = fd, c.base = f[i].off, c.size = f[i].size;
+            if (!rd(fd, c.hdr, NCA_HDR, c.base)) continue;
+            xts_header(hk, c.hdr);
+            if (memcmp(c.hdr + 0x200, "NCA3", 4)) { REP("%s: not an NCA3 (or not this prod.keys)\n", f[i].name); continue; }
+            uint64_t tid = le64(c.hdr + 0x210);
+            int ct = c.hdr[0x205];
+            Section s;
+            bool patch = ct == 0 && data_section(&c, &s) && le64(s.fsh + 0x108) != 0;
+            char rid[33] = "-";
+            if (rights_id(&c)) for (int k = 0; k < 16; k++) snprintf(rid + 2 * k, 3, "%02x", c.hdr[0x230 + k]);
+            REP("%s: type %d, title %016llx%s, rights id %s\n", f[i].name, ct, (unsigned long long)tid,
+                patch ? " (patch)" : "", rid);
+            int r = ct == 0 ? 3 : ct == 5 ? 2 : 0;
+            if (r > rank) rank = r, kind = kind_of(tid, ct, patch), tid_seen = tid;
+        }
+    }
+    for (int i = 0; i < nf; i++)
+        if (ends_with(f[i].name, ".tik")) {
+            REP("%s: ticket\n", f[i].name);
+            char hex[17];
+            if (rank < 1 && strlen(f[i].name) >= 36 && strspn(f[i].name, "0123456789abcdefABCDEF") >= 32) {
+                memcpy(hex, f[i].name, 16), hex[16] = 0;
+                tid_seen = strtoull(hex, NULL, 16), kind = kind_of_tid(tid_seen), rank = 1;
+            }
+        }
+#undef REP
+    keys_free(&ks);
+    free(f);
+    if (tid_out) *tid_out = tid_seen;
+    return kind;
 }
 
 void nsp_close(NspGame *g) {
