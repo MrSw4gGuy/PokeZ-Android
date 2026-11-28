@@ -53,6 +53,7 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | | |
 |---|---|
 | Start screen, game setup check | Works |
+| Game files | **Read straight from your own `.nsp` files** (2026-11-28): on the start screen you pick the base game, the update, the DLC and the keys, one step at a time, from wherever they are on the phone. Nothing big is copied (the app keeps only ~40 MB), and an emulator such as Eden can keep using the same files. Each step takes only its own kind of file and the keys are checked as you pick them |
 | Language selection, save creation, character creation, name entry | Works |
 | Intro cutscenes, train, Lumiose City | Works, with the game's own pop-in; Lumiose can still stop with a GPU error (below) |
 | Frame rate | Three rates in Settings > Video: 30 fps (the game's own on the Switch), 40 fps and 60 fps. **40 fps** (2026-11-28): every frame moves the world exactly the time it stays on screen - fractions of the game's 1/60 s step included - with the display at 80 Hz, so motion is even and at the right speed; walking around Lumiose with a 100% save it ran at 37-40 fps with 89-99% of the frames on screen exactly their time (the old 40 / 45 fps modes, whole 1/60 s steps, juddered; 48 fps the same way didn't hold 48 in the city). **60 fps**: with CPU/GPU overlap on (2026-11-25) the station holds 60 and Lumiose runs at about 51 on Qualcomm's driver; **Dynamic 30 / 60 fps** goes to 30 instead of slow motion when 60 isn't held |
@@ -63,7 +64,8 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Memory | About 3 GB in use |
 | Heat | **Thermal profile** (Settings > Video) sets the rate with it: With cooler (60 fps, the chosen resolution kept), Without cooler (40 fps), Economy (30 fps); the last two lower the resolution near the throttling point. With a cooler in Lumiose the thermal headroom (1.0 = the phone starts throttling) held at about 0.73 at 40 fps; 60 fps settled at 0.92-0.93 |
 | Upscaling | Snapdragon Game Super Resolution (Qualcomm's own upscaler) by default; AMD FSR 1 and bilinear in the menu |
-| *Mega Dimension* DLC | Not tested yet |
+| CPU use | Window events are checked every 4 ms (2026-11-28) instead of SDL's wait, which spun about 1,000 times a second: about 21% less CPU on the same route, fewer slow frames after loading |
+| DLC | The DLC `0100F43008C45002` set up from its `.nsp` (with the `title.keys` that has its key) shows as ready in the game's menu (2026-11-28); its content not played yet |
 
 **Known bugs** (being worked on):
 - Lumiose City: some time after arriving, the game can stop with "device lost" (the GPU gave up). Some indirect draws
@@ -82,8 +84,8 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 |---|---|
 | **Phone** | Android 12 or newer, arm64 (64-bit), Vulkan 1.3. Tested: Snapdragon 8 Elite (Adreno 830) only |
 | **RAM** | 8 GB at least; tested with 12 GB |
-| **Storage** | About 7 GB free on the phone (the game data is 6 GB, the APK about 500 MB) |
-| **Game** | Pokémon Legends: Z-A **2.0.2** (Switch 1 version): the base game and the update, with the `prod.keys` from your own Switch |
+| **Storage** | Your `.nsp` files on the phone (about 6.4 GB, kept where you keep them), plus about 600 MB for the APK and the app's own files |
+| **Game** | Pokémon Legends: Z-A **2.0.2** (Switch 1 version): the base game and the update as `.nsp`, with the `prod.keys` from your own Switch (from a firmware at least as new as the game needs), and `title.keys` for a DLC dumped without its ticket |
 | **To build** | A PC with Windows 10/11 and WSL2 (Ubuntu 22.04), or any x86-64 Linux; about 30 GB free; a USB cable and [platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`) |
 
 ## Building and installing
@@ -93,18 +95,22 @@ that guide has each step and option. In short:
 
 1. Set up the toolchain once: `setup_wsl.sh`, `install_ndk.sh`, `install_sdk.sh`, then the libraries with
    `deps_android.sh all`.
-2. Import your game: put your base game and update (`.nsp` / `.xci`) and `prod.keys` in one folder and run
-   `import_za.sh <that folder>`.
+2. Import your game on the PC (the game code is built from it): put your base game and update (`.nsp` / `.xci`) and
+   `prod.keys` in one folder and run `import_za.sh <that folder>`.
 3. Build the game code and the APK: `build_za.sh`, then `za_apk.sh`. The game code takes a while the first time.
-4. Turn on USB debugging on the phone, then install the APK and copy the game files:
+4. Turn on USB debugging on the phone, then install the APK, and copy your `.nsp` files and keys to any folder on
+   the phone (for example the one your emulator uses):
 
    ```bash
    adb install -r ZARecomp-za-debug.apk
-   adb push za-extracted/exefs /sdcard/Android/data/org.recomp.za/files/extracted/exefs
-   adb push za-extracted/romfs.bin /sdcard/Android/data/org.recomp.za/files/extracted/romfs.bin
    ```
 
-5. Open **ZA Recomp** on the phone and tap **Play**.
+5. Open **ZA Recomp** on the phone. On the setup page, choose each file on its row: **1. Base game**, **2. Update**,
+   **3. DLC** (optional), **4. prod.keys** (with `title.keys` if you have one), then tap **Set up the game** and
+   **Play**. The game is read from those files where they are: don't move or delete them afterwards.
+
+   (The older way still works: `adb push` the imported `exefs` folder and `romfs.bin` into
+   `/sdcard/Android/data/org.recomp.za/files/extracted/`.)
 
 ## Controls
 

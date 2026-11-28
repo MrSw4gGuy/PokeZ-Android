@@ -57,6 +57,8 @@ The Android port (branch `android-port`, Galaxy S25+): its build, phone tests, F
   kept for the same reason; it is gated off for Pokémon Z-A (`g_game_is_la`, and the menus' `menu_la_rows()`).
 - `runtime/ui/launcher.mm` is ZA Recomp's own start screen (not upstream's): upstream launcher changes are ported by
   hand. Never delete `romfs.bin` there - for Pokémon Z-A it is the game's only data (zaimport writes no romfs/).
+  The one exception: Android's setup from the player's own `.nsp` files (`nsp_setup`), which replaces it with
+  `packages.txt` - the game is then read from the packages in place (`runtime/services/nsp.c`, `nsp_list.c`).
 - `tools/za/`: Z-A scripts (perf runs, log watcher, stack symbolizer, texture and font tools).
 - `tools/devtools/`, `tools/za/replay-*.sh`, `runtime/ui/devtools.mm`: ZA DevTools, record and replay, frame capture
   analysis (`docs/dev-tools.md`). Off unless `LARECOMP_DEVTOOLS=1` or their own variables are set.

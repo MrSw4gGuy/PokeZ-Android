@@ -53,6 +53,7 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | | |
 |---|---|
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
+| Arquivos do jogo | **Lidos direto dos seus próprios `.nsp`** (2026-11-28): na tela inicial você escolhe o jogo base, a atualização, a DLC e as keys, uma etapa de cada vez, de onde eles estiverem no celular. Nada grande é copiado (o app guarda só ~40 MB), e um emulador como o Eden pode continuar usando os mesmos arquivos. Cada etapa só aceita o próprio tipo de arquivo, e as keys são conferidas na hora da escolha |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
 | Cenas da introdução, trem, Lumiose | Funciona, com o pop-in do próprio jogo; em Lumiose o jogo ainda pode parar com um erro de GPU (abaixo) |
 | Taxa de quadros | Três taxas em Configurações > Vídeo: 30 fps (a do próprio jogo no Switch), 40 fps e 60 fps. **40 fps** (2026-11-28): cada quadro avança o mundo exatamente o tempo que fica na tela - inclusive frações do passo de 1/60 s do jogo - com a tela a 80 Hz, então o movimento é regular e na velocidade certa; andando por Lumiose com um save 100% rodou a 37-40 fps, com 89-99% dos quadros na tela exatamente o seu tempo (os antigos modos de 40 / 45 fps, em passos inteiros de 1/60 s, tremiam; 48 fps do mesmo jeito não segurou 48 na cidade). **60 fps**: com a sobreposição CPU/GPU ligada (2026-11-25) a estação segura 60 e Lumiose roda a cerca de 51 no driver da Qualcomm; o **30 / 60 fps dinâmico** vai para 30 em vez de câmera lenta quando 60 não segura |
@@ -63,7 +64,8 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | Memória | Cerca de 3 GB em uso |
 | Aquecimento | O **perfil térmico** (Configurações > Vídeo) escolhe a taxa junto: Com cooler (60 fps, mantém a resolução escolhida), Sem cooler (40 fps), Economia (30 fps); os dois últimos baixam a resolução perto do limite de aquecimento. Com cooler em Lumiose, a folga térmica (1,0 = o celular começa a reduzir o clock) ficou em cerca de 0,73 a 40 fps; a 60 fps estabilizou em 0,92-0,93 |
 | Upscaling | Snapdragon Game Super Resolution (o upscaler da própria Qualcomm) por padrão; AMD FSR 1 e bilinear no menu |
-| DLC *Mega Dimension* | Ainda não testado |
+| Uso de CPU | Os eventos da janela são checados a cada 4 ms (2026-11-28), em vez da espera do SDL, que girava cerca de 1.000 vezes por segundo: cerca de 21% menos CPU no mesmo trajeto, menos quadros lentos depois do carregamento |
+| DLC | A DLC `0100F43008C45002`, preparada pelo `.nsp` dela (com o `title.keys` que tem a chave dela), aparece como pronta no menu do jogo (2026-11-28); o conteúdo dela ainda não foi jogado |
 
 **Bugs conhecidos** (em correção):
 - Lumiose: algum tempo depois de chegar, o jogo pode parar com "device lost" (a GPU desistiu). Alguns desenhos
@@ -83,8 +85,8 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 |---|---|
 | **Celular** | Android 12 ou mais novo, arm64 (64 bits), Vulkan 1.3. Testado: só Snapdragon 8 Elite (Adreno 830) |
 | **RAM** | 8 GB no mínimo; testado com 12 GB |
-| **Armazenamento** | Cerca de 7 GB livres no celular (os dados do jogo têm 6 GB, o APK cerca de 500 MB) |
-| **Jogo** | Pokémon Legends: Z-A **2.0.2** (versão do Switch 1): o jogo base e a atualização, com as `prod.keys` do seu próprio Switch |
+| **Armazenamento** | Os seus `.nsp` no celular (cerca de 6,4 GB, onde você já guarda), mais cerca de 600 MB para o APK e os arquivos do próprio app |
+| **Jogo** | Pokémon Legends: Z-A **2.0.2** (versão do Switch 1): o jogo base e a atualização em `.nsp`, com as `prod.keys` do seu próprio Switch (de um firmware pelo menos tão novo quanto o jogo pede), e o `title.keys` para uma DLC copiada sem o ticket dela |
 | **Para compilar** | Um PC com Windows 10/11 e WSL2 (Ubuntu 22.04), ou qualquer Linux x86-64; cerca de 30 GB livres; um cabo USB e o [platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`) |
 
 ## Compilar e instalar
@@ -94,18 +96,22 @@ esse guia tem cada passo e opção. Resumindo:
 
 1. Prepare as ferramentas uma vez: `setup_wsl.sh`, `install_ndk.sh`, `install_sdk.sh`, depois as bibliotecas com
    `deps_android.sh all`.
-2. Importe o seu jogo: coloque o jogo base e a atualização (`.nsp` / `.xci`) e as `prod.keys` numa pasta e rode
-   `import_za.sh <essa pasta>`.
+2. Importe o seu jogo no PC (o código do jogo é compilado a partir dele): coloque o jogo base e a atualização
+   (`.nsp` / `.xci`) e as `prod.keys` numa pasta e rode `import_za.sh <essa pasta>`.
 3. Compile o código do jogo e o APK: `build_za.sh`, depois `za_apk.sh`. O código do jogo demora na primeira vez.
-4. Ative a depuração USB no celular, depois instale o APK e copie os arquivos do jogo:
+4. Ative a depuração USB no celular, instale o APK e copie os seus `.nsp` e as keys para qualquer pasta do celular
+   (por exemplo, a que o seu emulador usa):
 
    ```bash
    adb install -r ZARecomp-za-debug.apk
-   adb push za-extracted/exefs /sdcard/Android/data/org.recomp.za/files/extracted/exefs
-   adb push za-extracted/romfs.bin /sdcard/Android/data/org.recomp.za/files/extracted/romfs.bin
    ```
 
-5. Abra o **ZA Recomp** no celular e toque em **Play**.
+5. Abra o **ZA Recomp** no celular. Na página de preparação, escolha cada arquivo na linha dele: **1. Jogo base**,
+   **2. Atualização**, **3. DLC** (opcional), **4. prod.keys** (com o `title.keys`, se tiver), depois toque em
+   **Preparar o jogo** e em **Play**. O jogo é lido desses arquivos onde eles estão: não mova nem apague depois.
+
+   (O jeito antigo continua funcionando: `adb push` da pasta `exefs` importada e do `romfs.bin` para
+   `/sdcard/Android/data/org.recomp.za/files/extracted/`.)
 
 ## Controles
 
