@@ -1406,19 +1406,41 @@ static void SDLCALL picked(void *, const char *const *files, int) {
     pthread_mutex_unlock(&g_lock);
 }
 #ifdef __ANDROID__
-// (Android: several files at once - the .nsp packages and the keys, nsp_setup; shown by their names)
-static void SDLCALL picked_files(void *, const char *const *files, int) {
-    if (!files || !files[0]) return;
+// (Android: the files one kind at a time - the base game, its update, DLC, the keys - each from wherever the player
+// keeps it: Android's picker takes several files only from one folder, and the keys rarely sit with the games. Each
+// pick is checked as it comes - a game package (PFS0) on the game rows, a keys file on the keys row - so a wrong file
+// is said on its row, not after the setup started. nsp_setup gets them all together, g_picks.)
+enum { PICK_BASE, PICK_UPD, PICK_DLC, PICK_KEYS, PICK_N };
+static std::vector<std::string> g_pick[PICK_N];
+static std::string g_pick_note[PICK_N];  // (the picked files' names, or the one that doesn't fit)
+static bool g_pick_bad[PICK_N];
+static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
+    int slot = (int)(intptr_t)ud;
+    if (!files || !files[0] || slot < 0 || slot >= PICK_N) return;
     std::vector<std::string> v;
-    std::string shown;
+    std::string names, bad;
     for (int i = 0; files[i]; i++) {
         char nm[160];
         nsp_source_name(files[i], nm, sizeof nm);
-        v.push_back(files[i]);
-        shown += (i ? ", " : "") + std::string(nm);
+        int fd = nsp_open_source(files[i], true);
+        char head[16] = {0};
+        bool pkg = fd >= 0 && pread(fd, head, 16, 0) == 16 && !memcmp(head, "PFS0", 4), keys = false;
+        if (fd >= 0 && !pkg && slot == PICK_KEYS) {
+            char *t = nsp_slurp_fd(fd, 1 << 20);  // (prod.keys: header_key among its lines; title.keys: "<32 hex> = ...")
+            keys = t && (strstr(t, "header_key") || strspn(t, "0123456789abcdefABCDEF") == 32);
+            if (t) memset(t, 0, strlen(t)), free(t);
+        }
+        if (fd >= 0) close(fd);
+        if (slot == PICK_KEYS ? keys : pkg) v.push_back(files[i]), names += (names.empty() ? "" : ", ") + std::string(nm);
+        else bad = nm;
     }
     pthread_mutex_lock(&g_lock);
-    g_picks = v, g_src = shown;
+    if (!v.empty()) g_pick[slot] = v;
+    g_pick_bad[slot] = v.empty();
+    g_pick_note[slot] = v.empty() ? bad : names;
+    g_picks.clear();
+    for (auto &p : g_pick) g_picks.insert(g_picks.end(), p.begin(), p.end());
+    g_src = g_pick[PICK_BASE].empty() ? "" : g_pick_note[PICK_BASE];  // (the page's "something chosen")
     pthread_mutex_unlock(&g_lock);
 }
 #endif
@@ -3388,16 +3410,12 @@ extern "C" void launcher_run(const char *root) {
                              "Esta versão do ZA Recomp compila o código do jogo de um jeito um pouco diferente. Os seus "
                              "arquivos do jogo já estão aqui: só o código é compilado de novo (alguns minutos).")
 #ifdef __ANDROID__
-                        : TR("Choose your own dump of Pokémon Legends Z-A, all files at once (tap and hold to pick "
-                             "several): the base game's .nsp, the 2.0.2 update's .nsp (and the DLC's), and the prod.keys "
-                             "(and title.keys) from your Switch.\n"
-                             "The game is read from those files where they are: nothing big is copied, and an emulator "
-                             "can keep using them. Don't move or delete them afterwards. The game isn't included.",
-                             "Escolha o seu próprio dump de Pokémon Legends Z-A, todos os arquivos de uma vez (toque e "
-                             "segure para escolher vários): o .nsp do jogo base, o .nsp da atualização 2.0.2 (e o da DLC), e "
-                             "o prod.keys (e o title.keys) do seu Switch.\n"
-                             "O jogo é lido desses arquivos onde eles estão: nada grande é copiado, e um emulador pode "
-                             "continuar usando os mesmos. Não mova nem apague depois. O jogo não vem com o app.");
+                        : TR("Choose your own dump of Pokémon Legends Z-A, one step at a time, from wherever you keep it. "
+                             "The game is read from those files where they are: nothing big is copied, and an emulator can "
+                             "keep using them. Don't move or delete them afterwards. The game isn't included.",
+                             "Escolha o seu próprio dump de Pokémon Legends Z-A, uma etapa de cada vez, de onde você "
+                             "guarda os arquivos. O jogo é lido desses arquivos onde eles estão: nada grande é copiado, e "
+                             "um emulador pode continuar usando os mesmos. Não mova nem apague depois. O jogo não vem com o app.");
 #else
                         : TR("Choose the folder with your own copy of Pokémon Legends Z-A, either way:\n"
                              "· the game extracted (exefs and romfs folders, as an emulator or your Switch extracts them): "
@@ -3413,28 +3431,60 @@ extern "C" void launcher_run(const char *root) {
                              "Também dá para arrastar a pasta para esta janela. O jogo não vem com o ZA Recomp.");
 #endif
                     float ty = 196 + text(dl, F_BODY, 16, x, 196, C_SOFT, what, w).y + 22;
+#ifdef __ANDROID__
+                    // the steps: each row its own picker (picked_slot), the base game and the keys needed, the update and
+                    // DLC optional; the keys a setup kept (keys/prod.keys) count when none is picked again
+                    bool kept_keys = file_exists(g_root + "/keys/prod.keys");
+                    if (!rebuild) {
+                        static const char *const label_en[PICK_N] = {"1. Base game (.nsp)", "2. Update (.nsp, optional)",
+                                                                     "3. DLC (.nsp, optional)", "4. prod.keys (+ title.keys)"};
+                        static const char *const label_pt[PICK_N] = {"1. Jogo base (.nsp)", "2. Atualização (.nsp, opcional)",
+                                                                     "3. DLC (.nsp, opcional)", "4. prod.keys (+ title.keys)"};
+                        for (int k = 0; k < PICK_N; k++) {
+                            pthread_mutex_lock(&g_lock);
+                            bool have = !g_pick[k].empty(), bad = g_pick_bad[k];
+                            std::string note = g_pick_note[k];
+                            pthread_mutex_unlock(&g_lock);
+                            panel(dl, x, ty, w, 64, C_PANEL);
+                            icon(dl, have && !bad ? IC_CHECK : IC_FOLDER, x + 30, ty + 32, 22, bad ? C_RED : have ? C_GREEN : C_MUTED);
+                            std::string sub = bad ? note + TR(": not a game package (.nsp)", ": não é um pacote do jogo (.nsp)")
+                                            : have ? note
+                                            : k == PICK_KEYS && kept_keys ? TR("Kept from the last setup", "Guardado da última preparação")
+                                            : TR("Not chosen", "Não escolhido");
+                            if (bad && k == PICK_KEYS) sub = note + TR(": not a keys file", ": não é um arquivo de keys");
+                            dl->PushClipRect(P(x + 50, ty), P(x + w - 150, ty + 64), true);
+                            text(dl, F_LABEL, 15, x + 52, ty + 10, C_TEXT, g_pt ? label_pt[k] : label_en[k]);
+                            text(dl, F_BODY, 14, x + 52, ty + 34, bad ? C_RED : have ? C_SOFT : C_MUTED, sub.c_str());
+                            dl->PopClipRect();
+                            char id[16];
+                            snprintf(id, sizeof id, "##pick%d", k);
+                            // (no filter: Android's picker knows no .nsp / .keys type and would grey them out; DLC and the
+                            // keys take several files - prod.keys and title.keys usually sit together)
+                            if (button(id, TR("Choose...", "Escolher..."), x + w - 138, ty + 12, 124, 40, BTN_SECONDARY))
+                                SDL_ShowOpenFileDialog(picked_slot, (void *)(intptr_t)k, win, NULL, 0, NULL,
+                                                       k == PICK_DLC || k == PICK_KEYS);
+                            ty += 72;
+                        }
+                        ty += 12;
+                    }
+                    pthread_mutex_lock(&g_lock);
+                    bool can = rebuild || (!g_pick[PICK_BASE].empty() && (!g_pick[PICK_KEYS].empty() || kept_keys));
+                    pthread_mutex_unlock(&g_lock);
+#else
                     if (!rebuild) {
                         panel(dl, x, ty, w, 64, C_PANEL);
                         icon(dl, IC_FOLDER, x + 30, ty + 32, 22, src.empty() ? C_MUTED : C_TEAL);
-#ifdef __ANDROID__
-                        std::string shown = src.empty() ? TR("No files chosen yet", "Nenhum arquivo escolhido ainda") : src;
-#else
                         std::string shown = src.empty() ? TR("No folder chosen yet", "Nenhuma pasta escolhida ainda") : src;
-#endif
                         dl->PushClipRect(P(x + 50, ty), P(x + w - 150, ty + 64), true);
                         text(dl, F_BODY, 15, x + 52, ty + 32 - text_size(F_BODY, 15, "A").y / 2, src.empty() ? C_MUTED : C_TEXT,
                              shown.c_str());
                         dl->PopClipRect();
                         if (button("##pick", TR("Choose...", "Escolher..."), x + w - 138, ty + 12, 124, 40, BTN_SECONDARY))
-#ifdef __ANDROID__
-                            // (no filter: Android's picker knows no .nsp / .keys type and would grey them out)
-                            SDL_ShowOpenFileDialog(picked_files, NULL, win, NULL, 0, NULL, true);
-#else
                             SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
-#endif
                         ty += 84;
                     }
                     bool can = rebuild || !src.empty();
+#endif
                     if (mod_restart) {
                         if (button("##restart", TR("Restart now", "Reiniciar agora"), x, ty, 0, 54, BTN_PRIMARY, true, IC_PLAY,
                                    F_LABEL, 17, true)) {
