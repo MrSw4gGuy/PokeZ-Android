@@ -46,6 +46,7 @@ extern "C" {
 #include "input_bind.h"
 #include "xbox_attack_layout.h"
 #include "services/mod_layout.h"
+#include "services/nsp.h"
 bool controls_ui_took_back(void);  // ui/controls_ui.mm: B went back a step on Configure inputs
 void input_mouse_release(SDL_Window *w);   // runtime/hle/input.c
 void ui_window_init(void);
@@ -379,8 +380,9 @@ static std::string check_copied_files(const std::string &root) {
     if (!read_build_id(root + "/exefs/main", id)) return "No game files";
     if (!build_version(id)) return "Wrong game version";
     // (the game data: romfs.bin - Pokémon Z-A's packages, read by zaimport - or the copied romfs/ folder, which
-    // runtime/services/fs.c serves itself)
-    if (!file_exists(root + "/romfs.bin") && !file_exists(root + (build_is_za(id) ? "/romfs" : "/romfs/region_common")))
+    // runtime/services/fs.c serves itself; or, on Android, the player's own packages read in place: packages.txt)
+    if (!file_exists(root + "/romfs.bin") && !file_exists(root + (build_is_za(id) ? "/romfs" : "/romfs/region_common")) &&
+        !file_exists(root + "/" NSP_LIST))
         return "Game data missing";
     return "";
 }
@@ -417,6 +419,7 @@ static std::string check_game_files(const std::string &root) {
 // file system allows); the game reads romfs/ in place (runtime/services/fs.c).
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static std::string g_src;           // the picked folder
+static std::vector<std::string> g_picks;  // (Android: the picked files - content:// URIs; Android's picker takes no folder)
 static std::string g_job;           // current setup step / result for the status line
 static std::string g_job_hint;      // a failure: what to do about it (shown under it)
 static bool g_busy, g_job_failed;
@@ -1156,6 +1159,125 @@ static bool build_game_code(void) {
     return true;
 }
 
+#ifdef __ANDROID__
+// ---- Android: the game set up from the player's own files, left where they keep them (runtime/services/nsp.h: the
+// game reads its data from them in place, at every start - Eden or another emulator can keep using the same .nsp).
+// Android's picker gives files, not a folder: the base game's .nsp, the update's, the DLC's, prod.keys and title.keys,
+// picked together and told apart by what is in them (as find_keys does: any file names). Written here: exefs/ (~40 MB,
+// what the game code is built from), the DLC images (kilobytes: misc.c / fs.c read aoc/ as files), a copy of the keys
+// (keys/: needed at every start, and the picked keys file may be moved or deleted), then packages.txt - last, as it
+// marks the setup done (check_copied_files). The old copy's romfs.bin (~6 GB) goes with the other game files.
+static bool nsp_setup(const std::vector<std::string> &picks, std::string &err, int &fail) {
+    std::vector<int> fds;
+    std::vector<std::string> pkgs, names;
+    std::string pk, tk;
+    bool xci = false;
+    auto drop = [&](std::string &s) { std::fill(s.begin(), s.end(), 0), s.clear(); };  // (no keys left in memory)
+    auto done = [&](bool ok) {
+        for (int fd : fds) close(fd);
+        drop(pk), drop(tk);
+        return ok;
+    };
+    for (auto &s : picks) {
+        char nm[160];
+        nsp_source_name(s.c_str(), nm, sizeof nm);
+        int fd = nsp_open_source(s.c_str(), true);
+        if (fd < 0) {
+            rt_launcher_log("[launcher] %s: can't be opened\n", nm);
+            continue;
+        }
+        char head[16] = {0}, h2[4] = {0};
+        if (pread(fd, head, 16, 0) == 16 && !memcmp(head, "PFS0", 4)) {
+            fds.push_back(fd), pkgs.push_back(s), names.push_back(nm);
+            continue;
+        }
+        if (pread(fd, h2, 4, 0x100) == 4 && !memcmp(h2, "HEAD", 4)) xci = true;
+        char *text = xci ? NULL : nsp_slurp_fd(fd, 1 << 20);
+        close(fd);
+        std::string t = text ? text : "";
+        if (text) memset(text, 0, t.size()), free(text);
+        // (title.keys: "<32 hex> = <32 hex>" lines; prod.keys: named keys, header_key among them)
+        bool rid = t.size() > 66 && strspn(t.c_str(), "0123456789abcdefABCDEF") == 32;
+        if (t.find("header_key") != std::string::npos) pk = t;
+        else if (rid) tk = t;
+        else rt_launcher_log("[launcher] %s: not a package or a keys file, left out\n", nm);
+        drop(t);
+    }
+    rt_launcher_log("[launcher] picked: %zu package(s), prod.keys %s, title.keys %s\n", pkgs.size(), pk.empty() ? "no" : "yes",
+                    tk.empty() ? "no" : "yes");
+    if (pkgs.empty()) {
+        fail = FAIL_UNUSABLE;
+        err = xci ? TR("Your dump is an .xci: this version reads .nsp packages. Choose the .nsp files.",
+                       "O seu dump é .xci: esta versão lê pacotes .nsp. Escolha os arquivos .nsp.")
+                  : TR("None of the chosen files is a game package (.nsp).", "Nenhum dos arquivos escolhidos é um pacote do jogo (.nsp).");
+        return done(false);
+    }
+    if (pk.empty()) {  // (setting up again with the packages only: the keys the last setup kept)
+        int kfd = nsp_open_source((g_root + "/keys/prod.keys").c_str(), false);
+        char *k = nsp_slurp_fd(kfd, 1 << 20);
+        if (kfd >= 0) close(kfd);
+        if (k) pk = k, memset(k, 0, pk.size()), free(k);
+    }
+    if (pk.empty()) {
+        fail = FAIL_KEYS;
+        err = TR("Choose your prod.keys together with the .nsp files (tap and hold to pick several files).",
+                 "Escolha o seu prod.keys junto com os arquivos .nsp (toque e segure para escolher vários arquivos).");
+        return done(false);
+    }
+    std::vector<const char *> np;
+    for (auto &n : names) np.push_back(n.c_str());
+    char why[512] = "";
+    NspGame *g = nsp_open(fds.data(), np.data(), (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why,
+                          sizeof why);
+    if (!g) {
+        err = why;
+        fail = err.find("base game") != std::string::npos ? FAIL_UNUSABLE : FAIL_IMPORT;
+        return done(false);
+    }
+    nsp_adopt_fds(g, fds.data(), (int)fds.size());
+    fds.clear();
+    rt_launcher_log("[launcher] packages: %s; RomFS %llu bytes read in place\n", nsp_describe(g),
+                    (unsigned long long)nsp_romfs_size(g));
+    rt_remove_game_files(g_root.c_str());
+    mkdir(g_root.c_str(), 0755);
+    mkdir((g_root + "/exefs").c_str(), 0755);
+    mkdir((g_root + "/keys").c_str(), 0700);
+    plat_remove_tree((g_root + "/aoc").c_str());
+    auto put = [&](const std::string &path, const void *data, size_t n) {
+        FILE *f = fopen(path.c_str(), "wb");
+        bool ok = f && fwrite(data, 1, n, f) == n;
+        if (f && fclose(f)) ok = false;
+        return ok;
+    };
+    bool ok = put(g_root + "/keys/prod.keys", pk.data(), pk.size()) &&
+              (tk.empty() || put(g_root + "/keys/title.keys", tk.data(), tk.size()));
+    if (ok && !nsp_exefs_extract(g, (g_root + "/exefs").c_str(), why, sizeof why)) ok = false, err = why;
+    if (ok && nsp_aoc_count(g)) mkdir((g_root + "/aoc").c_str(), 0755);
+    for (int i = 0; ok && i < nsp_aoc_count(g); i++) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "/aoc/%016llx.bin", (unsigned long long)nsp_aoc_title(g, i));
+        uint64_t size = nsp_aoc_size(g, i);
+        FILE *f = fopen((g_root + nm).c_str(), "wb");
+        std::vector<uint8_t> buf(4 << 20);
+        for (uint64_t off = 0; f && ok && off < size; off += buf.size()) {
+            size_t n = (size_t)std::min<uint64_t>(buf.size(), size - off);
+            ok = nsp_aoc_read(g, i, buf.data(), n, off) == (ssize_t)n && fwrite(buf.data(), 1, n, f) == n;
+        }
+        if (!f || fclose(f)) ok = false;
+        if (!ok) err = std::string("aoc") + nm + " couldn't be written";
+    }
+    std::string list = "# Pokémon Legends Z-A read from these packages in place (runtime/services/nsp.h); keys in keys/\n";
+    for (auto &s : pkgs) list += s + "\n";
+    if (ok && !put(g_root + "/" NSP_LIST, list.data(), list.size())) ok = false, err = NSP_LIST " couldn't be written";
+    nsp_close(g);
+    if (!ok) {
+        fail = FAIL_COPY;
+        rt_remove_game_files(g_root.c_str());  // (half a setup: the keys copy too)
+    }
+    return done(ok);
+}
+#endif
+
 static void *extract_thread(void *) {
     std::string src;
     pthread_mutex_lock(&g_lock);
@@ -1167,6 +1289,27 @@ static void *extract_thread(void *) {
     std::string exefs, romfs;
     std::vector<std::string> pkgs;
     bool unusable = false;  // (game packages rather than its files)
+#ifdef __ANDROID__
+    {   // (the picked files: the packages read in place - nsp_setup)
+        std::vector<std::string> picks;
+        pthread_mutex_lock(&g_lock);
+        picks = g_picks;
+        pthread_mutex_unlock(&g_lock);
+        if (!picks.empty()) {
+            std::string err;
+            int fail = FAIL_IMPORT;
+            g_import_mode = true;
+            set_job("Reading your game files...");
+            if (!nsp_setup(picks, err, fail)) { set_failure(fail, err); goto done; }
+            pthread_mutex_lock(&g_lock);
+            g_picks.clear(), g_src.clear();
+            pthread_mutex_unlock(&g_lock);
+            if (!build_id_ok(g_root + "/exefs/main")) { set_failure(FAIL_VERSION); goto done; }
+            if (!build_game_code()) goto done;
+            goto check;
+        }
+    }
+#endif
     if (src.empty() && check_copied_files(g_root).empty()) {  // copied already (an update needs new game code)
         g_copy_skipped = true;
         if (!build_game_code()) goto done;
@@ -1262,6 +1405,23 @@ static void SDLCALL picked(void *, const char *const *files, int) {
     g_src = files[0];
     pthread_mutex_unlock(&g_lock);
 }
+#ifdef __ANDROID__
+// (Android: several files at once - the .nsp packages and the keys, nsp_setup; shown by their names)
+static void SDLCALL picked_files(void *, const char *const *files, int) {
+    if (!files || !files[0]) return;
+    std::vector<std::string> v;
+    std::string shown;
+    for (int i = 0; files[i]; i++) {
+        char nm[160];
+        nsp_source_name(files[i], nm, sizeof nm);
+        v.push_back(files[i]);
+        shown += (i ? ", " : "") + std::string(nm);
+    }
+    pthread_mutex_lock(&g_lock);
+    g_picks = v, g_src = shown;
+    pthread_mutex_unlock(&g_lock);
+}
+#endif
 
 // ------------------------------------------------------------------ a save from the player's Switch (or another copy)
 // The game's save is its own files, as JKSV backs them up on a modded Switch (SD card: JKSV/<game>/<user - date>/,
@@ -3227,6 +3387,18 @@ extern "C" void launcher_run(const char *root) {
                              "are already here: only the code is compiled again (a few minutes).",
                              "Esta versão do ZA Recomp compila o código do jogo de um jeito um pouco diferente. Os seus "
                              "arquivos do jogo já estão aqui: só o código é compilado de novo (alguns minutos).")
+#ifdef __ANDROID__
+                        : TR("Choose your own dump of Pokémon Legends Z-A, all files at once (tap and hold to pick "
+                             "several): the base game's .nsp, the 2.0.2 update's .nsp (and the DLC's), and the prod.keys "
+                             "(and title.keys) from your Switch.\n"
+                             "The game is read from those files where they are: nothing big is copied, and an emulator "
+                             "can keep using them. Don't move or delete them afterwards. The game isn't included.",
+                             "Escolha o seu próprio dump de Pokémon Legends Z-A, todos os arquivos de uma vez (toque e "
+                             "segure para escolher vários): o .nsp do jogo base, o .nsp da atualização 2.0.2 (e o da DLC), e "
+                             "o prod.keys (e o title.keys) do seu Switch.\n"
+                             "O jogo é lido desses arquivos onde eles estão: nada grande é copiado, e um emulador pode "
+                             "continuar usando os mesmos. Não mova nem apague depois. O jogo não vem com o app.");
+#else
                         : TR("Choose the folder with your own copy of Pokémon Legends Z-A, either way:\n"
                              "· the game extracted (exefs and romfs folders, as an emulator or your Switch extracts them): "
                              "no keys needed;\n"
@@ -3239,17 +3411,27 @@ extern "C" void launcher_run(const char *root) {
                              "· ou o seu dump: o jogo base (.xci / .nsp com o seu prod.keys, ou .nup sem keys), se quiser a atualização e a "
                              "DLC (.nsp).\n"
                              "Também dá para arrastar a pasta para esta janela. O jogo não vem com o ZA Recomp.");
+#endif
                     float ty = 196 + text(dl, F_BODY, 16, x, 196, C_SOFT, what, w).y + 22;
                     if (!rebuild) {
                         panel(dl, x, ty, w, 64, C_PANEL);
                         icon(dl, IC_FOLDER, x + 30, ty + 32, 22, src.empty() ? C_MUTED : C_TEAL);
+#ifdef __ANDROID__
+                        std::string shown = src.empty() ? TR("No files chosen yet", "Nenhum arquivo escolhido ainda") : src;
+#else
                         std::string shown = src.empty() ? TR("No folder chosen yet", "Nenhuma pasta escolhida ainda") : src;
+#endif
                         dl->PushClipRect(P(x + 50, ty), P(x + w - 150, ty + 64), true);
                         text(dl, F_BODY, 15, x + 52, ty + 32 - text_size(F_BODY, 15, "A").y / 2, src.empty() ? C_MUTED : C_TEXT,
                              shown.c_str());
                         dl->PopClipRect();
                         if (button("##pick", TR("Choose...", "Escolher..."), x + w - 138, ty + 12, 124, 40, BTN_SECONDARY))
+#ifdef __ANDROID__
+                            // (no filter: Android's picker knows no .nsp / .keys type and would grey them out)
+                            SDL_ShowOpenFileDialog(picked_files, NULL, win, NULL, 0, NULL, true);
+#else
                             SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
+#endif
                         ty += 84;
                     }
                     bool can = rebuild || !src.empty();

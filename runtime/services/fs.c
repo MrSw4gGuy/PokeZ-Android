@@ -24,6 +24,7 @@
 #include "../input_bind.h"
 #include "../xbox_attack_layout.h"
 #include "mod_layout.h"
+#include "nsp.h"
 #include "../paths.h"
 
 #ifndef O_BINARY
@@ -41,9 +42,13 @@ const char *g_save_dir = "save";
 // laid out in memory (runtime/romfs_build.c), each file's bytes read from its own file, the gaps between files zeros -
 // no image file on disk, so the game data isn't kept twice. A romfs.bin from an older version is used only when the
 // folder isn't there.
+// Pokémon Z-A set up from its packages on Android (<game dir>/packages.txt): the image is read from the player's own
+// .nsp files, decrypted as it is read (runtime/services/nsp.c) - no copy of the game data at all. It wins over a
+// romfs.bin or romfs/ left from an earlier setup.
 static RomfsLayout g_base;
 static bool g_base_open;
 static int g_base_fd = -1;  // (an older version's romfs.bin)
+static NspGame *g_nsp;      // (the packages)
 static pthread_mutex_t g_base_lock = PTHREAD_MUTEX_INITIALIZER;
 #define BASE_FDS 32  // files kept open (macOS allows 256 open files by default)
 static struct { int file, fd; uint64_t used; } g_base_fds[BASE_FDS];
@@ -62,6 +67,7 @@ static int base_file_fd(int i) {  // (g_base_lock held)
 }
 
 static uint64_t base_size(void) {
+    if (g_nsp) return nsp_romfs_size(g_nsp);
     if (g_base_fd >= 0) {
         struct stat sb;
         fstat(g_base_fd, &sb);
@@ -72,6 +78,12 @@ static uint64_t base_size(void) {
 
 // n bytes of the base image at off (past its end: zeros)
 static ssize_t base_pread(void *dst_, uint64_t n, uint64_t off) {
+    if (g_nsp) {
+        ssize_t r = nsp_romfs_read(g_nsp, dst_, n, off);
+        if (r < 0) LOG("[fs] the game's packages can't be read at %llu (+%llu)\n", (unsigned long long)off,
+                       (unsigned long long)n);
+        return r;
+    }
     if (g_base_fd >= 0) return pread(g_base_fd, dst_, n, (off_t)off);
     uint8_t *dst = dst_;
     memset(dst, 0, n);
@@ -111,12 +123,32 @@ static void base_close(void) {
     romfs_layout_free(&g_base);
     if (g_base_fd >= 0) close(g_base_fd);
     g_base_fd = -1;
+    nsp_close(g_nsp);
+    g_nsp = NULL;
     g_base_open = false;
 }
 
 static void base_open(void) {
     if (g_base_open) return;
     char path[1100], why[256] = "";
+    {   // (the packages: <game dir>/packages.txt beside romfs - where aoc/ is, services/misc.c)
+        char dir[1100];
+        snprintf(dir, sizeof dir, "%s", g_romfs_dir);
+        char *slash = strrchr(dir, '/');
+        if (slash) *slash = 0;
+        else snprintf(dir, sizeof dir, ".");
+        snprintf(path, sizeof path, "%s/" NSP_LIST, dir);
+        struct stat sb;
+        if (stat(path, &sb) == 0) {
+            char nw[512] = "";
+            g_nsp = nsp_open_game_dir(dir, nw, sizeof nw);
+            if (!g_nsp) FATAL("the game's packages can't be read: %s\n", nw);
+            LOG("[fs] romfs: read from the game's packages (%s), %llu bytes\n", nsp_describe(g_nsp),
+                (unsigned long long)nsp_romfs_size(g_nsp));
+            g_base_open = true;
+            return;
+        }
+    }
     // (the folder: Link's Awakening's has region_common; Pokémon Z-A's, copied from extracted files, has no romfs.bin
     // beside it - the import from its packages writes only that)
     struct stat sb;

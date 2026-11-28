@@ -84,6 +84,10 @@ void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
 void plat_frame_rate_hint(void *sdl_window, float fps);
 // The app closes and opens again at its start screen (a new process: what a GPU driver change needs - android.c)
 void plat_restart_app(void);
+// A content:// URI from the system file picker (the player's .nsp where they keep it), opened for reading: an fd, -1
+// if not (moved, deleted, access taken back). keep: ask Android to keep the read access across restarts - only right
+// after the picker gave the URI (runtime/services/nsp_list.c, the game read straight from its packages).
+int plat_android_open_uri(const char *uri, bool keep);
 // GPU drivers (runtime/platform/android_vk.c): the packages in <data root>/drivers/, by name (max of them); the one the
 // running process loaded (NULL: the system's); the chosen one it didn't run on (NULL: none; the last start died on it,
 // or it didn't load); a .zip package (AdrenoToolsDrivers' meta.json layout) or a bare .so added from a picked file or
