@@ -1210,11 +1210,17 @@ static bool nsp_setup(const std::vector<std::string> &picks, std::string &err, i
                   : TR("None of the chosen files is a game package (.nsp).", "Nenhum dos arquivos escolhidos é um pacote do jogo (.nsp).");
         return done(false);
     }
-    if (pk.empty()) {  // (setting up again with the packages only: the keys the last setup kept)
+    if (pk.empty()) {  // (setting up again with the packages only: the keys the last setup kept, title.keys too)
         int kfd = nsp_open_source((g_root + "/keys/prod.keys").c_str(), false);
         char *k = nsp_slurp_fd(kfd, 1 << 20);
         if (kfd >= 0) close(kfd);
         if (k) pk = k, memset(k, 0, pk.size()), free(k);
+    }
+    if (tk.empty()) {
+        int kfd = nsp_open_source((g_root + "/keys/title.keys").c_str(), false);
+        char *k = nsp_slurp_fd(kfd, 1 << 20);
+        if (kfd >= 0) close(kfd);
+        if (k) tk = k, memset(k, 0, tk.size()), free(k);
     }
     if (pk.empty()) {
         fail = FAIL_KEYS;
@@ -1461,6 +1467,58 @@ static void check_packages(const std::vector<std::string> &files, int want, cons
     }
 }
 
+// the title.keys text: one picked on the keys row, else the copy a setup kept; "" when neither
+static std::string known_title_keys(const std::vector<std::string> &key_picks) {
+    std::vector<std::string> srcs = key_picks;
+    srcs.push_back(g_root + "/keys/title.keys");
+    for (auto &s : srcs) {
+        int fd = nsp_open_source(s.c_str(), false);
+        char *t = nsp_slurp_fd(fd, 1 << 20);
+        if (fd >= 0) close(fd);
+        std::string r = t && !nsp_text_is_prod_keys(t) && nsp_text_is_title_keys(t) ? t : "";
+        if (t) memset(t, 0, strlen(t)), free(t);
+        if (!r.empty()) return r;
+    }
+    return "";
+}
+
+// After every pick, the chosen packages opened with the keys there are (picked or kept: nsp_open, headers and tables
+// only - a second or so): a prod.keys from an older firmware than the game needs is said on the keys row (2026-11-28:
+// the phone's loose prod.keys had no key_area_key_application_13), a DLC without its title key on the DLC row - also
+// when the keys are the kept ones and only a DLC was picked (2026-11-28: a re-setup for the DLC went through without
+// it, the row saying the keys were kept). The keys row's warning stops the setup; the DLC's only says it'll be left out.
+static std::string g_pick_warn[PICK_N];
+static void pick_trial(const std::vector<std::string> rows[PICK_N]) {
+    std::string warn[PICK_N];
+    std::string pk = known_prod_keys(rows[PICK_KEYS]), tk = known_title_keys(rows[PICK_KEYS]);
+    if (!pk.empty() && !rows[PICK_BASE].empty()) {
+        std::vector<int> fds;
+        for (int k = 0; k < PICK_KEYS; k++)
+            for (auto &s : rows[k]) {
+                int fd = nsp_open_source(s.c_str(), false);
+                if (fd >= 0) fds.push_back(fd);
+            }
+        char why[512] = "";
+        NspGame *g = nsp_open(fds.data(), NULL, (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why, sizeof why);
+        bool opens = g != NULL;
+        if (!opens) warn[PICK_KEYS] = why;
+        else {
+            if ((size_t)nsp_aoc_count(g) < rows[PICK_DLC].size())
+                warn[PICK_DLC] = TR("no title key for it among the keys: choose title.keys on the keys row too",
+                                    "sem a chave dela entre as keys: escolha também o title.keys na linha das keys");
+            nsp_adopt_fds(g, fds.data(), (int)fds.size()), fds.clear();
+            nsp_close(g);
+        }
+        for (int fd : fds) close(fd);
+        rt_launcher_log("[launcher] keys tried on the chosen packages: %s%s\n", opens ? "they open" : why,
+                        warn[PICK_DLC].empty() ? "" : " (a DLC without its title key)");
+    }
+    std::fill(pk.begin(), pk.end(), 0), std::fill(tk.begin(), tk.end(), 0);
+    pthread_mutex_lock(&g_lock);
+    for (int k = 0; k < PICK_N; k++) g_pick_warn[k] = warn[k];
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
     static const int want[PICK_N] = {NSP_BASE, NSP_UPDATE, NSP_DLC, 0};
     int slot = (int)(intptr_t)ud;
@@ -1497,34 +1555,6 @@ static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
         for (int k = 0; k < PICK_KEYS && !pk.empty(); k++)
             if (!rows[k].empty())
                 recheck[k] = true, check_packages(rows[k], want[k], pk, false, ok[k], names[k], refused[k], unsure[k]);
-        // a trial open with these keys (nsp_open, headers and tables only - a second or so): a prod.keys from an older
-        // firmware than the game needs is said here, on its row, not after "Set up the game" (2026-11-28: the phone's
-        // loose prod.keys had no key_area_key_application_13); a DLC without its title key, on the DLC row
-        if (!pk.empty() && !ok[PICK_BASE].empty()) {
-            std::vector<std::string> srcs;
-            for (int k = 0; k < PICK_KEYS; k++) srcs.insert(srcs.end(), ok[k].begin(), ok[k].end());
-            std::vector<int> fds;
-            for (auto &s : srcs) {
-                int fd = nsp_open_source(s.c_str(), false);
-                if (fd >= 0) fds.push_back(fd);
-            }
-            char why[512] = "";
-            NspGame *g = nsp_open(fds.data(), NULL, (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why,
-                                  sizeof why);
-            bool opens = g != NULL;
-            if (!opens) {
-                refused[slot] = why;
-                ok[slot].clear(), names[slot].clear();
-            } else {
-                if ((size_t)nsp_aoc_count(g) < ok[PICK_DLC].size() && refused[PICK_DLC].empty())
-                    refused[PICK_DLC] = TR("no title key for it among the chosen keys: choose title.keys too",
-                                           "sem a chave dela entre as keys escolhidas: escolha também o title.keys");
-                nsp_adopt_fds(g, fds.data(), (int)fds.size()), fds.clear();
-                nsp_close(g);
-            }
-            for (int fd : fds) close(fd);
-            rt_launcher_log("[launcher] keys tried on the chosen packages: %s\n", opens ? "they open" : why);
-        }
         std::fill(pk.begin(), pk.end(), 0), std::fill(tk.begin(), tk.end(), 0);
     } else {
         std::string pk = known_prod_keys(rows[PICK_KEYS]);
@@ -1542,7 +1572,9 @@ static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
     g_picks.clear();
     for (auto &p : g_pick) g_picks.insert(g_picks.end(), p.begin(), p.end());
     g_src = g_pick[PICK_BASE].empty() ? "" : g_pick_note[PICK_BASE];  // (the page's "something chosen")
+    for (int k = 0; k < PICK_N; k++) rows[k] = g_pick[k];
     pthread_mutex_unlock(&g_lock);
+    pick_trial(rows);
 }
 #endif
 
@@ -3544,13 +3576,19 @@ extern "C" void launcher_run(const char *root) {
                         for (int k = 0; k < PICK_N; k++) {
                             pthread_mutex_lock(&g_lock);
                             bool have = !g_pick[k].empty(), bad = g_pick_bad[k], unsure = g_pick_unsure[k];
-                            std::string note = g_pick_note[k];
+                            std::string note = g_pick_note[k], warn = g_pick_warn[k];
                             pthread_mutex_unlock(&g_lock);
+                            if (!warn.empty()) bad = true, note = warn;  // (pick_trial: the keys don't open it)
                             panel(dl, x, ty, w, 64, C_PANEL);
                             icon(dl, have && !bad ? IC_CHECK : IC_FOLDER, x + 30, ty + 32, 22,
                                  bad ? C_RED : have && !unsure ? C_GREEN : have ? C_TEAL : C_MUTED);
                             std::string sub = bad || have ? note
-                                            : k == PICK_KEYS && kept_keys ? TR("Kept from the last setup", "Guardado da última preparação")
+                                            : k == PICK_KEYS && kept_keys
+                                            ? (file_exists(g_root + "/keys/title.keys")
+                                                   ? TR("Kept from the last setup (prod.keys + title.keys)",
+                                                        "Guardado da última preparação (prod.keys + title.keys)")
+                                                   : TR("Kept from the last setup (prod.keys only, no title.keys)",
+                                                        "Guardado da última preparação (só o prod.keys, sem title.keys)"))
                                             : TR("Not chosen", "Não escolhido");
                             if (have && unsure && !bad)
                                 sub += TR(" (checked when the keys are chosen)", " (conferido quando as keys forem escolhidas)");
@@ -3570,7 +3608,8 @@ extern "C" void launcher_run(const char *root) {
                         ty += 12;
                     }
                     pthread_mutex_lock(&g_lock);
-                    bool can = rebuild || (!g_pick[PICK_BASE].empty() && (!g_pick[PICK_KEYS].empty() || kept_keys));
+                    bool can = rebuild || (!g_pick[PICK_BASE].empty() && (!g_pick[PICK_KEYS].empty() || kept_keys) &&
+                                           g_pick_warn[PICK_KEYS].empty());
                     pthread_mutex_unlock(&g_lock);
 #else
                     if (!rebuild) {
