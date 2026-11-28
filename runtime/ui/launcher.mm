@@ -46,6 +46,7 @@ extern "C" {
 #include "input_bind.h"
 #include "xbox_attack_layout.h"
 #include "services/mod_layout.h"
+#include "services/nsp.h"
 bool controls_ui_took_back(void);  // ui/controls_ui.mm: B went back a step on Configure inputs
 void input_mouse_release(SDL_Window *w);   // runtime/hle/input.c
 void ui_window_init(void);
@@ -379,8 +380,9 @@ static std::string check_copied_files(const std::string &root) {
     if (!read_build_id(root + "/exefs/main", id)) return "No game files";
     if (!build_version(id)) return "Wrong game version";
     // (the game data: romfs.bin - Pokémon Z-A's packages, read by zaimport - or the copied romfs/ folder, which
-    // runtime/services/fs.c serves itself)
-    if (!file_exists(root + "/romfs.bin") && !file_exists(root + (build_is_za(id) ? "/romfs" : "/romfs/region_common")))
+    // runtime/services/fs.c serves itself; or, on Android, the player's own packages read in place: packages.txt)
+    if (!file_exists(root + "/romfs.bin") && !file_exists(root + (build_is_za(id) ? "/romfs" : "/romfs/region_common")) &&
+        !file_exists(root + "/" NSP_LIST))
         return "Game data missing";
     return "";
 }
@@ -417,6 +419,7 @@ static std::string check_game_files(const std::string &root) {
 // file system allows); the game reads romfs/ in place (runtime/services/fs.c).
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static std::string g_src;           // the picked folder
+static std::vector<std::string> g_picks;  // (Android: the picked files - content:// URIs; Android's picker takes no folder)
 static std::string g_job;           // current setup step / result for the status line
 static std::string g_job_hint;      // a failure: what to do about it (shown under it)
 static bool g_busy, g_job_failed;
@@ -1156,6 +1159,129 @@ static bool build_game_code(void) {
     return true;
 }
 
+#ifdef __ANDROID__
+// ---- Android: the game set up from the player's own files, left where they keep them (runtime/services/nsp.h: the
+// game reads its data from them in place, at every start - Eden or another emulator can keep using the same .nsp).
+// Android's picker gives files, not a folder: the base game's .nsp, the update's, the DLC's, prod.keys and title.keys,
+// picked together and told apart by what is in them (as find_keys does: any file names). Written here: exefs/ (~40 MB,
+// what the game code is built from), the DLC images (kilobytes: misc.c / fs.c read aoc/ as files), a copy of the keys
+// (keys/: needed at every start, and the picked keys file may be moved or deleted), then packages.txt - last, as it
+// marks the setup done (check_copied_files). The old copy's romfs.bin (~6 GB) goes with the other game files.
+static bool nsp_setup(const std::vector<std::string> &picks, std::string &err, int &fail) {
+    std::vector<int> fds;
+    std::vector<std::string> pkgs, names;
+    std::string pk, tk;
+    bool xci = false;
+    auto drop = [&](std::string &s) { std::fill(s.begin(), s.end(), 0), s.clear(); };  // (no keys left in memory)
+    auto done = [&](bool ok) {
+        for (int fd : fds) close(fd);
+        drop(pk), drop(tk);
+        return ok;
+    };
+    for (auto &s : picks) {
+        char nm[160];
+        nsp_source_name(s.c_str(), nm, sizeof nm);
+        int fd = nsp_open_source(s.c_str(), true);
+        if (fd < 0) {
+            rt_launcher_log("[launcher] %s: can't be opened\n", nm);
+            continue;
+        }
+        char head[16] = {0}, h2[4] = {0};
+        if (pread(fd, head, 16, 0) == 16 && !memcmp(head, "PFS0", 4)) {
+            fds.push_back(fd), pkgs.push_back(s), names.push_back(nm);
+            continue;
+        }
+        if (pread(fd, h2, 4, 0x100) == 4 && !memcmp(h2, "HEAD", 4)) xci = true;
+        char *text = xci ? NULL : nsp_slurp_fd(fd, 1 << 20);
+        close(fd);
+        std::string t = text ? text : "";
+        if (text) memset(text, 0, t.size()), free(text);
+        if (nsp_text_is_prod_keys(t.c_str())) pk = t;
+        else if (nsp_text_is_title_keys(t.c_str())) tk = t;
+        else rt_launcher_log("[launcher] %s: not a package or a keys file, left out\n", nm);
+        drop(t);
+    }
+    rt_launcher_log("[launcher] picked: %zu package(s), prod.keys %s, title.keys %s\n", pkgs.size(), pk.empty() ? "no" : "yes",
+                    tk.empty() ? "no" : "yes");
+    if (pkgs.empty()) {
+        fail = FAIL_UNUSABLE;
+        err = xci ? TR("Your dump is an .xci: this version reads .nsp packages. Choose the .nsp files.",
+                       "O seu dump é .xci: esta versão lê pacotes .nsp. Escolha os arquivos .nsp.")
+                  : TR("None of the chosen files is a game package (.nsp).", "Nenhum dos arquivos escolhidos é um pacote do jogo (.nsp).");
+        return done(false);
+    }
+    if (pk.empty()) {  // (setting up again with the packages only: the keys the last setup kept, title.keys too)
+        int kfd = nsp_open_source((g_root + "/keys/prod.keys").c_str(), false);
+        char *k = nsp_slurp_fd(kfd, 1 << 20);
+        if (kfd >= 0) close(kfd);
+        if (k) pk = k, memset(k, 0, pk.size()), free(k);
+    }
+    if (tk.empty()) {
+        int kfd = nsp_open_source((g_root + "/keys/title.keys").c_str(), false);
+        char *k = nsp_slurp_fd(kfd, 1 << 20);
+        if (kfd >= 0) close(kfd);
+        if (k) tk = k, memset(k, 0, tk.size()), free(k);
+    }
+    if (pk.empty()) {
+        fail = FAIL_KEYS;
+        err = TR("Choose your prod.keys together with the .nsp files (tap and hold to pick several files).",
+                 "Escolha o seu prod.keys junto com os arquivos .nsp (toque e segure para escolher vários arquivos).");
+        return done(false);
+    }
+    std::vector<const char *> np;
+    for (auto &n : names) np.push_back(n.c_str());
+    char why[512] = "";
+    NspGame *g = nsp_open(fds.data(), np.data(), (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why,
+                          sizeof why);
+    if (!g) {
+        err = why;
+        fail = err.find("base game") != std::string::npos ? FAIL_UNUSABLE : FAIL_IMPORT;
+        return done(false);
+    }
+    nsp_adopt_fds(g, fds.data(), (int)fds.size());
+    fds.clear();
+    rt_launcher_log("[launcher] packages: %s; RomFS %llu bytes read in place\n", nsp_describe(g),
+                    (unsigned long long)nsp_romfs_size(g));
+    rt_remove_game_files(g_root.c_str());
+    mkdir(g_root.c_str(), 0755);
+    mkdir((g_root + "/exefs").c_str(), 0755);
+    mkdir((g_root + "/keys").c_str(), 0700);
+    plat_remove_tree((g_root + "/aoc").c_str());
+    auto put = [&](const std::string &path, const void *data, size_t n) {
+        FILE *f = fopen(path.c_str(), "wb");
+        bool ok = f && fwrite(data, 1, n, f) == n;
+        if (f && fclose(f)) ok = false;
+        return ok;
+    };
+    bool ok = put(g_root + "/keys/prod.keys", pk.data(), pk.size()) &&
+              (tk.empty() || put(g_root + "/keys/title.keys", tk.data(), tk.size()));
+    if (ok && !nsp_exefs_extract(g, (g_root + "/exefs").c_str(), why, sizeof why)) ok = false, err = why;
+    if (ok && nsp_aoc_count(g)) mkdir((g_root + "/aoc").c_str(), 0755);
+    for (int i = 0; ok && i < nsp_aoc_count(g); i++) {
+        char nm[64];
+        snprintf(nm, sizeof nm, "/aoc/%016llx.bin", (unsigned long long)nsp_aoc_title(g, i));
+        uint64_t size = nsp_aoc_size(g, i);
+        FILE *f = fopen((g_root + nm).c_str(), "wb");
+        std::vector<uint8_t> buf(4 << 20);
+        for (uint64_t off = 0; f && ok && off < size; off += buf.size()) {
+            size_t n = (size_t)std::min<uint64_t>(buf.size(), size - off);
+            ok = nsp_aoc_read(g, i, buf.data(), n, off) == (ssize_t)n && fwrite(buf.data(), 1, n, f) == n;
+        }
+        if (!f || fclose(f)) ok = false;
+        if (!ok) err = std::string("aoc") + nm + " couldn't be written";
+    }
+    std::string list = "# Pokémon Legends Z-A read from these packages in place (runtime/services/nsp.h); keys in keys/\n";
+    for (auto &s : pkgs) list += s + "\n";
+    if (ok && !put(g_root + "/" NSP_LIST, list.data(), list.size())) ok = false, err = NSP_LIST " couldn't be written";
+    nsp_close(g);
+    if (!ok) {
+        fail = FAIL_COPY;
+        rt_remove_game_files(g_root.c_str());  // (half a setup: the keys copy too)
+    }
+    return done(ok);
+}
+#endif
+
 static void *extract_thread(void *) {
     std::string src;
     pthread_mutex_lock(&g_lock);
@@ -1167,6 +1293,27 @@ static void *extract_thread(void *) {
     std::string exefs, romfs;
     std::vector<std::string> pkgs;
     bool unusable = false;  // (game packages rather than its files)
+#ifdef __ANDROID__
+    {   // (the picked files: the packages read in place - nsp_setup)
+        std::vector<std::string> picks;
+        pthread_mutex_lock(&g_lock);
+        picks = g_picks;
+        pthread_mutex_unlock(&g_lock);
+        if (!picks.empty()) {
+            std::string err;
+            int fail = FAIL_IMPORT;
+            g_import_mode = true;
+            set_job("Reading your game files...");
+            if (!nsp_setup(picks, err, fail)) { set_failure(fail, err); goto done; }
+            pthread_mutex_lock(&g_lock);
+            g_picks.clear(), g_src.clear();
+            pthread_mutex_unlock(&g_lock);
+            if (!build_id_ok(g_root + "/exefs/main")) { set_failure(FAIL_VERSION); goto done; }
+            if (!build_game_code()) goto done;
+            goto check;
+        }
+    }
+#endif
     if (src.empty() && check_copied_files(g_root).empty()) {  // copied already (an update needs new game code)
         g_copy_skipped = true;
         if (!build_game_code()) goto done;
@@ -1262,6 +1409,174 @@ static void SDLCALL picked(void *, const char *const *files, int) {
     g_src = files[0];
     pthread_mutex_unlock(&g_lock);
 }
+#ifdef __ANDROID__
+// (Android: the files one kind at a time - the base game, its update, DLC, the keys - each from wherever the player
+// keeps it: Android's picker takes several files only from one folder, and the keys rarely sit with the games. Each
+// pick is checked as it comes - a game package (PFS0) on the game rows, a keys file on the keys row - so a wrong file
+// is said on its row, not after the setup started. nsp_setup gets them all together, g_picks.)
+// A row takes only its own kind (nsp_classify): the update picked on the DLC row is refused there, saying what it is.
+// Without keys a package without a ticket (the base game's, a DLC dumped without one) can't be told yet: it is taken
+// as "to be checked", and picking the keys checks every row again - a wrong one is taken out, said on its row.
+enum { PICK_BASE, PICK_UPD, PICK_DLC, PICK_KEYS, PICK_N };
+static std::vector<std::string> g_pick[PICK_N];
+static std::string g_pick_note[PICK_N];  // (the picked files' names, or why the last pick was refused)
+static bool g_pick_bad[PICK_N], g_pick_unsure[PICK_N];
+
+static const char *kind_said(int k) {
+    switch (k) {
+    case NSP_BASE: return TR("it's the base game", "é o jogo base");
+    case NSP_UPDATE: return TR("it's the update", "é a atualização");
+    case NSP_DLC: return TR("it's a DLC", "é uma DLC");
+    case NSP_OTHER_GAME: return TR("it's another game", "é de outro jogo");
+    case NSP_XCI: return TR("it's an .xci: choose the .nsp", "é um .xci: escolha o .nsp");
+    default: return TR("not a game package (.nsp)", "não é um pacote do jogo (.nsp)");
+    }
+}
+
+// the prod.keys text the checks can use: the keys row's (picked), else the copy a setup kept; "" when neither
+static std::string known_prod_keys(const std::vector<std::string> &key_picks) {
+    std::vector<std::string> srcs = key_picks;
+    srcs.push_back(g_root + "/keys/prod.keys");
+    for (auto &s : srcs) {
+        int fd = nsp_open_source(s.c_str(), false);
+        char *t = nsp_slurp_fd(fd, 1 << 20);
+        if (fd >= 0) close(fd);
+        std::string r = t && nsp_text_is_prod_keys(t) ? t : "";
+        if (t) memset(t, 0, strlen(t)), free(t);
+        if (!r.empty()) return r;
+    }
+    return "";
+}
+
+// files checked for a game row (want: NSP_BASE / NSP_UPDATE / NSP_DLC): those that fit, their names, the refusal
+static void check_packages(const std::vector<std::string> &files, int want, const std::string &pk, bool keep,
+                           std::vector<std::string> &ok, std::string &names, std::string &refused, bool &unsure) {
+    for (auto &f : files) {
+        char nm[160];
+        nsp_source_name(f.c_str(), nm, sizeof nm);
+        int fd = nsp_open_source(f.c_str(), keep);
+        uint64_t tid = 0;
+        char rep[2048];
+        int k = fd < 0 ? NSP_NOT_PACKAGE : nsp_classify(fd, pk.empty() ? NULL : pk.c_str(), &tid, rep, sizeof rep);
+        if (fd >= 0) close(fd);
+        rt_launcher_log("[launcher] %s: kind %d, title %016llx\n%s", nm, k, (unsigned long long)tid, rep);
+        if (k == want || k == NSP_UNKNOWN) {
+            unsure = unsure || k == NSP_UNKNOWN;
+            ok.push_back(f), names += (names.empty() ? "" : ", ") + std::string(nm);
+        } else refused = std::string(nm) + ": " + kind_said(k);
+    }
+}
+
+// the title.keys text: one picked on the keys row, else the copy a setup kept; "" when neither
+static std::string known_title_keys(const std::vector<std::string> &key_picks) {
+    std::vector<std::string> srcs = key_picks;
+    srcs.push_back(g_root + "/keys/title.keys");
+    for (auto &s : srcs) {
+        int fd = nsp_open_source(s.c_str(), false);
+        char *t = nsp_slurp_fd(fd, 1 << 20);
+        if (fd >= 0) close(fd);
+        std::string r = t && !nsp_text_is_prod_keys(t) && nsp_text_is_title_keys(t) ? t : "";
+        if (t) memset(t, 0, strlen(t)), free(t);
+        if (!r.empty()) return r;
+    }
+    return "";
+}
+
+// After every pick, the chosen packages opened with the keys there are (picked or kept: nsp_open, headers and tables
+// only - a second or so): a prod.keys from an older firmware than the game needs is said on the keys row (2026-11-28:
+// the phone's loose prod.keys had no key_area_key_application_13), a DLC without its title key on the DLC row - also
+// when the keys are the kept ones and only a DLC was picked (2026-11-28: a re-setup for the DLC went through without
+// it, the row saying the keys were kept). The keys row's warning stops the setup; the DLC's only says it'll be left out.
+static std::string g_pick_warn[PICK_N];
+static void pick_trial(const std::vector<std::string> rows[PICK_N]) {
+    std::string warn[PICK_N];
+    std::string pk = known_prod_keys(rows[PICK_KEYS]), tk = known_title_keys(rows[PICK_KEYS]);
+    if (!pk.empty() && !rows[PICK_BASE].empty()) {
+        std::vector<int> fds;
+        for (int k = 0; k < PICK_KEYS; k++)
+            for (auto &s : rows[k]) {
+                int fd = nsp_open_source(s.c_str(), false);
+                if (fd >= 0) fds.push_back(fd);
+            }
+        char why[512] = "";
+        NspGame *g = nsp_open(fds.data(), NULL, (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why, sizeof why);
+        bool opens = g != NULL;
+        if (!opens) warn[PICK_KEYS] = why;
+        else {
+            if ((size_t)nsp_aoc_count(g) < rows[PICK_DLC].size())
+                warn[PICK_DLC] = TR("no title key for it among the keys: choose title.keys on the keys row too",
+                                    "sem a chave dela entre as keys: escolha também o title.keys na linha das keys");
+            nsp_adopt_fds(g, fds.data(), (int)fds.size()), fds.clear();
+            nsp_close(g);
+        }
+        for (int fd : fds) close(fd);
+        rt_launcher_log("[launcher] keys tried on the chosen packages: %s%s\n", opens ? "they open" : why,
+                        warn[PICK_DLC].empty() ? "" : " (a DLC without its title key)");
+    }
+    std::fill(pk.begin(), pk.end(), 0), std::fill(tk.begin(), tk.end(), 0);
+    pthread_mutex_lock(&g_lock);
+    for (int k = 0; k < PICK_N; k++) g_pick_warn[k] = warn[k];
+    pthread_mutex_unlock(&g_lock);
+}
+
+static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
+    static const int want[PICK_N] = {NSP_BASE, NSP_UPDATE, NSP_DLC, 0};
+    int slot = (int)(intptr_t)ud;
+    if (!files || !files[0] || slot < 0 || slot >= PICK_N) return;
+    std::vector<std::string> picked;
+    for (int i = 0; files[i]; i++) picked.push_back(files[i]);
+    pthread_mutex_lock(&g_lock);
+    std::vector<std::string> rows[PICK_N];
+    for (int k = 0; k < PICK_N; k++) rows[k] = g_pick[k];
+    pthread_mutex_unlock(&g_lock);
+    std::vector<std::string> ok[PICK_N];
+    std::string names[PICK_N], refused[PICK_N];
+    bool unsure[PICK_N] = {false}, recheck[PICK_N] = {false};
+    if (slot == PICK_KEYS) {  // (keys: prod.keys / title.keys by content; then every game row checked with them)
+        std::string tk;
+        for (auto &f : picked) {
+            char nm[160];
+            nsp_source_name(f.c_str(), nm, sizeof nm);
+            int fd = nsp_open_source(f.c_str(), true);
+            char *t = nsp_slurp_fd(fd, 1 << 20);
+            if (fd >= 0) close(fd);
+            bool fits = t && (nsp_text_is_prod_keys(t) || nsp_text_is_title_keys(t));
+            if (t && !nsp_text_is_prod_keys(t) && nsp_text_is_title_keys(t)) tk = t;
+            if (t) memset(t, 0, strlen(t)), free(t);
+            if (fits) ok[slot].push_back(f), names[slot] += (names[slot].empty() ? "" : ", ") + std::string(nm);
+            else refused[slot] = std::string(nm) + TR(": not a keys file", ": não é um arquivo de keys");
+        }
+        std::string pk = ok[slot].empty() ? "" : known_prod_keys(ok[slot]);
+        if (!ok[slot].empty() && pk.empty()) {  // (only a title.keys: the prod.keys is still needed)
+            refused[slot] = TR("no prod.keys among them (title.keys alone isn't enough)",
+                               "nenhum prod.keys entre eles (só o title.keys não basta)");
+            ok[slot].clear(), names[slot].clear();
+        }
+        for (int k = 0; k < PICK_KEYS && !pk.empty(); k++)
+            if (!rows[k].empty())
+                recheck[k] = true, check_packages(rows[k], want[k], pk, false, ok[k], names[k], refused[k], unsure[k]);
+        std::fill(pk.begin(), pk.end(), 0), std::fill(tk.begin(), tk.end(), 0);
+    } else {
+        std::string pk = known_prod_keys(rows[PICK_KEYS]);
+        check_packages(picked, want[slot], pk, true, ok[slot], names[slot], refused[slot], unsure[slot]);
+        std::fill(pk.begin(), pk.end(), 0);
+    }
+    pthread_mutex_lock(&g_lock);
+    for (int k = 0; k < PICK_N; k++) {
+        if (k != slot && !recheck[k]) continue;
+        g_pick[k] = ok[k];
+        g_pick_bad[k] = !refused[k].empty();
+        g_pick_unsure[k] = unsure[k];
+        g_pick_note[k] = refused[k].empty() ? names[k] : refused[k] + (names[k].empty() ? "" : " - " + names[k]);
+    }
+    g_picks.clear();
+    for (auto &p : g_pick) g_picks.insert(g_picks.end(), p.begin(), p.end());
+    g_src = g_pick[PICK_BASE].empty() ? "" : g_pick_note[PICK_BASE];  // (the page's "something chosen")
+    for (int k = 0; k < PICK_N; k++) rows[k] = g_pick[k];
+    pthread_mutex_unlock(&g_lock);
+    pick_trial(rows);
+}
+#endif
 
 // ------------------------------------------------------------------ a save from the player's Switch (or another copy)
 // The game's save is its own files, as JKSV backs them up on a modded Switch (SD card: JKSV/<game>/<user - date>/,
@@ -3227,6 +3542,14 @@ extern "C" void launcher_run(const char *root) {
                              "are already here: only the code is compiled again (a few minutes).",
                              "Esta versão do ZA Recomp compila o código do jogo de um jeito um pouco diferente. Os seus "
                              "arquivos do jogo já estão aqui: só o código é compilado de novo (alguns minutos).")
+#ifdef __ANDROID__
+                        : TR("Choose your own dump of Pokémon Legends Z-A, one step at a time, from wherever you keep it. "
+                             "The game is read from those files where they are: nothing big is copied, and an emulator can "
+                             "keep using them. Don't move or delete them afterwards. The game isn't included.",
+                             "Escolha o seu próprio dump de Pokémon Legends Z-A, uma etapa de cada vez, de onde você "
+                             "guarda os arquivos. O jogo é lido desses arquivos onde eles estão: nada grande é copiado, e "
+                             "um emulador pode continuar usando os mesmos. Não mova nem apague depois. O jogo não vem com o app.");
+#else
                         : TR("Choose the folder with your own copy of Pokémon Legends Z-A, either way:\n"
                              "· the game extracted (exefs and romfs folders, as an emulator or your Switch extracts them): "
                              "no keys needed;\n"
@@ -3239,7 +3562,56 @@ extern "C" void launcher_run(const char *root) {
                              "· ou o seu dump: o jogo base (.xci / .nsp com o seu prod.keys, ou .nup sem keys), se quiser a atualização e a "
                              "DLC (.nsp).\n"
                              "Também dá para arrastar a pasta para esta janela. O jogo não vem com o ZA Recomp.");
+#endif
                     float ty = 196 + text(dl, F_BODY, 16, x, 196, C_SOFT, what, w).y + 22;
+#ifdef __ANDROID__
+                    // the steps: each row its own picker (picked_slot), the base game and the keys needed, the update and
+                    // DLC optional; the keys a setup kept (keys/prod.keys) count when none is picked again
+                    bool kept_keys = file_exists(g_root + "/keys/prod.keys");
+                    if (!rebuild) {
+                        static const char *const label_en[PICK_N] = {"1. Base game (.nsp)", "2. Update (.nsp, optional)",
+                                                                     "3. DLC (.nsp, optional)", "4. prod.keys (+ title.keys)"};
+                        static const char *const label_pt[PICK_N] = {"1. Jogo base (.nsp)", "2. Atualização (.nsp, opcional)",
+                                                                     "3. DLC (.nsp, opcional)", "4. prod.keys (+ title.keys)"};
+                        for (int k = 0; k < PICK_N; k++) {
+                            pthread_mutex_lock(&g_lock);
+                            bool have = !g_pick[k].empty(), bad = g_pick_bad[k], unsure = g_pick_unsure[k];
+                            std::string note = g_pick_note[k], warn = g_pick_warn[k];
+                            pthread_mutex_unlock(&g_lock);
+                            if (!warn.empty()) bad = true, note = warn;  // (pick_trial: the keys don't open it)
+                            panel(dl, x, ty, w, 64, C_PANEL);
+                            icon(dl, have && !bad ? IC_CHECK : IC_FOLDER, x + 30, ty + 32, 22,
+                                 bad ? C_RED : have && !unsure ? C_GREEN : have ? C_TEAL : C_MUTED);
+                            std::string sub = bad || have ? note
+                                            : k == PICK_KEYS && kept_keys
+                                            ? (file_exists(g_root + "/keys/title.keys")
+                                                   ? TR("Kept from the last setup (prod.keys + title.keys)",
+                                                        "Guardado da última preparação (prod.keys + title.keys)")
+                                                   : TR("Kept from the last setup (prod.keys only, no title.keys)",
+                                                        "Guardado da última preparação (só o prod.keys, sem title.keys)"))
+                                            : TR("Not chosen", "Não escolhido");
+                            if (have && unsure && !bad)
+                                sub += TR(" (checked when the keys are chosen)", " (conferido quando as keys forem escolhidas)");
+                            dl->PushClipRect(P(x + 50, ty), P(x + w - 150, ty + 64), true);
+                            text(dl, F_LABEL, 15, x + 52, ty + 10, C_TEXT, g_pt ? label_pt[k] : label_en[k]);
+                            text(dl, F_BODY, 14, x + 52, ty + 34, bad ? C_RED : have ? C_SOFT : C_MUTED, sub.c_str());
+                            dl->PopClipRect();
+                            char id[16];
+                            snprintf(id, sizeof id, "##pick%d", k);
+                            // (no filter: Android's picker knows no .nsp / .keys type and would grey them out; DLC and the
+                            // keys take several files - prod.keys and title.keys usually sit together)
+                            if (button(id, TR("Choose...", "Escolher..."), x + w - 138, ty + 12, 124, 40, BTN_SECONDARY))
+                                SDL_ShowOpenFileDialog(picked_slot, (void *)(intptr_t)k, win, NULL, 0, NULL,
+                                                       k == PICK_DLC || k == PICK_KEYS);
+                            ty += 72;
+                        }
+                        ty += 12;
+                    }
+                    pthread_mutex_lock(&g_lock);
+                    bool can = rebuild || (!g_pick[PICK_BASE].empty() && (!g_pick[PICK_KEYS].empty() || kept_keys) &&
+                                           g_pick_warn[PICK_KEYS].empty());
+                    pthread_mutex_unlock(&g_lock);
+#else
                     if (!rebuild) {
                         panel(dl, x, ty, w, 64, C_PANEL);
                         icon(dl, IC_FOLDER, x + 30, ty + 32, 22, src.empty() ? C_MUTED : C_TEAL);
@@ -3253,6 +3625,7 @@ extern "C" void launcher_run(const char *root) {
                         ty += 84;
                     }
                     bool can = rebuild || !src.empty();
+#endif
                     if (mod_restart) {
                         if (button("##restart", TR("Restart now", "Reiniciar agora"), x, ty, 0, 54, BTN_PRIMARY, true, IC_PLAY,
                                    F_LABEL, 17, true)) {

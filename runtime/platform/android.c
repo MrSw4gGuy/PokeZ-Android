@@ -389,6 +389,50 @@ void plat_restart_app(void) {
     _exit(0);  // (no atexit handlers: the GPU device and its threads go with the process)
 }
 
+// ---- the player's packages by content:// URI (platform.h plat_android_open_uri): the activity's ContentResolver, as
+// SDLActivity.openFileDescriptor does, but with the framework's classes only (FindClass on this native thread sees the
+// system class loader, not the app's) and every exception cleared - a revoked grant is a SecurityException, which
+// SDL's version leaves pending. takePersistableUriPermission keeps the grant ACTION_OPEN_DOCUMENT gave past this
+// process: without it the next start couldn't open the package again.
+int plat_android_open_uri(const char *uri, bool keep) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    int fd = -1;
+    if (!env || !act) return -1;
+    (*env)->PushLocalFrame(env, 16);
+    jclass ac = (*env)->GetObjectClass(env, act);
+    jobject cr = (*env)->CallObjectMethod(env, act, (*env)->GetMethodID(env, ac, "getContentResolver",
+                                                                        "()Landroid/content/ContentResolver;"));
+    jclass uc = (*env)->FindClass(env, "android/net/Uri");
+    jstring js = (*env)->NewStringUTF(env, uri);
+    jobject u = cr && uc && js ? (*env)->CallStaticObjectMethod(env, uc, (*env)->GetStaticMethodID(env, uc, "parse",
+                                                                "(Ljava/lang/String;)Landroid/net/Uri;"), js) : NULL;
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env), u = NULL;
+    if (u) {
+        jclass cc = (*env)->GetObjectClass(env, cr);
+        if (keep) {
+            (*env)->CallVoidMethod(env, cr, (*env)->GetMethodID(env, cc, "takePersistableUriPermission",
+                                                                "(Landroid/net/Uri;I)V"), u, 1 /* FLAG_GRANT_READ_URI_PERMISSION */);
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                fprintf(stderr, "[nsp] %s: Android didn't keep the access (it lasts until the app closes)\n", uri);
+            }
+        }
+        jstring mode = (*env)->NewStringUTF(env, "r");
+        jobject pfd = (*env)->CallObjectMethod(env, cr, (*env)->GetMethodID(env, cc, "openFileDescriptor",
+                      "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;"), u, mode);
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env), pfd = NULL;
+        if (pfd) {
+            jclass pc = (*env)->GetObjectClass(env, pfd);
+            fd = (*env)->CallIntMethod(env, pfd, (*env)->GetMethodID(env, pc, "detachFd", "()I"));
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env), fd = -1;
+        }
+    }
+    (*env)->PopLocalFrame(env, NULL);
+    if (fd < 0) errno = EACCES;
+    return fd;
+}
+
 // ---- thermal: how much of the render scale the temperature allows (platform.h plat_thermal_scale)
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
 // next forecast seconds, to its severe throttling point - 1.0 is that point. The thermal profile selects the render
