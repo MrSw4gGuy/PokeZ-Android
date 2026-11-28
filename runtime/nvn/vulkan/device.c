@@ -3117,12 +3117,28 @@ static void window_event_log(const SDL_Event *e) {
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
+    // Android: SDL has no blocking wait there (no video-driver WaitEventTimeout), so SDL_WaitEventTimeout pumped the
+    // events about a thousand times a second - joystick and HID detection, clocks and locks each time: a quarter of the
+    // whole process's CPU on the Galaxy S25+ (simpleperf, 2026-11-28: this thread 26%, more than the render thread),
+    // heat and a core taken from the game. There the events are polled every few ms instead (touch and pads well
+    // within a 60 fps frame). LARECOMP_UI_POLL_MS=<ms>: that interval (Android default 4); 0: SDL's wait, as on desktops.
+    static int poll_ms = -1;
+    if (poll_ms < 0) {
+#ifdef __ANDROID__
+        poll_ms = ENV("LARECOMP_UI_POLL_MS") ? atoi(ENV("LARECOMP_UI_POLL_MS")) : 4;
+#else
+        poll_ms = ENV("LARECOMP_UI_POLL_MS") ? atoi(ENV("LARECOMP_UI_POLL_MS")) : 0;
+#endif
+        if (poll_ms < 0) poll_ms = 0;
+        if (poll_ms) LOG("[window] events polled every %d ms (LARECOMP_UI_POLL_MS)\n", poll_ms);
+    }
     for (;;) {
         if (rt_reboot_requested()) return rt_reboot_requested();  // (runtime/main.c tears the game down)
         SDL_Event e;
         atomic_store(&ui_beat, SDL_GetTicksNS());
         atomic_store(&ui_stage, "waiting for events");
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        if (poll_ms) SDL_Delay((Uint32)poll_ms);
+        while (poll_ms ? SDL_PollEvent(&e) : SDL_WaitEventTimeout(&e, 16)) {
             input_rumble_poll();
             atomic_store(&ui_beat, SDL_GetTicksNS());
             window_event_log(&e);
