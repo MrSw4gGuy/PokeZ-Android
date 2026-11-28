@@ -1475,6 +1475,7 @@ static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
     std::string names[PICK_N], refused[PICK_N];
     bool unsure[PICK_N] = {false}, recheck[PICK_N] = {false};
     if (slot == PICK_KEYS) {  // (keys: prod.keys / title.keys by content; then every game row checked with them)
+        std::string tk;
         for (auto &f : picked) {
             char nm[160];
             nsp_source_name(f.c_str(), nm, sizeof nm);
@@ -1482,6 +1483,7 @@ static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
             char *t = nsp_slurp_fd(fd, 1 << 20);
             if (fd >= 0) close(fd);
             bool fits = t && (nsp_text_is_prod_keys(t) || nsp_text_is_title_keys(t));
+            if (t && !nsp_text_is_prod_keys(t) && nsp_text_is_title_keys(t)) tk = t;
             if (t) memset(t, 0, strlen(t)), free(t);
             if (fits) ok[slot].push_back(f), names[slot] += (names[slot].empty() ? "" : ", ") + std::string(nm);
             else refused[slot] = std::string(nm) + TR(": not a keys file", ": não é um arquivo de keys");
@@ -1495,7 +1497,35 @@ static void SDLCALL picked_slot(void *ud, const char *const *files, int) {
         for (int k = 0; k < PICK_KEYS && !pk.empty(); k++)
             if (!rows[k].empty())
                 recheck[k] = true, check_packages(rows[k], want[k], pk, false, ok[k], names[k], refused[k], unsure[k]);
-        std::fill(pk.begin(), pk.end(), 0);
+        // a trial open with these keys (nsp_open, headers and tables only - a second or so): a prod.keys from an older
+        // firmware than the game needs is said here, on its row, not after "Set up the game" (2026-11-28: the phone's
+        // loose prod.keys had no key_area_key_application_13); a DLC without its title key, on the DLC row
+        if (!pk.empty() && !ok[PICK_BASE].empty()) {
+            std::vector<std::string> srcs;
+            for (int k = 0; k < PICK_KEYS; k++) srcs.insert(srcs.end(), ok[k].begin(), ok[k].end());
+            std::vector<int> fds;
+            for (auto &s : srcs) {
+                int fd = nsp_open_source(s.c_str(), false);
+                if (fd >= 0) fds.push_back(fd);
+            }
+            char why[512] = "";
+            NspGame *g = nsp_open(fds.data(), NULL, (int)fds.size(), pk.c_str(), tk.empty() ? NULL : tk.c_str(), why,
+                                  sizeof why);
+            bool opens = g != NULL;
+            if (!opens) {
+                refused[slot] = why;
+                ok[slot].clear(), names[slot].clear();
+            } else {
+                if ((size_t)nsp_aoc_count(g) < ok[PICK_DLC].size() && refused[PICK_DLC].empty())
+                    refused[PICK_DLC] = TR("no title key for it among the chosen keys: choose title.keys too",
+                                           "sem a chave dela entre as keys escolhidas: escolha também o title.keys");
+                nsp_adopt_fds(g, fds.data(), (int)fds.size()), fds.clear();
+                nsp_close(g);
+            }
+            for (int fd : fds) close(fd);
+            rt_launcher_log("[launcher] keys tried on the chosen packages: %s\n", opens ? "they open" : why);
+        }
+        std::fill(pk.begin(), pk.end(), 0), std::fill(tk.begin(), tk.end(), 0);
     } else {
         std::string pk = known_prod_keys(rows[PICK_KEYS]);
         check_packages(picked, want[slot], pk, true, ok[slot], names[slot], refused[slot], unsure[slot]);
