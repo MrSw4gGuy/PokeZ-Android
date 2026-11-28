@@ -161,8 +161,12 @@ typedef struct {
     char rando_options[48];  // the Randomizer tab's New seed options: a seed ID without its random part (empty = defaults)
     bool fps60_lock;  // with fps60: stays at 60 even when this PC can't hold it (slow motion below; runtime/hle/framepace.c)
     bool fps40;       // Z-A only: one and two world steps in turn, each shown that long on the 60 Hz display - 40 fps
-                      // at the right speed (runtime/hle/framepace.c rt_za_frame_cfg)
-    bool fps45;       // Z-A only: one, one and two world steps in turn, the same way - 45 fps (fps40 wins over it)
+                      // at the right speed (runtime/hle/framepace.c rt_za_frame_cfg). Out of the menu since 2026-11-28
+                      // (it judders): an ini's is read as fps_even 40 and this stays off
+    bool fps45;       // Z-A only: one, one and two world steps in turn, the same way - 45 fps. Out of the menu likewise
+    int fps_even;     // Z-A only: 40 (the menu's 40 fps) - the world steps exactly each frame's time on screen, fractions
+                      // of the game's 1/60 s step included, the display asked for a multiple of 40 (runtime/hle/
+                      // framepace.c rt_za_frame_dt); 0 off. fps60 on clears it at load (LARECOMP_FPS_EVEN=48: tests)
     bool frame_gen;   // at 30 fps, an image made between each two frames: shown at 60 (vulkan/exec.c vk_fg_make)
     bool frame_dt;    // Pokémon Z-A: the world's step from a wall-clock accumulator (runtime/hle/framepace.c
                       // rt_za_frame_dt) - the same game speed at any frame rate. Off: the game's own step (slow motion

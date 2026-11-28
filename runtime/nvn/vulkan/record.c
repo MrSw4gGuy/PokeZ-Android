@@ -651,12 +651,23 @@ typedef struct {
 void vk_present_watch(uint64_t id);  // (device.c)
 // (VK_GOOGLE_display_timing) when the last presents were shown, by gid: read here after each present - the swapchain
 // is this thread's - and by the render thread (rec_present_shown)
-static struct { uint32_t gid; uint64_t at; } shown_ring[32];
+static struct { uint32_t gid; uint64_t at, ready; } shown_ring[32];
 static pthread_mutex_t shown_mu = PTHREAD_MUTEX_INITIALIZER;
 uint64_t rec_present_shown(uint32_t gid) {
     uint64_t at = 0;
     pthread_mutex_lock(&shown_mu);
     for (int i = 0; i < 32; i++) if (shown_ring[i].gid == gid) at = shown_ring[i].at;
+    pthread_mutex_unlock(&shown_mu);
+    return at;
+}
+// (when the same present was ready: its time on screen less its presentMargin - Android's is the compositor's latch less
+// the GPU's completion, so this is that completion plus the latch's lead - not held back by its own "not before": the
+// even mode's display time is measured from it without measuring itself, vulkan/device.c. Android's
+// earliestPresentTime is no use there: always the time it was shown, 48 fps on the S25+)
+uint64_t rec_present_ready(uint32_t gid) {
+    uint64_t at = 0;
+    pthread_mutex_lock(&shown_mu);
+    for (int i = 0; i < 32; i++) if (shown_ring[i].gid == gid) at = shown_ring[i].ready;
     pthread_mutex_unlock(&shown_mu);
     return at;
 }
@@ -686,6 +697,7 @@ static pthread_cond_t late_cv = PTHREAD_COND_INITIALIZER;
 static PresentArgs late_a;
 static _Atomic uint64_t refresh_ns, grid_at;  // (present_now, display timing: the refresh period and a refresh's time)
 static bool late_have;
+uint64_t rec_refresh_ns(void) { return refresh_ns; }  // (0 until known: runtime/hle/framepace.c even_frame, device.c)
 void rec_wait_late(void) {  // (a new swapchain: the pacer's present made first)
     pthread_mutex_lock(&late_mu);
     while (late_have) pthread_cond_wait(&late_cv, &late_mu);
@@ -790,7 +802,17 @@ static void present_now(const PresentArgs *a) {
         if (past && past(g_vk.dev, a->swapchain, &n, t) >= 0 && n) {
             static int next;
             pthread_mutex_lock(&shown_mu);
-            for (uint32_t i = 0; i < n; i++) shown_ring[next].gid = t[i].presentID, shown_ring[next].at = t[i].actualPresentTime, next = (next + 1) % 32;
+            for (uint32_t i = 0; i < n; i++)
+                shown_ring[next].gid = t[i].presentID, shown_ring[next].at = t[i].actualPresentTime,
+                shown_ring[next].ready = t[i].presentMargin < t[i].actualPresentTime ? t[i].actualPresentTime - t[i].presentMargin : 0,
+                next = (next + 1) % 32;
+            static int elog = -1;  // (LARECOMP_EVEN_LOG: what the compositor reports, the first presents with a time asked)
+            if (elog < 0) elog = getenv("LARECOMP_EVEN_LOG") != NULL ? 40 : 0;
+            for (uint32_t i = 0; elog > 0 && i < n; i++)
+                if (t[i].desiredPresentTime)
+                    elog--, LOG("[even] present %u: desired %+.1f, earliest %+.1f, margin %.1f ms (from shown)\n", t[i].presentID,
+                                ((double)t[i].desiredPresentTime - (double)t[i].actualPresentTime) / 1e6,
+                                ((double)t[i].earliestPresentTime - (double)t[i].actualPresentTime) / 1e6, t[i].presentMargin / 1e6);
             pthread_mutex_unlock(&shown_mu);
             grid_at = t[n - 1].actualPresentTime;
             {   // (the phone's display changes its rate by itself: asked on every present)
@@ -820,6 +842,33 @@ static void present_now(const PresentArgs *a) {
                     hist[d < 12 ? 0 : d < 21 ? 1 : d < 29 ? 2 : d < 38 ? 3 : 4]++, nh++, sum += d;
                 }
                 last_at = at;
+            }
+            {   // (the even mode, runtime/hle/framepace.c: every 5 s how far apart its images reached the screen, in the
+                // display's refreshes, and how many stayed on screen exactly the world time they stepped - the point of it)
+                extern int g_even_fps;
+                extern uint32_t vk_even_units(uint32_t gid);
+                static uint64_t e_last_at, e_log;
+                static uint32_t e_last_id;
+                static unsigned e_hist[6], e_n, e_match, e_lost;
+                for (uint32_t i = 0; g_even_fps && i < n; i++) {
+                    uint64_t at = t[i].actualPresentTime;
+                    uint32_t id = t[i].presentID;
+                    if (id <= e_last_id) continue;
+                    if (e_last_id && id > e_last_id + 1) e_lost += id - e_last_id - 1, e_last_at = 0;  // (no interval across)
+                    uint64_t rp = refresh_ns ? refresh_ns : 8333333ull;
+                    if (e_last_at && at > e_last_at) {
+                        unsigned r = (unsigned)((at - e_last_at + rp / 2) / rp);
+                        e_hist[r < 5 ? r : 5]++, e_n++;
+                        e_match += r == vk_even_units(id);
+                    }
+                    e_last_at = at, e_last_id = id;
+                }
+                if (g_even_fps && e_n && NOW() - e_log > 5000000000ull) {
+                    LOG("[even] on screen: %u images, refreshes apart 1: %u, 2: %u, 3: %u, 4: %u, other: %u; %u (%.0f%%) as "
+                        "long as their world time; %u never shown (display refresh %.2f ms)\n", e_n, e_hist[1], e_hist[2],
+                        e_hist[3], e_hist[4], e_hist[0] + e_hist[5], e_match, 100.0 * e_match / e_n, e_lost, refresh_ns / 1e6);
+                    memset(e_hist, 0, sizeof e_hist), e_n = e_match = e_lost = 0, e_log = NOW();
+                }
             }
             if (tm && nh && NOW() - t_log > 2000000000ull) {
                 LOG("[fg] on screen: %u images, %.1f ms apart on average; under 12 ms %u, 12-21 %u, 21-29 %u, 29-38 %u, "

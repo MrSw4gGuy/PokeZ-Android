@@ -1000,6 +1000,7 @@ NVN(nvnQueueAcquireTexture) {
 // The console presents once per `interval` vsyncs of its 60 Hz display (Pokémon Z-A: 2, 30 fps) and the game steps its
 // world a fixed amount per frame, so presenting at the host's pace (mailbox, a 75 / 144 Hz monitor) sped it up.
 // LARECOMP_PRESENT_INTERVAL=<n> overrides the game's interval (0: no pacing).
+uint64_t g_present_let_go;  // (when the frame being presented was let go: vulkan/device.c's display time in the even mode)
 static void present_pace(int interval) {
     static int forced = -2;
     static uint64_t next;
@@ -1010,19 +1011,25 @@ static void present_pace(int interval) {
     static int logged = -12345;
     if (interval != logged && !g_za_mode_dyn_interval) { logged = interval; LOG("[nvn] present interval %d\n", interval); }
     extern int g_out_present_interval;  // (output_scale.c: dynamic resolution's frame budget)
-    g_out_present_interval = interval;
-    if (interval <= 0) return;
+    // (the even mode, runtime/hle/framepace.c: its own period, not the game's interval - 2 for the budget, 25 / 21 ms
+    // frames judged as 30 fps ones rather than against 60)
+    extern int g_even_fps;
+    extern uint64_t g_even_period;
+    g_out_present_interval = g_even_fps ? 2 : interval;
+    if (interval <= 0 && !g_even_fps) return;
     if (interval > 4) interval = 1;  // (not a sane interval: the console's default)
-    uint64_t period = 16666667ull * (uint64_t)interval, now = plat_now_ns();
+    uint64_t period = g_even_fps ? g_even_period : 16666667ull * (uint64_t)interval, now = plat_now_ns();
     // (the 40 fps mode, runtime/hle/framepace.c: a frame's interval is the gap before it - the time its world stepped -
-    // not after it, or its one- and two-step frames would each be shown the other's time: the worst judder)
+    // not after it, or its one- and two-step frames would each be shown the other's time: the worst judder. The even
+    // mode's frames the same: each one's world time before it)
     extern bool g_fps40_on;
     static uint64_t last;  // when the frame before was let go
-    uint64_t at = g_fps40_on && last ? last + period : next;
+    uint64_t at = (g_fps40_on || g_even_fps) && last ? last + period : next;
     if (at > now && at - now <= period) plat_sleep_until_ns(at);
     else at = now;  // (first frame, or more than a period late: no catching up)
     last = at;
     next = at + period;
+    g_present_let_go = at;
 }
 
 NVN(nvnQueuePresentTexture) {

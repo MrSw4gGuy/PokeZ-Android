@@ -55,13 +55,13 @@ própria Qualcomm) com Pokémon Legends: Z-A **2.0.2**, a partir de um save novo
 | Tela inicial, verificação dos arquivos do jogo | Funciona |
 | Escolha de idioma, criação do save, criação de personagem, nome | Funciona |
 | Cenas da introdução, trem, Lumiose | Funciona, com o pop-in do próprio jogo; em Lumiose o jogo ainda pode parar com um erro de GPU (abaixo) |
-| Taxa de quadros | 30 fps estáveis (a taxa do próprio jogo no Switch). 60 fps: 60 estáveis em cenas mais leves (a estação com pouca gente) com sombras a 50%; as mais cheias pedem mais tempo de GPU que os 16,7 ms de um quadro - a estação cheia roda a 43-44 fps (38-39 antes de uma correção na tradução dos shaders, em 2026-11-24) e Lumiose à noite a cerca de 38 -, então ali o **30 / 60 fps dinâmico** (Configurações > Vídeo) vai para 30 em vez de câmera lenta e tenta 60 de novo depois das trocas de cena |
+| Taxa de quadros | Três taxas em Configurações > Vídeo: 30 fps (a do próprio jogo no Switch), 40 fps e 60 fps. **40 fps** (2026-11-28): cada quadro avança o mundo exatamente o tempo que fica na tela - inclusive frações do passo de 1/60 s do jogo - com a tela a 80 Hz, então o movimento é regular e na velocidade certa; andando por Lumiose com um save 100% rodou a 37-40 fps, com 89-99% dos quadros na tela exatamente o seu tempo (os antigos modos de 40 / 45 fps, em passos inteiros de 1/60 s, tremiam; 48 fps do mesmo jeito não segurou 48 na cidade). **60 fps**: com a sobreposição CPU/GPU ligada (2026-11-25) a estação segura 60 e Lumiose roda a cerca de 51 no driver da Qualcomm; o **30 / 60 fps dinâmico** vai para 30 em vez de câmera lenta quando 60 não segura |
 | Textos e caixas de diálogo | Funciona |
 | Controle (testado: 8BitDo Pro 3, Bluetooth) | Funciona |
 | Controles de toque | Funciona (direcional testado nos menus do jogo; o resto em teste) |
 | Salvar | Funciona |
 | Memória | Cerca de 3 GB em uso |
-| Aquecimento | A resolução baixa sozinha conforme o celular esquenta (folga térmica): 75% da tela, até cerca de 45% quando quente |
+| Aquecimento | O **perfil térmico** (Configurações > Vídeo) escolhe a taxa junto: Com cooler (60 fps, mantém a resolução escolhida), Sem cooler (40 fps), Economia (30 fps); os dois últimos baixam a resolução perto do limite de aquecimento. Com cooler em Lumiose, a folga térmica (1,0 = o celular começa a reduzir o clock) ficou em cerca de 0,73 a 40 fps; a 60 fps estabilizou em 0,92-0,93 |
 | Upscaling | Snapdragon Game Super Resolution (o upscaler da própria Qualcomm) por padrão; AMD FSR 1 e bilinear no menu |
 | DLC *Mega Dimension* | Ainda não testado |
 

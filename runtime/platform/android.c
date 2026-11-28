@@ -393,7 +393,7 @@ void plat_restart_app(void) {
 // AThermal_getThermalHeadroom (API 31) is the system's forecast of how close the device will be, on average over the
 // next forecast seconds, to its severe throttling point - 1.0 is that point. The thermal profile selects the render
 // scale curve: the cooler profile (60 fps) keeps the chosen resolution (its headroom is only logged); the no-cooler
-// (45 fps) and economy (30 fps) profiles step 100/85/70/60/50%. The cooler's curve was 100/85/70/60% until 2026-11-25: on the Galaxy S25+
+// (40 fps even) and economy (30 fps) profiles step 100/85/70/60/50%. The cooler's curve was 100/85/70/60% until 2026-11-25: on the Galaxy S25+
 // the headroom stayed 0.83-0.95 at 60% as at 100% (this game's GPU cost hardly follows the pixel count; the heat is the
 // 60 fps itself), so the steps only made cutscenes and text blocky - even one step to 85% did, the phone starting a
 // session warm (the system's own throttling still guards the device). The API wants a call a second at most (more

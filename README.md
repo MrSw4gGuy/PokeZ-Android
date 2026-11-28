@@ -55,13 +55,13 @@ driver) with Pokémon Legends: Z-A **2.0.2**, from a new save.
 | Start screen, game setup check | Works |
 | Language selection, save creation, character creation, name entry | Works |
 | Intro cutscenes, train, Lumiose City | Works, with the game's own pop-in; Lumiose can still stop with a GPU error (below) |
-| Frame rate | A steady 30 fps (the game's own rate on the Switch). 60 fps: a steady 60 in lighter scenes (the station with few people) with 50% shadows; busier ones need more GPU time than a frame's 16.7 ms - the crowded station runs at 43-44 fps (38-39 before a shader translation fix on 2026-11-24) and Lumiose at night at about 38 - so there **Dynamic 30 / 60 fps** (Settings > Video) goes to 30 instead of slow motion and tries 60 again after scene changes |
+| Frame rate | Three rates in Settings > Video: 30 fps (the game's own on the Switch), 40 fps and 60 fps. **40 fps** (2026-11-28): every frame moves the world exactly the time it stays on screen - fractions of the game's 1/60 s step included - with the display at 80 Hz, so motion is even and at the right speed; walking around Lumiose with a 100% save it ran at 37-40 fps with 89-99% of the frames on screen exactly their time (the old 40 / 45 fps modes, whole 1/60 s steps, juddered; 48 fps the same way didn't hold 48 in the city). **60 fps**: with CPU/GPU overlap on (2026-11-25) the station holds 60 and Lumiose runs at about 51 on Qualcomm's driver; **Dynamic 30 / 60 fps** goes to 30 instead of slow motion when 60 isn't held |
 | Text and dialogue boxes | Works |
 | Controller (tested: 8BitDo Pro 3, Bluetooth) | Works |
 | Touch controls | Works (D-pad tested in the game's menus; the rest in progress) |
 | Saving | Works |
 | Memory | About 3 GB in use |
-| Heat | The resolution steps down by itself as the phone warms (thermal headroom): 75% of the screen, down to about 45% once hot |
+| Heat | **Thermal profile** (Settings > Video) sets the rate with it: With cooler (60 fps, the chosen resolution kept), Without cooler (40 fps), Economy (30 fps); the last two lower the resolution near the throttling point. With a cooler in Lumiose the thermal headroom (1.0 = the phone starts throttling) held at about 0.73 at 40 fps; 60 fps settled at 0.92-0.93 |
 | Upscaling | Snapdragon Game Super Resolution (Qualcomm's own upscaler) by default; AMD FSR 1 and bilinear in the menu |
 | *Mega Dimension* DLC | Not tested yet |
 

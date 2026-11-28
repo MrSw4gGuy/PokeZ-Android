@@ -285,6 +285,7 @@ void settings_video_apply_recommended(void) {
     // (the thermal profile goes with the rate on a phone - menu.mm's Frame rate and Thermal profile rows)
     g_settings.thermal_profile = r->fps60 ? THERMAL_PROFILE_COOLER : THERMAL_PROFILE_ECONOMY;
     g_settings.fps40 = g_settings.fps45 = false;
+    g_settings.fps_even = 0;
 #endif
 }
 
@@ -342,8 +343,11 @@ void settings_load(void) {
         else if (!strcmp(key, "content_trade")) g_settings.content_trade = atoi(val) != 0;
         else if (!strcmp(key, "fps60")) g_settings.fps60 = atoi(val) != 0;
         else if (!strcmp(key, "fps60_lock")) g_settings.fps60_lock = atoi(val) != 0;
-        else if (!strcmp(key, "fps40")) g_settings.fps40 = atoi(val) != 0;
-        else if (!strcmp(key, "fps45")) g_settings.fps45 = atoi(val) != 0;
+        // (the 40 / 45 fps modes of whole world steps and 48 fps even left the menu on 2026-11-28: any of them is read
+        // as 40 fps even, the one 40 now - runtime/ui/menu.mm's Frame rate row; fps60 left on wins, as the menu shows)
+        else if (!strcmp(key, "fps40") || !strcmp(key, "fps45") || !strcmp(key, "fps_even")) {
+            if (atoi(val) != 0) g_settings.fps_even = 40;
+        }
         else if (!strcmp(key, "frame_gen")) g_settings.frame_gen = atoi(val) != 0;
         else if (!strcmp(key, "frame_dt")) g_settings.frame_dt = atoi(val) != 0;
         else if (!strcmp(key, "smooth_anim")) g_settings.smooth_anim = atoi(val) != 0;
@@ -500,6 +504,8 @@ void settings_load(void) {
     if (g_settings.rstick_deadzone < 0 || g_settings.rstick_deadzone > 30) g_settings.rstick_deadzone = 0;
     if (g_settings.rumble_strength < 25 || g_settings.rumble_strength > 100) g_settings.rumble_strength = 100;
     if (g_settings.draw_dist != 150 && g_settings.draw_dist != 200 && g_settings.draw_dist != 300) g_settings.draw_dist = 100;
+    if (g_settings.fps60) g_settings.fps_even = 0;  // (one rate: 60 wins, as the menu shows it)
+    g_settings.fps40 = g_settings.fps45 = false;    // (read as 40 fps even above)
     settings_env_overrides();
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
     {   // F1 > Compatibility choices that aren't Auto, and a chosen graphics card: a report's log shows them (#288 had
@@ -533,6 +539,7 @@ void settings_save(void) {
     fprintf(f, "fps60_lock = %d\n", g_settings.fps60_lock);
     fprintf(f, "fps40 = %d\n", g_settings.fps40);
     fprintf(f, "fps45 = %d\n", g_settings.fps45);
+    fprintf(f, "fps_even = %d\n", g_settings.fps_even);
     fprintf(f, "frame_gen = %d\n", g_settings.frame_gen);
     fprintf(f, "frame_dt = %d\n", g_settings.frame_dt);
     fprintf(f, "smooth_anim = %d\n", g_settings.smooth_anim);

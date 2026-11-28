@@ -2218,6 +2218,59 @@ static void hdr_shot_report(const void *px) {
     free(out);
 }
 
+// ---- the even mode's display time (runtime/hle/framepace.c: 40 / 48 fps even, in the display's refreshes). Shown as soon as
+// the GPU is done, a frame lands on whichever refresh comes first after that, and the phone's GPU takes 10 - 45 ms
+// over a frame: by more than a refresh, so frames meant 25 ms apart would come 16.7 or 33.3 apart. So each frame asks
+// to be shown a fixed time after it was let go (nvn/objects.c present_pace, which spaces those exactly by the frames'
+// world time): what 95% of the last 64 frames took from let go to ready (record.c rec_present_ready: shown less the
+// compositor's margin) - half a refresh early, since "not before" is compared with a refresh's time.
+// Measured from when they were shown instead, the time asked for measured itself: each frame held to it was seen as
+// that slow, the held images backed the GPU's queue up, and it crept to 100 ms (48 fps: 15 - 23 ms as soon as ready).
+// LARECOMP_EVEN_DESIRED=0: shown as soon as ready (for comparison; at 48 fps 40 - 90% of the frames then stay on screen
+// their world time, 98 - 100% with it).
+typedef struct { uint64_t at; uint32_t units; } EvenFrame;
+static EvenFrame even_ring[64], even_cur;  // (by game frame: backend_present -> backend_present_now)
+static struct { uint32_t gid, units; uint64_t at; bool pending; } even_gids[64];  // (by present gid)
+uint32_t vk_even_units(uint32_t gid) {  // (record.c: the world time a shown present stood for, in refreshes; 0 unknown)
+    return even_gids[gid & 63].gid == gid ? even_gids[gid & 63].units : 0;
+}
+static uint64_t even_desired(uint32_t gid) {
+    extern uint64_t rec_present_shown(uint32_t gid), rec_present_ready(uint32_t gid);
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_EVEN_DESIRED") || atoi(ENV("LARECOMP_EVEN_DESIRED")) != 0;
+    static double win[64], lat = -1;  // (ns: let go to ready, the last 64 frames; their 95th percentile)
+    static int wn, wi;
+    bool more = false;
+    for (int i = 0; i < 64; i++) {
+        if (!even_gids[i].pending) continue;
+        uint64_t shown = rec_present_shown(even_gids[i].gid), ready = rec_present_ready(even_gids[i].gid);
+        if (!shown) {
+            if (gid - even_gids[i].gid > 24) even_gids[i].pending = false;  // (never reported: not shown)
+            continue;
+        }
+        even_gids[i].pending = false;
+        if (!ready || ready > shown) ready = shown;  // (no earliest time reported)
+        double s = ready > even_gids[i].at ? (double)(ready - even_gids[i].at) : 0;
+        if (s > 100e6) continue;  // (a hitch: not the pace)
+        win[wi] = s, wi = (wi + 1) % 64, wn += wn < 64, more = true;
+    }
+    if (more) {
+        double v[64];
+        memcpy(v, win, sizeof(double) * wn);
+        for (int i = 1; i < wn; i++)  // (insertion sort: 64 at most)
+            for (int j = i; j > 0 && v[j - 1] > v[j]; j--) { double x = v[j]; v[j] = v[j - 1], v[j - 1] = x; }
+        lat = v[(wn * 95) / 100 < wn ? (wn * 95) / 100 : wn - 1];
+    }
+    even_gids[gid & 63].gid = gid, even_gids[gid & 63].units = even_cur.units, even_gids[gid & 63].at = even_cur.at;
+    even_gids[gid & 63].pending = even_cur.at != 0;
+    static uint64_t n;
+    if (++n % 600 == 0 && even_cur.at) LOG("[even] let go to ready (95%% of frames) %.1f ms%s\n", lat / 1e6, on ? "" : " (not asked for)");
+    if (!on || lat < 0 || !even_cur.at) return 0;
+    extern uint64_t rec_refresh_ns(void);
+    uint64_t half = rec_refresh_ns() ? rec_refresh_ns() / 2 : 4166667ull;
+    return even_cur.at + (uint64_t)lat - half;
+}
+
 // End rendering into the window image and present it. shot_path: also save the window image as PNG.
 uint64_t renderer_present_count(void);
 // The next vk_frame_end's present: frame_after > 0, made by the recorder's pacer delay_ns after that submission is done
@@ -2282,9 +2335,15 @@ void vk_frame_end(const char *shot_path) {
     if (frame_after) {
         rec_QueuePresentKHR_late(done_sem[img], g_vk.swapchain, img, g_vk.display_timing ? ++frame_gid : 0, frame_after, frame_delay);
         frame_after = 0;
-    } else if (g_vk.display_timing) {  // (named: LARECOMP_FG_TIMING reads when each was shown)
-        rec_QueuePresentKHR_at(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0, ++frame_gid, 0);
+    } else if (g_vk.display_timing) {  // (named: LARECOMP_FG_TIMING reads when each was shown; the even mode's display time)
+        extern int g_even_fps;
+        uint32_t gid = ++frame_gid;
+        rec_QueuePresentKHR_at(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0, gid,
+                               g_even_fps ? even_desired(gid) : 0);
     } else {
+        extern int g_even_fps;
+        static bool said;
+        if (g_even_fps && !said) said = true, LOG("[even] no VK_GOOGLE_display_timing: frames shown as soon as ready\n");
         rec_QueuePresentKHR(done_sem[img], g_vk.swapchain, img, g_present_wait ? ++present_id : 0);
     }
     atomic_fetch_add(&g_window_frames, 1);
@@ -2538,10 +2597,17 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         bool at30 = fg_period > 25 && fg_period < 45 && d < fg_period * 1.6;
         extern TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make);
         extern bool g_fps40_on;  // (runtime/hle/framepace.c: 16.7 / 33.3 ms in turn - 25 on average, no 30 fps to fill)
-        if (g_settings.frame_gen && !g_fps40_on) fg_mid = vk_fg_make(b, frame, at30);
+        extern int g_even_fps;   // (the same: 40 / 48 fps even, frames of 25 or 16.7 ms - none to fill either)
+        if (g_settings.frame_gen && !g_fps40_on && !g_even_fps) fg_mid = vk_fg_make(b, frame, at30);
         // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game;
-        // the 40 fps mode's one-vsync frames need 60 Hz too)
-        plat_frame_rate_hint(window, g_settings.frame_gen || g_settings.fps60 || g_fps40_on ? 60.0f : 0.0f);
+        // the 40 fps mode's one-vsync frames need 60 Hz too; the even mode its own rate - the S25+'s 48 Hz mode for 48,
+        // 80 or 120 for 40 - whose refreshes its frames are counted in (runtime/hle/framepace.c even_frame).
+        // LARECOMP_EVEN_HZ=<hz>: another rate for it)
+        static float even_hz = -1;
+        if (even_hz < 0) even_hz = ENV("LARECOMP_EVEN_HZ") ? (float)atof(ENV("LARECOMP_EVEN_HZ")) : 0;
+        plat_frame_rate_hint(window, g_even_fps ? (even_hz > 0 ? even_hz : (float)g_even_fps)
+                                     : g_settings.frame_gen || g_settings.fps60 || g_fps40_on ? 60.0f : 0.0f);
+        even_cur = even_ring[frame & 63];
         static int tm = -1;
         if (tm < 0) tm = ENV("LARECOMP_FG_TIMING") != NULL;
         if (tm && g_settings.frame_gen) {  // (how many frames had an in-between image, and why not)
@@ -2820,6 +2886,12 @@ void debug_frame_after_present(uint64_t frame) {
 void backend_present(NvnTexture *t) {
     g_last_presented = t;
     uint64_t frame = total_frames, t0 = plat_now_ns();
+    {   // (the even mode: when this frame was let go and its world time, for its display time - even_desired)
+        extern int g_even_fps;
+        extern uint32_t g_even_units;
+        extern uint64_t g_present_let_go;  // (nvn/objects.c present_pace)
+        even_ring[frame & 63] = (EvenFrame){g_even_fps ? g_present_let_go : 0, g_even_fps ? g_even_units : 0};
+    }
     if (rq_on()) rq_present(t, frame, true);
     else backend_present_now(t, frame);
     uint64_t t1 = plat_now_ns();

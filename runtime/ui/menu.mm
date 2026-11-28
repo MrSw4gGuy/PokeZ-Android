@@ -729,34 +729,36 @@ static void tab_display(bool in_game) {
         // start); in game only with the frame hook (a supported game version).
         extern bool g_za_frame_hook, g_fps60_fell_back;
         if (!in_game || g_za_frame_hook) {  // (g_game_is_la stays 1 until the boot: no help on the start screen)
-            int fr = g_settings.fps60 ? 3 : g_settings.fps40 ? 1 : g_settings.fps45 ? 2 : 0;
-            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), "40 fps", "45 fps", "60 fps"};
-            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 4, 0,
-                           TR("30 fps: as on the Switch. 40 fps: frames of one and two world steps in turn, each shown "
-                              "exactly that long - the right speed, smoother than 30 and much lighter than 60 (25 ms a "
-                              "frame on average), though not perfectly even. 45 fps: the same with one, one and two steps "
-                              "(22 ms on average) - smoother than 40, still lighter than 60. 60 fps: "
-                              "the game presents every refresh and steps its world 1/60 s a frame - smoother still, but it "
-                              "needs a fast CPU and GPU: the game counts frames, not time, so below 60 fps everything moves "
-                              "in slow motion (see the next option).",
-                              "30 fps: como no Switch. 40 fps: quadros de um e de dois passos do mundo, alternados, cada "
-                              "um mostrado exatamente esse tempo - velocidade certa, mais fluido que 30 e bem mais leve que "
-                              "60 (25 ms por quadro em média), mas não perfeitamente regular. 45 fps: o mesmo com um, um e "
-                              "dois passos (22 ms em média) - mais fluido que 40, ainda mais leve que 60. 60 fps: o jogo mostra um quadro a cada atualização da tela e avança o "
-                              "mundo 1/60 s por quadro - mais fluido ainda, mas pede CPU e GPU rápidas: o jogo conta quadros, "
-                              "não tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção)."))) {
-                g_settings.fps60 = fr == 3;
-                g_settings.fps40 = fr == 1;
-                g_settings.fps45 = fr == 2;
+            // (three rates since 2026-11-28: the 40 / 45 fps modes of whole world steps judder - a frame held twice
+            // every two or three - and 48 fps even didn't hold 48 in the S25+'s city, heated past 0.9 headroom in two
+            // minutes and crackled; 40 even held 0.73. An ini's fps40 / fps45 / fps_even 48 is read as 40 even,
+            // settings.c; LARECOMP_FPS_EVEN=48 still runs 48 for tests)
+            int fr = g_settings.fps60 ? 2 : g_settings.fps_even ? 1 : 0;
+            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), "40 fps", "60 fps"};
+            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 3, 0,
+                           TR("30 fps: as on the Switch. 40 fps: every frame moves the world exactly the time it stays on "
+                              "screen, fractions of the game's step included, with the display at a multiple of 40 (80 or "
+                              "120 Hz) - even motion at the right speed, much lighter than 60 (25 ms a frame). 60 fps: the "
+                              "game presents every refresh and steps its world 1/60 s a frame - the smoothest, but it needs "
+                              "a fast CPU and GPU: the game counts frames, not time, so below 60 fps everything moves in "
+                              "slow motion (see the next option).",
+                              "30 fps: como no Switch. 40 fps: cada quadro avança o mundo exatamente o tempo que fica na "
+                              "tela, inclusive frações do passo do jogo, com a tela num múltiplo de 40 (80 ou 120 Hz) - "
+                              "movimento regular na velocidade certa, bem mais leve que 60 (25 ms por quadro). 60 fps: o "
+                              "jogo mostra um quadro a cada atualização da tela e avança o mundo 1/60 s por quadro - o mais "
+                              "fluido, mas pede CPU e GPU rápidas: o jogo conta quadros, não tempo, então abaixo de 60 fps "
+                              "tudo fica em câmera lenta (veja a próxima opção)."))) {
+                g_settings.fps60 = fr == 2;
+                g_settings.fps40 = g_settings.fps45 = false;
+                g_settings.fps_even = fr == 1 ? 40 : 0;
 #ifdef __ANDROID__
-                // (the thermal profile goes with the rate: 60 the cooler's, 45 the one without it, 30 economy - the
-                // Thermal profile row below sets the rate the same way; 40 keeps whichever profile was picked)
-                if (fr != 1)
-                    g_settings.thermal_profile = fr == 3 ? THERMAL_PROFILE_COOLER : fr == 2 ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_ECONOMY;
+                // (the thermal profile goes with the rate: 60 the cooler's, 40 the one without it, 30 economy - the
+                // Thermal profile row below sets the rate the same way)
+                g_settings.thermal_profile = fr == 2 ? THERMAL_PROFILE_COOLER : fr == 1 ? THERMAL_PROFILE_NO_COOLER : THERMAL_PROFILE_ECONOMY;
 #endif
             }
 #ifdef __ANDROID__
-            if (g_settings.fps60 && !g_settings.fps40) {  // (2026-11-25: 60 fps took the S25+ to the throttling point in ~3 minutes)
+            if (g_settings.fps60) {  // (2026-11-25: 60 fps took the S25+ to the throttling point in ~3 minutes)
                 ImGui::PushTextWrapPos(0);  // (the phone's narrow rows: one line would be cut off)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
                                    TR("Recommended only with a phone cooler: at 60 fps the phone heats up.",
@@ -765,7 +767,7 @@ static void tab_display(bool in_game) {
             }
 #endif
             bool fall = !g_settings.fps60_lock;
-            ImGui::BeginDisabled(!g_settings.fps60 || g_settings.fps40 || g_settings.fps45);
+            ImGui::BeginDisabled(!g_settings.fps60);
             if (opt_toggle(TR("Dynamic 30 / 60 fps", "30 / 60 fps dinâmico"), &fall, false,
                            TR("With 60 fps: when this PC doesn't keep 60 for a few seconds, the game goes to 30 fps by "
                               "itself instead of running in slow motion, and back to 60 once there is room again (the "
@@ -837,7 +839,7 @@ static void tab_display(bool in_game) {
                                        TR("Preparing the draw distance...", "Preparando a distância de visão..."));
             }
 #endif
-            if (in_game && g_settings.fps60 && !g_settings.fps40 && g_fps60_fell_back)
+            if (in_game && g_settings.fps60 && g_fps60_fell_back)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
                                    TR("Running at 30 fps for now: 60 wasn't held (back to 60 when there is room).",
                                       "Rodando a 30 fps por enquanto: 60 não segurou (volta para 60 quando houver folga)."));
@@ -858,7 +860,7 @@ static void tab_display(bool in_game) {
                                     TR("Applies 60 fps with automatic fallback to 30, the game's dynamic resolution, reduced distant shadows, and earlier use of simpler models. Frame generation stays off. Other video settings are unchanged. Dynamic resolution can lower image sharpness; the LOD setting can make model changes more visible.",
                                        "Aplica 60 fps com retorno automático a 30, resolução dinâmica do jogo, sombras distantes reduzidas e uso mais cedo de modelos simples. A geração de quadros fica desligada. As demais opções de vídeo não mudam. A resolução dinâmica pode reduzir a nitidez, e o LOD pode deixar as trocas de modelo mais visíveis."))) {
         g_settings.fps60 = true;
-        g_settings.fps40 = g_settings.fps45 = false;
+        g_settings.fps40 = g_settings.fps45 = false, g_settings.fps_even = 0;
         g_settings.fps60_lock = false;
         g_settings.thermal_profile = THERMAL_PROFILE_COOLER;  // (60 fps goes with the cooler's profile: the Frame rate row)
         g_settings.game_drs = true;
@@ -1020,23 +1022,23 @@ static void tab_display(bool in_game) {
     }
 #ifdef __ANDROID__
     {   // (platform/android.c plat_thermal_scale: the curves; the frame rate goes with the profile - Frame rate row above)
-        const char *profiles[] = {TR("With cooler (60 fps)", "Com cooler (60 fps)"), TR("Without cooler (45 fps)", "Sem cooler (45 fps)"),
+        const char *profiles[] = {TR("With cooler (60 fps)", "Com cooler (60 fps)"), TR("Without cooler (40 fps)", "Sem cooler (40 fps)"),
                                   TR("Economy (30 fps)", "Economia (30 fps)")};  // (THERMAL_PROFILE_*)
         if (opt_choice(TR("Thermal profile", "Perfil térmico"), &g_settings.thermal_profile, profiles, 3, THERMAL_PROFILE_COOLER,
                        TR("Pick what matches how you play; the app can't tell whether a cooler is attached. With cooler: 60 "
                           "fps at the resolution you chose, never lowered for heat - in this game a lower resolution cools "
-                          "next to nothing and only blurs cutscenes and text. Without cooler: 45 fps, smoother than 30 "
+                          "next to nothing and only blurs cutscenes and text. Without cooler: 40 fps, even and smooth "
                           "without 60's heat. Economy: 30 fps, the lightest on battery and heat. In those two, near the "
                           "phone's throttling point (headroom 0.85) the resolution drops in steps down to 50%, and comes "
                           "back slowly. Sets the Frame rate too.",
                           "Escolha conforme o seu uso; o app não sabe se há um cooler. Com cooler: 60 fps na resolução que "
                           "você escolheu, sem reduzir por calor - neste jogo uma resolução menor quase não esfria e só borra "
-                          "cutscenes e textos. Sem cooler: 45 fps, mais fluido que 30 sem o calor do 60. Economia: 30 fps, o "
+                          "cutscenes e textos. Sem cooler: 40 fps, regular e sem tremor, sem o calor do 60. Economia: 30 fps, o "
                           "mais leve para a bateria e o calor. Nesses dois, perto do limite de aquecimento do aparelho "
                           "(folga 0,85) a resolução cai em degraus até 50%, e volta devagar. Muda a Taxa de quadros também."))) {
-            g_settings.fps40 = false;
+            g_settings.fps40 = g_settings.fps45 = false;
             g_settings.fps60 = g_settings.thermal_profile == THERMAL_PROFILE_COOLER;
-            g_settings.fps45 = g_settings.thermal_profile == THERMAL_PROFILE_NO_COOLER;
+            g_settings.fps_even = g_settings.thermal_profile == THERMAL_PROFILE_NO_COOLER ? 40 : 0;
         }
     }
 #endif

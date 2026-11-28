@@ -217,9 +217,111 @@ static const PaceRec *pace_replayed(void) {
     return pace_mode == 2 && pace_at < pace_n ? &pace_tab[pace_at] : NULL;
 }
 static bool za_dyn30, za_dyn30_prev;  // (rt_za_frame_cfg: this frame / the one before ran in the game's 30 fps mode)
+
+// ---- Pokémon Z-A: 40 / 48 fps even (the fps_even setting; LARECOMP_FPS_EVEN=40 / 48 / 0 overrides it, tests)
+// The 40 / 45 fps modes step the world in whole 1/60 s ticks: on the 60 Hz display their frames move 16.7 and 33.3 ms
+// of world in turn - the right speed, but the motion judders (the user saw it at 45: one frame in three held twice).
+// The clock's set function stores a duration, not a step (ch_set_hook): any duration can go in. So here every channel
+// gets the frame's own time, in whole refreshes of the display (vulkan/record.c rec_refresh_ns), and the display is
+// asked for the mode's own rate (vulkan/device.c's display hint): on the S25+ 48 fps is its 48 Hz mode, one refresh -
+// 20.8 ms - a frame; 40 fps a multiple of 40 (80 or 120 Hz), 25 ms a frame. A display that only gives 120 Hz shows 48
+// fps as two and three refreshes in turn (16.7 / 25 ms), one at 60 Hz as the 40 fps mode's one and two: each frame's
+// time is its own refreshes either way. Each frame is shown that long after the one before (nvn/objects.c
+// present_pace; the display time, vulkan/device.c even_desired), so its motion is the time it stays on screen - what a
+// variable-refresh display does. A frame late by half a refresh or more hands what it owes to the next, up to 42 ms (a
+// dash's hit is checked once a frame: #222's misses were at 50).
+// 2026-11-26/28 (S25+, cooler): 120 Hz for both rates heated the phone more than 60 fps at 60 Hz did (48 fps reached the
+// throttling point in ~2 min of play) - the reason for the modes' own rates.
+// Not known yet: the game's code that catches its moments on whole ticks (#309's ladder on channel 0, #179's banners on
+// channel 1 in the 60 fps mode) - the knobs for bisecting that:
+//   LARECOMP_EVEN_MODE=<n>      the game's frame mode on those frames (default 0, its 60 fps mode; 1 its 30 fps mode)
+//   LARECOMP_EVEN_TICKS=<i>,<j>.. channels kept on whole ticks (the frames' time paid in 16.7 ms ticks as owed, one or
+//                               two a frame, as in the 40 fps mode); none by default
+//   LARECOMP_EVEN_HZ=<hz>       the display rate asked for instead of the mode's own (120: the first version)
+//   LARECOMP_EVEN_LOG=1         the first 20 frames and every 600th: the time measured and the world time handed on
+int g_even_fps;                // (the even mode running this frame: 40 / 48, else 0 - nvn/objects.c, nvn/pace.c, vulkan/device.c)
+uint32_t g_even_units;         // (this frame's world time in display refreshes: vulkan/device.c checks it against the screen)
+uint64_t g_even_period;        // (that in ns: present_pace shows the frame that long after the last; every clock channel's
+                               // duration this frame, ch_set_hook)
+static int g_even_next = -1;   // (rt_za_frame_step: the channel whose set call comes next - only the frame clock's are overridden)
+static int even_fps(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = ENV("LARECOMP_FPS_EVEN"); env = e ? atoi(e) : -1; }
+    int f = env >= 0 ? env : g_settings.fps_even;
+    return f == 40 || f == 48 ? f : 0;
+}
+// The frame's world time (rt_za_frame_dt, the frame clock's first read): the mode's period in the display's whole
+// refreshes (the fraction carried to the next frames: 48 fps at 120 Hz two and three in turn), plus what the frame
+// before owes when it started late. Between two frame starts the real time is the world time the frame before was
+// given (present_pace held its present until then), so `owed` is only lateness: a GPU or a CPU that didn't keep up.
+static void even_frame(void) {
+    extern uint64_t rec_refresh_ns(void) __attribute__((weak));  // (vulkan/record.c: the display's refresh, 0 until known)
+    static uint64_t last, prev;
+    static double owed, plan;  // (ns)
+    uint64_t now = plat_now_ns();
+    int f = even_fps();
+    if (!f) { last = 0, g_even_fps = 0; return; }
+    double r = rec_refresh_ns && rec_refresh_ns() ? (double)rec_refresh_ns() : 1e9 / 120;
+    if (r < 4e6 || r > 34e6) r = 1e9 / 120;  // (not a refresh)
+    if (!g_even_fps || !last) owed = plan = 0;  // (just turned on: nothing owed from before)
+    else {
+        owed += (double)(now - last) - (double)prev;
+        if (owed > 50e6) owed = 50e6;  // (a load, a shader build: dropped, not caught up at length)
+        if (owed < -r) owed = -r;
+    }
+    double real = last ? (double)(now - last) : 0;
+    last = now;
+    g_even_fps = f;
+    plan += 1e9 / f;
+    int u = (int)(plan / r + 0.5);
+    if (u < 1) u = 1;
+    plan -= u * r;
+    if (plan < -r || plan > r) plan = 0;  // (the display's rate changed)
+    bool late = false;
+    while (owed >= 0.5 * r && (u + 1) * r <= 42e6) u++, owed -= r, late = true;
+    g_even_units = (uint32_t)u;
+    g_even_period = prev = (uint64_t)(u * r + 0.5);
+    static int log = -1;
+    if (log < 0) log = ENV("LARECOMP_EVEN_LOG") != NULL;
+    static uint64_t n, n_late;
+    n_late += late;
+    if (++n % 600 == 0 || (log && n < 20))
+        LOG("[even] %d fps: frame %llu %.1f ms since the last, world %.1f ms (%d of %.2f ms refreshes), owed %.1f ms; %llu "
+            "frames late so far\n", f, (unsigned long long)n, real / 1e6, g_even_period / 1e6, u, r / 1e6, owed / 1e6,
+            (unsigned long long)n_late);
+}
+// A clock channel's duration this frame (ch_set_hook): the frame's time - or, for LARECOMP_EVEN_TICKS's channels,
+// whole ticks paid as owed
+static uint64_t even_channel_dur(uint32_t ch) {
+    static int init;
+    static uint64_t mask;
+    static double owed[64];  // (ns)
+    if (!init) {
+        init = 1;
+        const char *e = ENV("LARECOMP_EVEN_TICKS");
+        for (const char *p = e ? e : ""; *p;) {
+            char *end;
+            unsigned long v = strtoul(p, &end, 10);
+            if (end == p) break;
+            if (v < 64) mask |= 1ull << v;
+            p = *end ? end + 1 : end;
+        }
+        if (mask) LOG("[even] clock channels on whole ticks: %s\n", e);
+    }
+    if (ch >= 64 || !(mask >> ch & 1)) return g_even_period;
+    owed[ch] += (double)g_even_period;
+    int ticks = (int)(owed[ch] / 16666667.0 + 0.001);
+    if (ticks < 1) ticks = 1;
+    if (ticks > 4) ticks = 4;
+    owed[ch] -= ticks * 16666667.0;
+    return (uint64_t)ticks * 16666667ull;
+}
+
 uint64_t rt_za_frame_dt(uint64_t real_ns) {
     static uint64_t acc, last_ns;
     static bool was_on;
+    even_frame();
+    if (g_even_fps) { was_on = false, za_step_n = 0; return 0; }  // (the game's own step: its configured one, ch_set_hook the time)
     if (!g_settings.frame_dt) { was_on = false, za_step_n = 0; return real_ns; }
     uint64_t now = plat_now_ns();
     if (!was_on) { was_on = true, last_ns = now, acc = 0; }  // (turned on: nothing owed from before)
@@ -334,10 +436,15 @@ static uint64_t ch0_duration(uint32_t world_ticks) {
 }
 // The clock's set function (x0 the clock's channels, w1 the channel, w2 the step): channel 0 is stored the smooth
 // duration through the channels' own store (vtable +0x10), every other channel goes through the game's code
+// (the even mode, above: every channel of the frame clock's loop the frame's time)
 static void ch_set_hook(Cpu *c) {
-    if ((uint32_t)c->x[1] != 0 || !g_ch0_smooth) { g_ch_set_orig(c); return; }
+    uint32_t ch = (uint32_t)c->x[1];
+    uint64_t d;
+    if (g_even_fps && (int)ch == g_even_next) d = even_channel_dur(ch), g_even_next = -1;
+    else if (ch == 0 && g_ch0_smooth) d = ch0_duration(g_ch0_world);
+    else { g_ch_set_orig(c); return; }
     uint64_t store = *(const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)c->x[0] + 0x10);
-    c->x[2] = ch0_duration(g_ch0_world);
+    c->x[2] = d;
     guest_call(c, store);
 }
 // The camera judders on any frame rate between 30 and 60 (#224: turning it with the stick, ~15 px a frame and ~30 on
@@ -555,6 +662,16 @@ uint32_t rt_za_frame_step(uint32_t game_step, uint32_t channel) {
     static bool counted;
     if (!counted && channel == 0 && last_channel > 0) counted = true, LOG("[pace] clock channels: %u\n", last_channel + 1);
     last_channel = channel;
+    if (g_even_fps) {  // (the even mode: the set function's override hands this channel the frame's time, whatever the step)
+        if (channel == 0) {
+            ch_set_install();
+            g_cam_dur = 0, g_ch0_smooth = false, g_ch0_restart = true;  // (no smoothing over: each frame is its own time)
+            static bool said;
+            if (!said && !g_ch_set_hooked) said = true, LOG("[even] the clock's set function isn't overridden: whole ticks\n");
+        }
+        g_even_next = (int)channel;
+        return game_step;
+    }
     if (channel == 0 && on && g_settings.frame_dt) ch_set_install();  // (once: channel 0's smooth duration)
     uint32_t r = frame_step(game_step, channel, on);
     {   // ticks handed to channel 0 and channel 1 (the world's speed), logged once a minute of channel-0 calls: with
@@ -639,6 +756,21 @@ int32_t rt_za_frame_cfg(int32_t cfg) {
         static long slow = -1;
         if (slow < 0) slow = ENV("LARECOMP_ZA_SLOW_MS") ? atol(ENV("LARECOMP_ZA_SLOW_MS")) : 0;
         if (slow > 0 && frames > 1800) plat_sleep_until_ns(plat_now_ns() + (uint64_t)slow * 1000000);
+    }
+    if (g_even_fps) {  // (the even mode, rt_za_frame_dt: one frame mode, every frame's time from the clock's set function)
+        g_fps40_on = g_fps45_on = false, g_za_mode_dyn = g_za_mode_dyn_interval = false, za_dyn30 = za_dyn30_prev = false;
+        static int even_mode = -2, logged_even;
+        if (even_mode == -2) even_mode = ENV("LARECOMP_EVEN_MODE") ? atoi(ENV("LARECOMP_EVEN_MODE")) : 0;
+        if (logged_even != g_even_fps) {
+            logged_even = g_even_fps;
+            LOG("[pace] %d fps even: every frame steps the world its own time (%s), shown that long; the game's frame "
+                "mode %d\n", g_even_fps, g_even_fps == 40 ? "25 ms" : "20.8 ms", even_mode);
+        }
+        extern uint64_t g_game_vsyncs;  // (the game's time in 60 Hz vsyncs: the fraction carried over)
+        static uint64_t part;
+        part += g_even_period;
+        g_game_vsyncs += part / 16666667ull, part %= 16666667ull;
+        return even_mode;
     }
     g_za_mode_dyn = dyn && on && g_settings.frame_dt && cfg > 0 && !f40;  // (the 40 fps mode picks every frame's mode)
     g_za_mode_dyn_interval = g_za_mode_dyn && dyn == 2;

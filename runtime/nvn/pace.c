@@ -256,7 +256,9 @@ void pace_frame(void) {
     // 30 fps mode, its period over 25 ms, else 16.7. CPU time, not busy time: Pokémon Z-A's wait for its next frame
     // counts as busy, and a frame reported as filling its budget kept the clocks up. platform.h plat_perf_hint, a no-op
     // elsewhere)
-    plat_perf_hint(tc ? tc : 1, g_fps45_on ? 22222222ull : g_fps40_on ? 25000000ull : p > 25000000ull ? 33333333ull : 16666667ull);
+    extern int g_even_fps;  // (40 / 48 fps even: its frames' average)
+    plat_perf_hint(tc ? tc : 1, g_even_fps == 40 ? 25000000ull : g_even_fps ? 20833333ull : g_fps45_on ? 22222222ull
+                                : g_fps40_on ? 25000000ull : p > 25000000ull ? 33333333ull : 16666667ull);
     // What the frame would cost at 60 fps: a frame of the game's 30 fps mode (two vsyncs or more) runs its world twice,
     // and the second step - about half this thread's CPU time then (measured: 3.0 -> 6.0 ms, 4.9 -> 9.3 ms) - is work
     // a 60 fps frame doesn't have. Without that, the 30 fps mode's frames looked 3-5 ms slower than they would be at 60
